@@ -1,8 +1,10 @@
 import os
+import csv
 import time
 import requests
+from datetime import datetime
 
-URL = "https://uae-market-production.up.railway.app/api/upload-csv"
+URL = "https://uae-market-production.up.railway.app/api/upload-batch"
 
 FILES = {
     "EMAAR": "EMAAR.csv",
@@ -47,6 +49,64 @@ FILES = {
     "APEX": "APEX.csv",
 }
 
+CHUNK_SIZE = 200
+
+
+def clean_num(x):
+    if x is None:
+        return None
+
+    x = str(x).strip().replace(",", "")
+
+    if x in ["", "-", "nan", "None"]:
+        return None
+
+    if x.endswith("M"):
+        return float(x[:-1]) * 1_000_000
+
+    if x.endswith("K"):
+        return float(x[:-1]) * 1_000
+
+    return float(x)
+
+
+def clean_date(x):
+    x = str(x).strip()
+
+    for fmt in ["%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y"]:
+        try:
+            return datetime.strptime(x, fmt).strftime("%Y-%m-%d")
+        except:
+            pass
+
+    return x
+
+
+def read_csv_rows(filename):
+    rows = []
+
+    with open(filename, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            raw_date = row.get("Date") or row.get("date")
+            close = row.get("Price") or row.get("Close") or row.get("close")
+
+            if not raw_date or not close:
+                continue
+
+            rows.append({
+                "date": clean_date(raw_date),
+                "open": clean_num(row.get("Open") or row.get("open")),
+                "high": clean_num(row.get("High") or row.get("high")),
+                "low": clean_num(row.get("Low") or row.get("low")),
+                "close": clean_num(close),
+                "volume": clean_num(row.get("Vol.") or row.get("Volume") or row.get("volume")),
+            })
+
+    return rows
+
+
 success = []
 failed = []
 missing = []
@@ -57,39 +117,52 @@ for symbol, filename in FILES.items():
         missing.append(symbol)
         continue
 
-    uploaded = False
+    print(f"\n📄 Reading {symbol} from {filename}", flush=True)
 
-    for attempt in range(1, 4):
-        print(f"⬆️ Uploading {symbol} | attempt {attempt}/3", flush=True)
+    try:
+        rows = read_csv_rows(filename)
+    except Exception as e:
+        print(f"❌ Failed reading {symbol}: {e}", flush=True)
+        failed.append(symbol)
+        continue
+
+    print(f"📊 {symbol}: {len(rows)} rows", flush=True)
+
+    symbol_ok = True
+
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i:i + CHUNK_SIZE]
+
+        payload = {
+            "symbol": symbol,
+            "exchange": "HISTORICAL",
+            "timeframe": "1D",
+            "rows": chunk
+        }
 
         try:
-            with open(filename, "rb") as f:
-                response = requests.post(
-                    URL,
-                    params={"symbol": symbol},
-                    files={"file": f},
-                    timeout=90
-                )
+            response = requests.post(URL, json=payload, timeout=60)
 
             if response.status_code == 200:
-                print(f"✅ {symbol}: {response.json()}", flush=True)
-                success.append(symbol)
-                uploaded = True
+                print(f"✅ {symbol}: chunk {i//CHUNK_SIZE + 1} uploaded", flush=True)
+            else:
+                print(f"❌ {symbol}: {response.status_code} {response.text[:300]}", flush=True)
+                symbol_ok = False
                 break
 
-            print(f"⚠️ {symbol}: {response.status_code} - {response.text[:300]}", flush=True)
-
         except Exception as e:
-            print(f"⚠️ {symbol}: {e}", flush=True)
+            print(f"❌ {symbol}: {e}", flush=True)
+            symbol_ok = False
+            break
 
-        print("⏳ waiting 20 seconds before retry...", flush=True)
-        time.sleep(20)
+        time.sleep(1)
 
-    if not uploaded:
+    if symbol_ok:
+        success.append(symbol)
+    else:
         failed.append(symbol)
 
-    print("😴 cooling server 15 seconds...", flush=True)
-    time.sleep(15)
+    time.sleep(3)
 
 print("\n🔥 Upload Summary", flush=True)
 print(f"✅ Success: {len(success)} → {success}", flush=True)
