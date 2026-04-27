@@ -142,22 +142,30 @@ def tradingview_webhook(payload: TVPayload):
     return {"status": "ignored", "reason": "unknown type"}
 
 
-from sqlalchemy import desc
-
 @app.get("/api/candles/latest")
-def get_latest_candles(symbol: str = "EMAAR", timeframe: str = None):
+def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    query = db.query(Candle).filter(Candle.symbol == symbol)
+    q = "SELECT * FROM candles WHERE 1=1"
+    params = []
+
+    if symbol:
+        q += " AND symbol = %s"
+        params.append(symbol)
 
     if timeframe:
-        query = query.filter(Candle.timeframe == timeframe)
+        q += " AND timeframe = %s"
+        params.append(timeframe)
 
-    candles = query.order_by(desc(Candle.bar_time)).limit(100).all()
+    q += " ORDER BY bar_time DESC LIMIT %s"
+    params.append(limit)
 
-    return {
-        "count": len(candles),
-        "candles": [c.to_dict() for c in candles]
-    }
+    cur.execute(q, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"count": len(rows), "candles": rows}
     
 @app.get("/api/signals/latest")
 def latest_signals(symbol: Optional[str] = None, limit: int = 50):
