@@ -334,7 +334,14 @@ async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
     inserted = 0
 
     for row in reader:
-        date = row.get("Date") or row.get("date")
+        raw_date = row.get("Date") or row.get("date")
+        
+        try:
+            date = datetime.strptime(raw_date, "%m/%d/%Y").strftime("%Y-%m-%d")
+        except:
+            date = raw_date
+        
+    
         open_price = row.get("Open") or row.get("open")
         high = row.get("High") or row.get("high")
         low = row.get("Low") or row.get("low")
