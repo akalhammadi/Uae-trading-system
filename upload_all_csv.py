@@ -51,11 +51,11 @@ failed = 0
 
 for symbol, filename in FILES.items():
     if not os.path.exists(filename):
-        print(f"❌ Missing file: {filename}")
+        print(f"❌ Missing file: {filename}", flush=True)
         failed += 1
         continue
 
-    print(f"⬆️ Uploading {symbol} from {filename}...")
+    print(f"⬆️ Uploading {symbol} from {filename}...", flush=True)
 
     try:
         with open(filename, "rb") as f:
@@ -63,21 +63,21 @@ for symbol, filename in FILES.items():
                 URL,
                 params={"symbol": symbol},
                 files={"file": f},
-                timeout=120
+                timeout=20
             )
 
         if response.status_code == 200:
-            print(f"✅ {symbol}: {response.json()}")
+            print(f"✅ {symbol}: {response.json()}", flush=True)
             success += 1
         else:
-            print(f"❌ {symbol}: {response.status_code} - {response.text}")
+            print(f"❌ {symbol}: {response.status_code} - {response.text[:300]}", flush=True)
             failed += 1
 
     except Exception as e:
-        print(f"❌ {symbol}: Error → {e}")
+        print(f"❌ {symbol}: Error → {e}", flush=True)
         failed += 1
 
-print("\n🔥 Upload Summary")
-print(f"✅ Success: {success}")
-print(f"❌ Failed: {failed}")
-print("🚀 Done")
+print("\n🔥 Upload Summary", flush=True)
+print(f"✅ Success: {success}", flush=True)
+print(f"❌ Failed: {failed}", flush=True)
+print("🚀 Done", flush=True)
