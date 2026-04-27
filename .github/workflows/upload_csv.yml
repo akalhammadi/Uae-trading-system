@@ -1,5 +1,6 @@
 name: Upload CSV to Railway API
 
+# trigger
 on:
   workflow_dispatch:
 
