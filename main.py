@@ -4,6 +4,8 @@ from typing import Optional
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+import os
+SECRET = os.getenv("SECRET")
 
 DB_PATH = Path("uae_trading.db")
 SECRET = "CHANGE_ME_SECRET"
