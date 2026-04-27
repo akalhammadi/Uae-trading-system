@@ -1,21 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
-from pathlib import Path
 import os
 
 SECRET = os.getenv("SECRET", "abc123")
-DB_PATH = Path("uae_trading.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI(title="UAE Trading Webhook System")
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
@@ -24,16 +24,16 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS candles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         symbol TEXT NOT NULL,
         exchange TEXT,
         timeframe TEXT NOT NULL,
         bar_time TEXT NOT NULL,
-        open REAL,
-        high REAL,
-        low REAL,
-        close REAL,
-        volume REAL,
+        open DOUBLE PRECISION,
+        high DOUBLE PRECISION,
+        low DOUBLE PRECISION,
+        close DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
         received_at TEXT NOT NULL,
         UNIQUE(symbol, timeframe, bar_time)
     )
@@ -41,13 +41,13 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         symbol TEXT NOT NULL,
         exchange TEXT,
         timeframe TEXT,
         signal TEXT NOT NULL,
-        price REAL,
-        volume REAL,
+        price DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
         bar_time TEXT,
         received_at TEXT NOT NULL,
         payload TEXT
@@ -88,9 +88,18 @@ def tradingview_webhook(payload: TVPayload):
 
     if payload.type == "CANDLE_UPDATE":
         cur.execute("""
-        INSERT OR REPLACE INTO candles
+        INSERT INTO candles
         (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (symbol, timeframe, bar_time)
+        DO UPDATE SET
+            exchange = EXCLUDED.exchange,
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            received_at = EXCLUDED.received_at
         """, (
             payload.symbol,
             payload.exchange,
@@ -112,7 +121,7 @@ def tradingview_webhook(payload: TVPayload):
         cur.execute("""
         INSERT INTO signals
         (symbol, exchange, timeframe, signal, price, volume, bar_time, received_at, payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             payload.symbol,
             payload.exchange,
@@ -134,28 +143,26 @@ def tradingview_webhook(payload: TVPayload):
 
 
 @app.get("/api/candles/latest")
-def latest_candles(
-    symbol: Optional[str] = None,
-    timeframe: Optional[str] = None,
-    limit: int = 100
-):
+def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
     conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     q = "SELECT * FROM candles WHERE 1=1"
     params = []
 
     if symbol:
-        q += " AND symbol = ?"
+        q += " AND symbol = %s"
         params.append(symbol)
 
     if timeframe:
-        q += " AND timeframe = ?"
+        q += " AND timeframe = %s"
         params.append(timeframe)
 
-    q += " ORDER BY bar_time DESC LIMIT ?"
+    q += " ORDER BY bar_time DESC LIMIT %s"
     params.append(limit)
 
-    rows = [dict(r) for r in conn.execute(q, params).fetchall()]
+    cur.execute(q, params)
+    rows = cur.fetchall()
     conn.close()
 
     return {"count": len(rows), "candles": rows}
@@ -164,18 +171,20 @@ def latest_candles(
 @app.get("/api/signals/latest")
 def latest_signals(symbol: Optional[str] = None, limit: int = 50):
     conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     q = "SELECT * FROM signals WHERE 1=1"
     params = []
 
     if symbol:
-        q += " AND symbol = ?"
+        q += " AND symbol = %s"
         params.append(symbol)
 
-    q += " ORDER BY received_at DESC LIMIT ?"
+    q += " ORDER BY received_at DESC LIMIT %s"
     params.append(limit)
 
-    rows = [dict(r) for r in conn.execute(q, params).fetchall()]
+    cur.execute(q, params)
+    rows = cur.fetchall()
     conn.close()
 
     return {"count": len(rows), "signals": rows}
@@ -184,21 +193,23 @@ def latest_signals(symbol: Optional[str] = None, limit: int = 50):
 @app.get("/api/dashboard")
 def dashboard():
     conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    rows = [dict(r) for r in conn.execute("""
-        SELECT symbol, exchange, timeframe, bar_time, close, volume
+    cur.execute("""
+        SELECT DISTINCT ON (symbol, timeframe)
+            symbol, exchange, timeframe, bar_time, close, volume
         FROM candles
-        WHERE id IN (
-            SELECT MAX(id) FROM candles GROUP BY symbol, timeframe
-        )
-        ORDER BY symbol
-    """).fetchall()]
+        ORDER BY symbol, timeframe, bar_time DESC
+    """)
+    rows = cur.fetchall()
 
-    signals = [dict(r) for r in conn.execute("""
+    cur.execute("""
         SELECT symbol, signal, price, bar_time, received_at
         FROM signals
-        ORDER BY received_at DESC LIMIT 20
-    """).fetchall()]
+        ORDER BY received_at DESC
+        LIMIT 20
+    """)
+    signals = cur.fetchall()
 
     conn.close()
 
@@ -211,14 +222,15 @@ def dashboard():
 @app.get("/api/market-status")
 def market_status():
     conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    rows = [dict(r) for r in conn.execute("""
+    cur.execute("""
         SELECT symbol, timeframe, bar_time, open, high, low, close, volume
         FROM candles
         WHERE close IS NOT NULL
         ORDER BY symbol, bar_time DESC
-    """).fetchall()]
-
+    """)
+    rows = cur.fetchall()
     conn.close()
 
     latest = {}
@@ -258,21 +270,16 @@ def market_status():
 
         if breakout:
             score += 40
-
         if change_pct > 0.3:
             score += 20
-
         if change_pct > 1:
             score += 20
-
         if volume_ratio > 1.1:
             score += 20
-
         if volume_ratio > 1.3:
             score += 20
 
         status = "Neutral"
-
         if score >= 60:
             status = "Strong"
         elif score >= 30:
@@ -298,7 +305,6 @@ def market_status():
     strong_count = len([x for x in results if x["score"] >= 60])
 
     market_mode = "Defensive"
-
     if strong_count >= 8:
         market_mode = "Aggressive"
     elif strong_count >= 4:
