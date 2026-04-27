@@ -164,7 +164,7 @@ def market_status():
     conn = db()
 
     rows = [dict(r) for r in conn.execute("""
-        SELECT symbol, timeframe, bar_time, close, volume
+        SELECT symbol, timeframe, bar_time, open, high, low, close, volume
         FROM candles
         WHERE close IS NOT NULL
         ORDER BY symbol, bar_time DESC
@@ -190,7 +190,11 @@ def market_status():
         last_close = current["close"]
         current_volume = current["volume"] or 0
 
-        prev_close = data[1]["close"] if len(data) > 1 else last_close
+        prev_close = data[1]["close"] if len(data) > 1 else None
+
+        if prev_close is None:
+            prev_close = current["open"] if current["open"] is not None else last_close
+
         volumes = [x["volume"] for x in data[:5] if x["volume"] is not None]
         avg_volume = sum(volumes) / len(volumes) if volumes else current_volume
 
@@ -199,19 +203,23 @@ def market_status():
 
         score = 0
 
-        if change_pct > 0:
-            score += 30
+        if change_pct > 0.3:
+            score += 20
         if change_pct > 1:
             score += 20
         if volume_ratio > 1.1:
-            score += 25
-        if volume_ratio > 1.5:
-            score += 25
+            score += 20
+        if volume_ratio > 1.3:
+            score += 20
+        if volume_ratio > 1.6:
+            score += 20
 
         status = "Neutral"
-        if score >= 70:
+        if score >= 60:
             status = "Strong"
-        elif score <= 25:
+        elif score >= 30:
+            status = "Watch"
+        elif score < 15:
             status = "Weak"
 
         results.append({
@@ -226,7 +234,7 @@ def market_status():
         })
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)
-    strong_count = len([x for x in results if x["score"] >= 70])
+    strong_count = len([x for x in results if x["score"] >= 60])
 
     market_mode = "Defensive"
     if strong_count >= 8:
