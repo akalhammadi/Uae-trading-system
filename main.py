@@ -158,3 +158,96 @@ def dashboard():
     """).fetchall()]
     conn.close()
     return {"latest_candles": rows, "latest_signals": signals}
+
+@app.get("/api/market-status")
+def market_status():
+    conn = db()
+
+    rows = [dict(r) for r in conn.execute("""
+        SELECT symbol, timeframe, bar_time, close, volume
+        FROM candles
+        WHERE close IS NOT NULL
+        ORDER BY symbol, bar_time DESC
+    """).fetchall()]
+
+    conn.close()
+
+    latest = {}
+    history = {}
+
+    for r in rows:
+        symbol = r["symbol"]
+        history.setdefault(symbol, []).append(r)
+
+        if symbol not in latest:
+            latest[symbol] = r
+
+    results = []
+
+    for symbol, current in latest.items():
+        data = history.get(symbol, [])
+
+        if len(data) < 5:
+            continue
+
+        closes = [x["close"] for x in data[:5] if x["close"] is not None]
+        volumes = [x["volume"] for x in data[:5] if x["volume"] is not None]
+
+        if len(closes) < 2 or len(volumes) < 2:
+            continue
+
+        last_close = closes[0]
+        prev_close = closes[1]
+        avg_volume = sum(volumes) / len(volumes)
+
+        change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
+        volume_ratio = current["volume"] / avg_volume if avg_volume else 0
+
+        score = 0
+
+        if change_pct > 0:
+            score += 30
+
+        if change_pct > 1:
+            score += 20
+
+        if volume_ratio > 1.2:
+            score += 25
+
+        if volume_ratio > 1.5:
+            score += 25
+
+        status = "Neutral"
+
+        if score >= 70:
+            status = "Strong"
+        elif score <= 25:
+            status = "Weak"
+
+        results.append({
+            "symbol": symbol,
+            "close": last_close,
+            "change_pct": round(change_pct, 2),
+            "volume": current["volume"],
+            "volume_ratio": round(volume_ratio, 2),
+            "score": score,
+            "status": status,
+            "bar_time": current["bar_time"]
+        })
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    strong_count = len([x for x in results if x["score"] >= 70])
+
+    market_mode = "Defensive"
+    if strong_count >= 8:
+        market_mode = "Aggressive"
+    elif strong_count >= 4:
+        market_mode = "Neutral"
+
+    return {
+        "market_mode": market_mode,
+        "strong_count": strong_count,
+        "top_stocks": results[:10],
+        "all_stocks": results
+    }
