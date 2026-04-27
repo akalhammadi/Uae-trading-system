@@ -390,3 +390,75 @@ async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
         "symbol": symbol,
         "rows_inserted": inserted
     }
+
+from pydantic import BaseModel
+from typing import List, Optional
+import psycopg2.extras
+from datetime import datetime
+
+class CandleRow(BaseModel):
+    date: str
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: float
+    volume: Optional[float] = None
+
+class BatchUpload(BaseModel):
+    symbol: str
+    exchange: str = "HISTORICAL"
+    timeframe: str = "1D"
+    rows: List[CandleRow]
+
+@app.post("/api/upload-batch")
+def upload_batch(payload: BatchUpload):
+    if not payload.rows:
+        return {"status": "empty", "inserted": 0}
+
+    conn = db()
+    cur = conn.cursor()
+
+    now = datetime.utcnow().isoformat()
+
+    values = [
+        (
+            payload.symbol,
+            payload.exchange,
+            payload.timeframe,
+            r.date,
+            r.open,
+            r.high,
+            r.low,
+            r.close,
+            r.volume,
+            now
+        )
+        for r in payload.rows
+    ]
+
+    psycopg2.extras.execute_values(
+        cur,
+        """
+        INSERT INTO candles
+        (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
+        VALUES %s
+        ON CONFLICT (symbol, timeframe, bar_time)
+        DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            received_at = EXCLUDED.received_at
+        """,
+        values
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "ok",
+        "symbol": payload.symbol,
+        "inserted": len(values)
+    }
