@@ -201,18 +201,29 @@ def market_status():
         change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
         volume_ratio = current_volume / avg_volume if avg_volume else 1
 
-        score = 0
+ # ==== Breakout Logic ====
+highs = [x["high"] for x in data[:5] if x.get("high") is not None]
+recent_high = max(highs) if highs else last_close
 
-        if change_pct > 0.3:
-            score += 20
-        if change_pct > 1:
-            score += 20
-        if volume_ratio > 1.1:
-            score += 20
-        if volume_ratio > 1.3:
-            score += 20
-        if volume_ratio > 1.6:
-            score += 20
+breakout = last_close > recent_high
+
+# ==== Score ====
+score = 0
+
+if breakout:
+    score += 40
+
+if change_pct > 0.3:
+    score += 20
+
+if change_pct > 1:
+    score += 20
+
+if volume_ratio > 1.1:
+    score += 20
+
+if volume_ratio > 1.3:
+    score += 20
 
         status = "Neutral"
         if score >= 60:
