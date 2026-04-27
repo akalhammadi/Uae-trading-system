@@ -5,10 +5,9 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import os
-SECRET = os.getenv("SECRET")
+SECRET = os.getenv("SECRET", "abc123")
 
 DB_PATH = Path("uae_trading.db")
-SECRET = "CHANGE_ME_SECRET"
 
 app = FastAPI(title="UAE Trading Webhook System")
 
