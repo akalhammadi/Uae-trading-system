@@ -21,3 +21,4 @@ jobs:
 
       - name: Run upload script
         run: python upload_all_csv.py
+ 
