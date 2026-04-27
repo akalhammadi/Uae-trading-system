@@ -187,38 +187,28 @@ def market_status():
     for symbol, current in latest.items():
         data = history.get(symbol, [])
 
-        if len(data) < 5:
-            continue
+        last_close = current["close"]
+        current_volume = current["volume"] or 0
 
-        closes = [x["close"] for x in data[:5] if x["close"] is not None]
+        prev_close = data[1]["close"] if len(data) > 1 else last_close
         volumes = [x["volume"] for x in data[:5] if x["volume"] is not None]
-
-        if len(closes) < 2 or len(volumes) < 2:
-            continue
-
-        last_close = closes[0]
-        prev_close = closes[1]
-        avg_volume = sum(volumes) / len(volumes)
+        avg_volume = sum(volumes) / len(volumes) if volumes else current_volume
 
         change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
-        volume_ratio = current["volume"] / avg_volume if avg_volume else 0
+        volume_ratio = current_volume / avg_volume if avg_volume else 1
 
         score = 0
 
         if change_pct > 0:
             score += 30
-
         if change_pct > 1:
             score += 20
-
-        if volume_ratio > 1.2:
+        if volume_ratio > 1.1:
             score += 25
-
         if volume_ratio > 1.5:
             score += 25
 
         status = "Neutral"
-
         if score >= 70:
             status = "Strong"
         elif score <= 25:
@@ -228,7 +218,7 @@ def market_status():
             "symbol": symbol,
             "close": last_close,
             "change_pct": round(change_pct, 2),
-            "volume": current["volume"],
+            "volume": current_volume,
             "volume_ratio": round(volume_ratio, 2),
             "score": score,
             "status": status,
@@ -236,7 +226,6 @@ def market_status():
         })
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)
-
     strong_count = len([x for x in results if x["score"] >= 70])
 
     market_mode = "Defensive"
