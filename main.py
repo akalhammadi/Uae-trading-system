@@ -164,7 +164,7 @@ def market_status():
     conn = db()
 
     rows = [dict(r) for r in conn.execute("""
-        SELECT symbol, timeframe, bar_time, open, high, low, close, volume
+    SELECT symbol, timeframe, bar_time, open, high, low, close, volume
         FROM candles
         WHERE close IS NOT NULL
         ORDER BY symbol, bar_time DESC
