@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 pydantic
-pandas
-python-multipart
 psycopg2-binary
+python-multipart
