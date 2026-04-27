@@ -49,7 +49,10 @@ FILES = {
     "APEX": "APEX.csv",
 }
 
-CHUNK_SIZE = 200
+CHUNK_SIZE = 25
+SLEEP_BETWEEN_CHUNKS = 5
+SLEEP_BETWEEN_SYMBOLS = 10
+TIMEOUT = 120
 
 
 def clean_num(x):
@@ -58,7 +61,7 @@ def clean_num(x):
 
     x = str(x).strip().replace(",", "")
 
-    if x in ["", "-", "nan", "None"]:
+    if x in ["", "-", "nan", "None", "null"]:
         return None
 
     if x.endswith("M"):
@@ -66,6 +69,9 @@ def clean_num(x):
 
     if x.endswith("K"):
         return float(x[:-1]) * 1_000
+
+    if x.endswith("B"):
+        return float(x[:-1]) * 1_000_000_000
 
     return float(x)
 
@@ -76,7 +82,7 @@ def clean_date(x):
     for fmt in ["%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y"]:
         try:
             return datetime.strptime(x, fmt).strftime("%Y-%m-%d")
-        except:
+        except Exception:
             pass
 
     return x
@@ -95,14 +101,21 @@ def read_csv_rows(filename):
             if not raw_date or not close:
                 continue
 
-            rows.append({
-                "date": clean_date(raw_date),
-                "open": clean_num(row.get("Open") or row.get("open")),
-                "high": clean_num(row.get("High") or row.get("high")),
-                "low": clean_num(row.get("Low") or row.get("low")),
-                "close": clean_num(close),
-                "volume": clean_num(row.get("Vol.") or row.get("Volume") or row.get("volume")),
-            })
+            try:
+                item = {
+                    "date": clean_date(raw_date),
+                    "open": clean_num(row.get("Open") or row.get("open")),
+                    "high": clean_num(row.get("High") or row.get("high")),
+                    "low": clean_num(row.get("Low") or row.get("low")),
+                    "close": clean_num(close),
+                    "volume": clean_num(row.get("Vol.") or row.get("Volume") or row.get("volume")),
+                }
+
+                if item["close"] is not None:
+                    rows.append(item)
+
+            except Exception as e:
+                print(f"⚠️ Skipped bad row in {filename}: {e}", flush=True)
 
     return rows
 
@@ -128,9 +141,16 @@ for symbol, filename in FILES.items():
 
     print(f"📊 {symbol}: {len(rows)} rows", flush=True)
 
+    if len(rows) == 0:
+        print(f"⚠️ {symbol}: no valid rows", flush=True)
+        failed.append(symbol)
+        continue
+
     symbol_ok = True
+    total_chunks = (len(rows) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     for i in range(0, len(rows), CHUNK_SIZE):
+        chunk_no = i // CHUNK_SIZE + 1
         chunk = rows[i:i + CHUNK_SIZE]
 
         payload = {
@@ -140,29 +160,45 @@ for symbol, filename in FILES.items():
             "rows": chunk
         }
 
-        try:
-            response = requests.post(URL, json=payload, timeout=60)
+        uploaded = False
 
-            if response.status_code == 200:
-                print(f"✅ {symbol}: chunk {i//CHUNK_SIZE + 1} uploaded", flush=True)
-            else:
-                print(f"❌ {symbol}: {response.status_code} {response.text[:300]}", flush=True)
-                symbol_ok = False
-                break
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(URL, json=payload, timeout=TIMEOUT)
 
-        except Exception as e:
-            print(f"❌ {symbol}: {e}", flush=True)
+                if response.status_code == 200:
+                    print(f"✅ {symbol}: chunk {chunk_no}/{total_chunks} uploaded", flush=True)
+                    uploaded = True
+                    break
+
+                print(
+                    f"⚠️ {symbol}: chunk {chunk_no}/{total_chunks} attempt {attempt}/3 "
+                    f"status {response.status_code} - {response.text[:200]}",
+                    flush=True
+                )
+
+            except Exception as e:
+                print(
+                    f"⚠️ {symbol}: chunk {chunk_no}/{total_chunks} attempt {attempt}/3 error → {e}",
+                    flush=True
+                )
+
+            time.sleep(10)
+
+        if not uploaded:
+            print(f"❌ {symbol}: failed at chunk {chunk_no}/{total_chunks}", flush=True)
             symbol_ok = False
             break
 
-        time.sleep(1)
+        time.sleep(SLEEP_BETWEEN_CHUNKS)
 
     if symbol_ok:
         success.append(symbol)
     else:
         failed.append(symbol)
 
-    time.sleep(3)
+    print(f"😴 Cooling after {symbol}...", flush=True)
+    time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
 print("\n🔥 Upload Summary", flush=True)
 print(f"✅ Success: {len(success)} → {success}", flush=True)
