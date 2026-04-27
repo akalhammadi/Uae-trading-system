@@ -316,3 +316,71 @@ def market_status():
         "top_stocks": results[:10],
         "all_stocks": results
     }
+
+from fastapi import UploadFile, File
+import csv
+import io
+from datetime import datetime
+
+@app.post("/api/upload-csv")
+async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
+    content = await file.read()
+    decoded = content.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(decoded))
+
+    conn = db()
+    cur = conn.cursor()
+
+    inserted = 0
+
+    for row in reader:
+        date = row.get("Date") or row.get("date")
+        open_price = row.get("Open") or row.get("open")
+        high = row.get("High") or row.get("high")
+        low = row.get("Low") or row.get("low")
+        close = row.get("Price") or row.get("Close") or row.get("close")
+        volume = row.get("Vol.") or row.get("Volume") or row.get("volume")
+
+        if not date or not close:
+            continue
+
+        def clean_num(x):
+            if x is None:
+                return None
+            return str(x).replace(",", "").replace("M", "000000").replace("K", "000").strip()
+
+        cur.execute("""
+            INSERT INTO candles
+            (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, timeframe, bar_time)
+            DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                received_at = EXCLUDED.received_at
+        """, (
+            symbol,
+            "HISTORICAL",
+            "1D",
+            date,
+            float(clean_num(open_price)) if open_price else None,
+            float(clean_num(high)) if high else None,
+            float(clean_num(low)) if low else None,
+            float(clean_num(close)),
+            float(clean_num(volume)) if volume else None,
+            datetime.utcnow().isoformat()
+        ))
+
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "rows_inserted": inserted
+    }
