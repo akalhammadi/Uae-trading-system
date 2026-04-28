@@ -904,7 +904,6 @@ def dashboard_history(limit: int = 200):
 
     return {"count": len(rows), "history": rows}
 
-
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
     data = daily_dashboard()
@@ -937,6 +936,35 @@ def dashboard_page():
         </tr>
         """
 
+    all_rows_html = ""
+
+    for item in data["all_stocks"]:
+        rec = item["recommendation"]
+
+        if rec == "BUY":
+            badge = "buy"
+        elif rec == "WATCH":
+            badge = "watch"
+        elif rec == "HOLD":
+            badge = "hold"
+        else:
+            badge = "avoid"
+
+        all_rows_html += f"""
+        <tr>
+            <td>{item['symbol']}</td>
+            <td>{item['last_close']}</td>
+            <td>{item['change_pct']}%</td>
+            <td>{item['score']}</td>
+            <td><span class="badge {badge}">{rec}</span></td>
+            <td>{"YES" if item["breakout"] else "NO"}</td>
+            <td>{"YES" if item["volume_confirmed"] else "NO"}</td>
+            <td>{item['entry']}</td>
+            <td>{item['stop_loss']}</td>
+            <td>{item['target']}</td>
+        </tr>
+        """
+
     html = f"""
     <html>
     <head>
@@ -955,6 +983,7 @@ def dashboard_page():
                 padding: 18px;
                 margin-bottom: 18px;
                 box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+                overflow-x: auto;
             }}
             h1 {{
                 margin-top: 0;
@@ -980,14 +1009,13 @@ def dashboard_page():
             table {{
                 width: 100%;
                 border-collapse: collapse;
-                overflow: hidden;
-                border-radius: 12px;
             }}
             th, td {{
                 padding: 12px;
                 border-bottom: 1px solid #374151;
                 text-align: left;
                 font-size: 14px;
+                white-space: nowrap;
             }}
             th {{
                 color: #9ca3af;
@@ -1044,6 +1072,29 @@ def dashboard_page():
                 </thead>
                 <tbody>
                     {rows_html}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>All Market Positions</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Close</th>
+                        <th>Change</th>
+                        <th>Score</th>
+                        <th>Status</th>
+                        <th>Breakout</th>
+                        <th>Volume</th>
+                        <th>Entry</th>
+                        <th>Stop</th>
+                        <th>Target</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {all_rows_html}
                 </tbody>
             </table>
         </div>
