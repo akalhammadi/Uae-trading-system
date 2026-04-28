@@ -1195,30 +1195,39 @@ def ai_top_trades(limit: int = 10):
         profit = (target - entry) / entry
         rr = profit / risk if risk > 0 else 0
 
-        if profit < 0.05:
+        if profit < 0.03:
             continue
 
-        if rr < 1.5:
+        if rr < 1.2:
             continue
-
+              
         volume_ratio = features.get("volume_ratio", 1) or 1
         breakout = features.get("breakout", 0)
-        trend_up = features.get("trend_up", 0)
+        trend_up = features.get("trend_up", 0) or 0
+        trend_down = features.get("trend_down", 0) or 0
 
         action = "WATCH"
 
-        if prob >= 0.7 and profit >= 0.05 and rr >= 1.8:
+        if prob >= 0.6 and breakout and volume_ratio > 1.5:
+            action = "BREAKOUT ATTACK"
+        elif prob >= 0.7 and profit >= 0.05 and rr >= 1.8 and trend_up:
             action = "STRONG BUY"
         elif prob >= 0.5 and profit >= 0.06 and rr >= 2:
             action = "SMART RISK"
         elif prob >= 0.75 and profit >= 0.03:
             action = "SAFE BUY"
-
-        if prob >= 0.45 and profit >= 0.08 and rr >= 2.5:
+        elif prob >= 0.45 and profit >= 0.08 and rr >= 2.5:
             action = "HIGH RISK HIGH REWARD"
-
-        if prob >= 0.6 and breakout and volume_ratio > 1.5:
-            action = "BREAKOUT ATTACK"
+        elif prob >= 0.7 and trend_up:
+            action = "BUY"
+        elif prob >= 0.7 and trend_down:
+            action = "REVERSAL WATCH"
+        elif prob >= 0.7:
+            action = "AI STRONG"
+        elif prob >= 0.6:
+            action = "AI GOOD"
+        elif prob >= 0.5:
+            action = "AI WEAK"
 
         score = prob * (profit * 100) * rr
 
@@ -1236,16 +1245,36 @@ def ai_top_trades(limit: int = 10):
             "score": round(score, 2),
             "volume_ratio": volume_ratio,
             "breakout": breakout,
-            "trend_up": trend_up
+            "trend_up": trend_up,
+            "trend_down": trend_down
         })
 
     conn.close()
 
     final_trades = sorted(final_trades, key=lambda x: x["score"], reverse=True)
 
-    top = [x for x in final_trades if x["action"] in ["STRONG BUY", "SMART RISK", "BREAKOUT ATTACK"]][:limit]
-    aggressive = [x for x in final_trades if x["action"] == "HIGH RISK HIGH REWARD"][:5]
-    watch = [x for x in final_trades if x["action"] == "WATCH"][:10]
+    top = [
+        x for x in final_trades
+        if x["action"] in [
+            "BUY",
+            "AI STRONG",
+            "AI GOOD",
+            "SAFE BUY",
+            "STRONG BUY",
+            "SMART RISK",
+            "BREAKOUT ATTACK"
+        ]
+    ][:limit]
+
+    aggressive = [
+        x for x in final_trades
+        if x["action"] == "HIGH RISK HIGH REWARD"
+    ][:5]
+
+    watch = [
+        x for x in final_trades
+        if x["action"] in ["WATCH", "AI WEAK", "REVERSAL WATCH"]
+    ][:10]
 
     return {
         "top_trades": top,
