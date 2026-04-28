@@ -1144,3 +1144,177 @@ def api_ai_predict():
         "count": len(result),
         "predictions": result
     }
+
+# =========================
+# AI TOP TRADES ENGINE
+# =========================
+
+@app.get("/api/ai/top-trades")
+def ai_top_trades(limit: int = 10):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    predictions = ai_engine.predict_latest(conn)
+    final_trades = []
+
+    for p in predictions:
+        prob = p.get("best_probability", 0) or 0
+        symbol = p.get("symbol")
+        horizon = p.get("best_horizon", "5d")
+        features = p.get("features", {})
+
+        last_close = p.get("last_close", 0) or 0
+        if last_close <= 0:
+            continue
+
+        cur.execute("""
+            SELECT high, low
+            FROM candles
+            WHERE symbol = %s
+              AND timeframe = '1D'
+            ORDER BY bar_time DESC
+            LIMIT 20
+        """, (symbol,))
+
+        rows = cur.fetchall()
+
+        highs = [r["high"] for r in rows if r["high"] is not None]
+        lows = [r["low"] for r in rows if r["low"] is not None]
+
+        recent_high = max(highs) if highs else last_close * 1.05
+        recent_low = min(lows) if lows else last_close * 0.97
+
+        entry = last_close
+        stop = recent_low
+        risk = (entry - stop) / entry if entry > stop else 0
+
+        base_target = entry * 1.05
+        breakout_target = recent_high * 1.02
+        target = max(base_target, breakout_target)
+
+        profit = (target - entry) / entry
+        rr = profit / risk if risk > 0 else 0
+
+        if profit < 0.05:
+            continue
+
+        if rr < 1.5:
+            continue
+
+        volume_ratio = features.get("volume_ratio", 1) or 1
+        breakout = features.get("breakout", 0)
+        trend_up = features.get("trend_up", 0)
+
+        action = "WATCH"
+
+        if prob >= 0.7 and profit >= 0.05 and rr >= 1.8:
+            action = "STRONG BUY"
+        elif prob >= 0.5 and profit >= 0.06 and rr >= 2:
+            action = "SMART RISK"
+        elif prob >= 0.75 and profit >= 0.03:
+            action = "SAFE BUY"
+
+        if prob >= 0.45 and profit >= 0.08 and rr >= 2.5:
+            action = "HIGH RISK HIGH REWARD"
+
+        if prob >= 0.6 and breakout and volume_ratio > 1.5:
+            action = "BREAKOUT ATTACK"
+
+        score = prob * (profit * 100) * rr
+
+        final_trades.append({
+            "symbol": symbol,
+            "action": action,
+            "probability": round(prob, 2),
+            "entry": round(entry, 3),
+            "stop_loss": round(stop, 3),
+            "target": round(target, 3),
+            "expected_profit_pct": round(profit * 100, 2),
+            "risk_pct": round(risk * 100, 2),
+            "rr": round(rr, 2),
+            "holding": horizon,
+            "score": round(score, 2),
+            "volume_ratio": volume_ratio,
+            "breakout": breakout,
+            "trend_up": trend_up
+        })
+
+    conn.close()
+
+    final_trades = sorted(final_trades, key=lambda x: x["score"], reverse=True)
+
+    top = [x for x in final_trades if x["action"] in ["STRONG BUY", "SMART RISK", "BREAKOUT ATTACK"]][:limit]
+    aggressive = [x for x in final_trades if x["action"] == "HIGH RISK HIGH REWARD"][:5]
+    watch = [x for x in final_trades if x["action"] == "WATCH"][:10]
+
+    return {
+        "top_trades": top,
+        "aggressive_opportunities": aggressive,
+        "watchlist": watch
+    }
+
+# =========================
+# AI TRADE MONITOR
+# =========================
+@app.get("/api/ai/monitor")
+def ai_monitor_trades():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM trades
+        WHERE status = 'OPEN'
+    """)
+
+    trades = cur.fetchall()
+    results = []
+
+    for t in trades:
+        symbol = t["symbol"]
+        entry = t["entry_price"]
+        stop = t["stop_loss"]
+        target = t["target"]
+
+        cur.execute("""
+            SELECT close
+            FROM candles
+            WHERE symbol = %s
+            ORDER BY bar_time DESC
+            LIMIT 1
+        """, (symbol,))
+
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        price = row["close"]
+        action = "HOLD"
+
+        if target and price > target * 1.03:
+            action = "EXTEND TARGET"
+        elif target and price >= target:
+            action = "TAKE PROFIT"
+        elif stop and price <= stop:
+            action = "EXIT NOW"
+        elif stop and price <= (stop * 1.02):
+            action = "STOP WARNING"
+        elif target and price > entry * 1.05 and price < target:
+            action = "TRAIL PROFIT"
+
+        results.append({
+            "symbol": symbol,
+            "entry": entry,
+            "current_price": price,
+            "pnl_pct": round(((price - entry) / entry) * 100, 2),
+            "action": action,
+            "target": target,
+            "stop": stop
+        })
+
+    conn.close()
+
+    return {
+        "count": len(results),
+        "trades": results
+    }
