@@ -494,3 +494,184 @@ def upload_batch(payload: BatchUpload):
         "symbol": payload.symbol,
         "inserted": len(values)
     }
+
+# =========================
+# TRADES SYSTEM
+# =========================
+
+class TradePayload(BaseModel):
+    symbol: str
+    qty: float
+    price: float
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    note: Optional[str] = None
+
+
+def init_trades_table():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        qty REAL NOT NULL,
+        entry_price REAL,
+        stop_loss REAL,
+        target REAL,
+        sell_price REAL,
+        status TEXT NOT NULL,
+        opened_at TEXT,
+        closed_at TEXT,
+        note TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_trades_table()
+
+
+# =========================
+# BUY
+# =========================
+@app.post("/api/trades/buy")
+def buy_trade(payload: TradePayload):
+    conn = db()
+    cur = conn.cursor()
+
+    now = datetime.utcnow().isoformat()
+    symbol = normalize_symbol(payload.symbol)
+
+    cur.execute("""
+    INSERT INTO trades
+    (symbol, qty, entry_price, stop_loss, target, status, opened_at, note)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    RETURNING id
+    """, (
+        symbol,
+        payload.qty,
+        payload.price,
+        payload.stop_loss,
+        payload.target,
+        "OPEN",
+        now,
+        payload.note
+    ))
+
+    trade_id = cur.fetchone()[0]
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "opened",
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "entry": payload.price,
+        "stop": payload.stop_loss,
+        "target": payload.target
+    }
+
+
+# =========================
+# SELL
+# =========================
+@app.post("/api/trades/sell/{trade_id}")
+def sell_trade(trade_id: int, payload: TradePayload):
+    conn = db()
+    cur = conn.cursor()
+
+    now = datetime.utcnow().isoformat()
+
+    cur.execute("""
+    SELECT entry_price, qty, symbol, stop_loss, target
+    FROM trades
+    WHERE id = %s AND status = 'OPEN'
+    """, (trade_id,))
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    entry, qty, symbol, stop_loss, target = row
+
+    pnl = (payload.price - entry) * qty
+    pnl_pct = ((payload.price - entry) / entry) * 100
+
+    cur.execute("""
+    UPDATE trades
+    SET sell_price = %s,
+        status = 'CLOSED',
+        closed_at = %s
+    WHERE id = %s
+    """, (
+        payload.price,
+        now,
+        trade_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "closed",
+        "symbol": symbol,
+        "entry": entry,
+        "exit": payload.price,
+        "qty": qty,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "stop_loss": stop_loss,
+        "target": target
+    }
+
+
+# =========================
+# OPEN TRADES
+# =========================
+@app.get("/api/trades/open")
+def open_trades():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+    SELECT *,
+    (target - entry_price) AS reward,
+    (entry_price - stop_loss) AS risk,
+    (target - entry_price) / NULLIF((entry_price - stop_loss),0) AS rr
+    FROM trades
+    WHERE status = 'OPEN'
+    ORDER BY opened_at DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"count": len(rows), "trades": rows}
+
+
+# =========================
+# ALL TRADES
+# =========================
+@app.get("/api/trades/all")
+def all_trades():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+    SELECT *,
+    (sell_price - entry_price) * qty AS pnl
+    FROM trades
+    ORDER BY id DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"count": len(rows), "trades": rows}
