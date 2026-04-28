@@ -1119,6 +1119,56 @@ def dashboard_page():
 
     return html
 
+# =========================
+# AI SYSTEM
+# =========================
+
+AUTO_TRAIN_HOURS = 12
+LAST_AUTO_TRAIN_AT = None
+
+
+def smart_auto_train(conn, force: bool = False):
+    global LAST_AUTO_TRAIN_AT
+
+    now = datetime.utcnow()
+    status = ai_engine.ai_status(conn)
+
+    trained_models = status.get("trained_models", {})
+    all_ready = all(trained_models.values()) if trained_models else False
+
+    should_train = False
+    reason = "TRAIN_NOT_NEEDED"
+
+    if force:
+        should_train = True
+        reason = "FORCED_TRAIN"
+    elif not all_ready:
+        should_train = True
+        reason = "MODELS_NOT_READY"
+    elif LAST_AUTO_TRAIN_AT is None:
+        should_train = True
+        reason = "FIRST_AUTO_TRAIN"
+    elif (now - LAST_AUTO_TRAIN_AT).total_seconds() >= AUTO_TRAIN_HOURS * 3600:
+        should_train = True
+        reason = "SCHEDULED_REFRESH"
+
+    if should_train:
+        result = ai_engine.train_models(conn)
+        LAST_AUTO_TRAIN_AT = now
+        return {
+            "trained": True,
+            "reason": reason,
+            "trained_at": now.isoformat(),
+            "result": result
+        }
+
+    return {
+        "trained": False,
+        "reason": reason,
+        "last_train_at": LAST_AUTO_TRAIN_AT.isoformat() if LAST_AUTO_TRAIN_AT else None
+    }
+
+
 @app.get("/api/ai/status")
 def api_ai_status():
     conn = db()
@@ -1130,7 +1180,7 @@ def api_ai_status():
 @app.post("/api/ai/train")
 def api_ai_train():
     conn = db()
-    result = ai_engine.train_models(conn)
+    result = smart_auto_train(conn, force=True)
     conn.close()
     return result
 
@@ -1138,12 +1188,18 @@ def api_ai_train():
 @app.get("/api/ai/predict")
 def api_ai_predict():
     conn = db()
+
+    train_info = smart_auto_train(conn)
     result = ai_engine.predict_latest(conn)
+
     conn.close()
+
     return {
+        "auto_train": train_info,
         "count": len(result),
         "predictions": result
     }
+
 
 # =========================
 # AI TOP TRADES ENGINE
@@ -1153,6 +1209,8 @@ def api_ai_predict():
 def ai_top_trades(limit: int = 5):
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    train_info = smart_auto_train(conn)
 
     predictions = ai_engine.predict_latest(conn)
     final_trades = []
@@ -1200,7 +1258,7 @@ def ai_top_trades(limit: int = 5):
 
         if rr < 1.2:
             continue
-              
+
         volume_ratio = features.get("volume_ratio", 1) or 1
         breakout = features.get("breakout", 0)
         trend_up = features.get("trend_up", 0) or 0
@@ -1281,14 +1339,17 @@ def ai_top_trades(limit: int = 5):
     ][:10]
 
     return {
+        "auto_train": train_info,
         "top_trades": top,
         "aggressive_opportunities": aggressive,
         "watchlist": watch
     }
 
+
 # =========================
 # AI TRADE MONITOR
 # =========================
+
 @app.get("/api/ai/monitor")
 def ai_monitor_trades():
     conn = db()
