@@ -675,3 +675,380 @@ def all_trades():
     conn.close()
 
     return {"count": len(rows), "trades": rows}
+
+from fastapi.responses import HTMLResponse
+from datetime import timezone, timedelta
+
+
+def init_daily_recommendations_table():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS daily_recommendations (
+        id SERIAL PRIMARY KEY,
+        report_date TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        last_close DOUBLE PRECISION,
+        change_pct DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
+        score DOUBLE PRECISION,
+        recommendation TEXT,
+        entry DOUBLE PRECISION,
+        stop_loss DOUBLE PRECISION,
+        target DOUBLE PRECISION,
+        risk_reward DOUBLE PRECISION,
+        market_phase TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(report_date, symbol)
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_daily_recommendations_table()
+
+
+def get_market_phase():
+    uae_now = datetime.now(timezone(timedelta(hours=4)))
+
+    if 10 <= uae_now.hour < 15:
+        market_phase = "MARKET_OPEN"
+    elif uae_now.hour >= 15:
+        market_phase = "AFTER_CLOSE"
+    else:
+        market_phase = "PRE_MARKET"
+
+    return uae_now, market_phase
+
+
+@app.get("/api/dashboard/daily")
+def daily_dashboard():
+    uae_now, market_phase = get_market_phase()
+    report_date = uae_now.strftime("%Y-%m-%d")
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT symbol, bar_time, open, high, low, close, volume
+        FROM candles
+        WHERE timeframe = '1D'
+          AND close IS NOT NULL
+        ORDER BY symbol, bar_time DESC
+    """)
+
+    rows = cur.fetchall()
+
+    from collections import defaultdict
+    data = defaultdict(list)
+
+    for r in rows:
+        data[r["symbol"]].append(r)
+
+    results = []
+
+    for symbol, candles in data.items():
+        if len(candles) < 30:
+            continue
+
+        latest = candles[0]
+        last_close = latest["close"]
+        last_high = latest["high"]
+        last_low = latest["low"]
+        last_volume = latest["volume"] or 0
+
+        prev_close = candles[1]["close"]
+        change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
+
+        highs_20 = [c["high"] for c in candles[1:21] if c["high"] is not None]
+        lows_10 = [c["low"] for c in candles[1:11] if c["low"] is not None]
+        volumes_20 = [c["volume"] for c in candles[1:21] if c["volume"] is not None]
+
+        recent_high = max(highs_20) if highs_20 else last_high
+        recent_low = min(lows_10) if lows_10 else last_low
+        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else last_volume
+
+        breakout = last_close > recent_high
+        volume_confirmed = last_volume > avg_volume * 1.3 if avg_volume else False
+        positive_momentum = change_pct > 0.5
+
+        score = 0
+        if breakout:
+            score += 40
+        if volume_confirmed:
+            score += 30
+        if positive_momentum:
+            score += 20
+        if last_close > recent_low:
+            score += 10
+
+        recommendation = "AVOID"
+        if score >= 80:
+            recommendation = "BUY"
+        elif score >= 60:
+            recommendation = "WATCH"
+        elif score >= 40:
+            recommendation = "HOLD"
+
+        entry = last_close
+        stop_loss = recent_low
+        risk = entry - stop_loss if entry and stop_loss else None
+        target = entry + (risk * 2) if risk and risk > 0 else None
+        rr = 2 if target else None
+
+        item = {
+            "symbol": symbol,
+            "last_close": round(last_close, 3),
+            "change_pct": round(change_pct, 2),
+            "volume": last_volume,
+            "score": score,
+            "recommendation": recommendation,
+            "entry": round(entry, 3),
+            "stop_loss": round(stop_loss, 3) if stop_loss else None,
+            "target": round(target, 3) if target else None,
+            "risk_reward": rr,
+            "breakout": breakout,
+            "volume_confirmed": volume_confirmed,
+            "bar_time": latest["bar_time"]
+        }
+
+        results.append(item)
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    buy_list = [x for x in results if x["recommendation"] == "BUY"]
+    watch_list = [x for x in results if x["recommendation"] == "WATCH"]
+
+    market_mode = "Defensive"
+    if len(buy_list) >= 5:
+        market_mode = "Aggressive"
+    elif len(buy_list) >= 2 or len(watch_list) >= 5:
+        market_mode = "Neutral"
+
+    # نحفظ history فقط بعد إغلاق السوق
+    if market_phase == "AFTER_CLOSE":
+        now = datetime.utcnow().isoformat()
+
+        for item in results:
+            cur.execute("""
+            INSERT INTO daily_recommendations
+            (report_date, symbol, last_close, change_pct, volume, score,
+             recommendation, entry, stop_loss, target, risk_reward,
+             market_phase, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (report_date, symbol)
+            DO UPDATE SET
+                last_close = EXCLUDED.last_close,
+                change_pct = EXCLUDED.change_pct,
+                volume = EXCLUDED.volume,
+                score = EXCLUDED.score,
+                recommendation = EXCLUDED.recommendation,
+                entry = EXCLUDED.entry,
+                stop_loss = EXCLUDED.stop_loss,
+                target = EXCLUDED.target,
+                risk_reward = EXCLUDED.risk_reward,
+                market_phase = EXCLUDED.market_phase,
+                created_at = EXCLUDED.created_at
+            """, (
+                report_date,
+                item["symbol"],
+                item["last_close"],
+                item["change_pct"],
+                item["volume"],
+                item["score"],
+                item["recommendation"],
+                item["entry"],
+                item["stop_loss"],
+                item["target"],
+                item["risk_reward"],
+                market_phase,
+                now
+            ))
+
+        conn.commit()
+
+    conn.close()
+
+    return {
+        "report_date": report_date,
+        "report_time_uae": uae_now.strftime("%Y-%m-%d %H:%M"),
+        "market_phase": market_phase,
+        "report_status": "FINAL_AFTER_15:00" if market_phase == "AFTER_CLOSE" else "LIVE_NOT_FINAL",
+        "market_mode": market_mode,
+        "buy_count": len(buy_list),
+        "watch_count": len(watch_list),
+        "top_recommendations": results[:10],
+        "buy_list": buy_list,
+        "watch_list": watch_list,
+        "all_stocks": results
+    }
+
+
+@app.get("/api/dashboard/history")
+def dashboard_history(limit: int = 200):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM daily_recommendations
+        ORDER BY report_date DESC, score DESC
+        LIMIT %s
+    """, (limit,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"count": len(rows), "history": rows}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    data = daily_dashboard()
+
+    rows_html = ""
+
+    for item in data["top_recommendations"]:
+        rec = item["recommendation"]
+
+        if rec == "BUY":
+            badge = "buy"
+        elif rec == "WATCH":
+            badge = "watch"
+        elif rec == "HOLD":
+            badge = "hold"
+        else:
+            badge = "avoid"
+
+        rows_html += f"""
+        <tr>
+            <td>{item['symbol']}</td>
+            <td>{item['last_close']}</td>
+            <td>{item['change_pct']}%</td>
+            <td>{item['score']}</td>
+            <td><span class="badge {badge}">{rec}</span></td>
+            <td>{item['entry']}</td>
+            <td>{item['stop_loss']}</td>
+            <td>{item['target']}</td>
+            <td>{item['risk_reward']}</td>
+        </tr>
+        """
+
+    html = f"""
+    <html>
+    <head>
+        <title>UAE Market Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #0f172a;
+                color: #e5e7eb;
+                padding: 20px;
+            }}
+            .card {{
+                background: #111827;
+                border-radius: 14px;
+                padding: 18px;
+                margin-bottom: 18px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            }}
+            h1 {{
+                margin-top: 0;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 12px;
+            }}
+            .metric {{
+                background: #1f2937;
+                padding: 14px;
+                border-radius: 12px;
+            }}
+            .metric small {{
+                color: #9ca3af;
+            }}
+            .metric strong {{
+                display: block;
+                font-size: 24px;
+                margin-top: 6px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                overflow: hidden;
+                border-radius: 12px;
+            }}
+            th, td {{
+                padding: 12px;
+                border-bottom: 1px solid #374151;
+                text-align: left;
+                font-size: 14px;
+            }}
+            th {{
+                color: #9ca3af;
+            }}
+            .badge {{
+                padding: 6px 10px;
+                border-radius: 999px;
+                font-weight: bold;
+                font-size: 12px;
+            }}
+            .buy {{ background: #16a34a; color: white; }}
+            .watch {{ background: #f59e0b; color: #111827; }}
+            .hold {{ background: #3b82f6; color: white; }}
+            .avoid {{ background: #6b7280; color: white; }}
+        </style>
+    </head>
+    <body>
+        <h1>UAE Market Daily Dashboard</h1>
+
+        <div class="card grid">
+            <div class="metric">
+                <small>Report Time UAE</small>
+                <strong>{data['report_time_uae']}</strong>
+            </div>
+            <div class="metric">
+                <small>Market Phase</small>
+                <strong>{data['market_phase']}</strong>
+            </div>
+            <div class="metric">
+                <small>Market Mode</small>
+                <strong>{data['market_mode']}</strong>
+            </div>
+            <div class="metric">
+                <small>BUY / WATCH</small>
+                <strong>{data['buy_count']} / {data['watch_count']}</strong>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Top Recommendations</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Close</th>
+                        <th>Change</th>
+                        <th>Score</th>
+                        <th>Recommendation</th>
+                        <th>Entry</th>
+                        <th>Stop</th>
+                        <th>Target</th>
+                        <th>R/R</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
