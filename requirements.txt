@@ -3,3 +3,7 @@ uvicorn
 pydantic
 psycopg2-binary
 python-multipart
+pandas
+numpy
+scikit-learn
+joblib
