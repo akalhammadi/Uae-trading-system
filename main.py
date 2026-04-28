@@ -77,12 +77,30 @@ class TVPayload(BaseModel):
     price: Optional[float] = None
 
 
+SYMBOL_MAP = {
+    "ARAMEX": "ARMX",
+}
+
+def normalize_symbol(symbol: str):
+    if not symbol:
+        return symbol
+
+    symbol = symbol.upper().strip()
+
+    if ":" in symbol:
+        symbol = symbol.split(":")[-1]
+
+    return SYMBOL_MAP.get(symbol, symbol)
+
+
 @app.post("/webhook/tradingview")
 def tradingview_webhook(payload: TVPayload):
     if payload.secret != SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
     now = datetime.utcnow().isoformat()
+    symbol = normalize_symbol(payload.symbol)
+
     conn = db()
     cur = conn.cursor()
 
@@ -101,9 +119,9 @@ def tradingview_webhook(payload: TVPayload):
             volume = EXCLUDED.volume,
             received_at = EXCLUDED.received_at
         """, (
-            payload.symbol,
+            symbol,
             payload.exchange,
-            payload.timeframe or "1H",
+            payload.timeframe or "60",
             payload.time or now,
             payload.open,
             payload.high,
@@ -115,7 +133,12 @@ def tradingview_webhook(payload: TVPayload):
 
         conn.commit()
         conn.close()
-        return {"status": "ok", "stored": "candle", "symbol": payload.symbol}
+        return {
+            "status": "ok",
+            "stored": "candle",
+            "original_symbol": payload.symbol,
+            "symbol": symbol
+        }
 
     if payload.type == "SIGNAL":
         cur.execute("""
@@ -123,7 +146,7 @@ def tradingview_webhook(payload: TVPayload):
         (symbol, exchange, timeframe, signal, price, volume, bar_time, received_at, payload)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            payload.symbol,
+            symbol,
             payload.exchange,
             payload.timeframe,
             payload.signal or "UNKNOWN",
@@ -136,11 +159,20 @@ def tradingview_webhook(payload: TVPayload):
 
         conn.commit()
         conn.close()
-        return {"status": "ok", "stored": "signal", "symbol": payload.symbol}
+        return {
+            "status": "ok",
+            "stored": "signal",
+            "original_symbol": payload.symbol,
+            "symbol": symbol
+        }
 
     conn.close()
-    return {"status": "ignored", "reason": "unknown type"}
-
+    return {
+        "status": "ignored",
+        "reason": "unknown type",
+        "original_symbol": payload.symbol,
+        "symbol": symbol
+    }
 
 @app.get("/api/candles/latest")
 def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
