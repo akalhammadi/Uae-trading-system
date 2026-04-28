@@ -952,62 +952,49 @@ def dashboard_history(limit: int = 200):
 def dashboard_page():
     data = daily_dashboard()
 
-    rows_html = ""
-
-    for item in data["top_recommendations"]:
-        rec = item["recommendation"]
-
+    def badge_class(rec):
         if rec == "BUY":
-            badge = "buy"
-        elif rec == "WATCH":
-            badge = "watch"
-        elif rec == "HOLD":
-            badge = "hold"
-        else:
-            badge = "avoid"
+            return "buy"
+        if rec == "WATCH":
+            return "watch"
+        if rec == "HOLD":
+            return "hold"
+        if rec == "DEAD":
+            return "dead"
+        return "avoid"
 
-        rows_html += f"""
-        <tr>
-            <td>{item['symbol']}</td>
-            <td>{item['last_close']}</td>
-            <td>{item['change_pct']}%</td>
-            <td>{item['score']}</td>
-            <td><span class="badge {badge}">{rec}</span></td>
-            <td>{item['entry']}</td>
-            <td>{item['stop_loss']}</td>
-            <td>{item['target']}</td>
-            <td>{item['risk_reward']}</td>
-        </tr>
-        """
+    def change_class(change):
+        return "green" if change > 0 else "red" if change < 0 else "neutral"
 
-    all_rows_html = ""
+    def build_rows(items, include_entry=True):
+        html_rows = ""
 
-    for item in data["all_stocks"]:
-        rec = item["recommendation"]
+        for item in items:
+            rec = item["recommendation"]
+            badge = badge_class(rec)
+            ch_class = change_class(item["change_pct"])
 
-        if rec == "BUY":
-            badge = "buy"
-        elif rec == "WATCH":
-            badge = "watch"
-        elif rec == "HOLD":
-            badge = "hold"
-        else:
-            badge = "avoid"
+            html_rows += f"""
+            <tr>
+                <td>{item['symbol']}</td>
+                <td>{item['last_close']}</td>
+                <td class="{ch_class}">{item['change_pct']}%</td>
+                <td>{item['score']}</td>
+                <td><span class="badge {badge}">{rec}</span></td>
+                <td>{item.get('trend', '-')}</td>
+                <td>{"YES" if item.get("breakout") else "NO"}</td>
+                <td>{"YES" if item.get("volume_confirmed") else "NO"}</td>
+                <td>{item.get('entry', '-')}</td>
+                <td>{item.get('stop_loss', '-')}</td>
+                <td>{item.get('target', '-')}</td>
+            </tr>
+            """
 
-        all_rows_html += f"""
-        <tr>
-            <td>{item['symbol']}</td>
-            <td>{item['last_close']}</td>
-            <td>{item['change_pct']}%</td>
-            <td>{item['score']}</td>
-            <td><span class="badge {badge}">{rec}</span></td>
-            <td>{"YES" if item["breakout"] else "NO"}</td>
-            <td>{"YES" if item["volume_confirmed"] else "NO"}</td>
-            <td>{item['entry']}</td>
-            <td>{item['stop_loss']}</td>
-            <td>{item['target']}</td>
-        </tr>
-        """
+        return html_rows
+
+    top_rows = build_rows(data["top_recommendations"])
+    other_rows = build_rows(data["other_stocks"])
+    dead_rows = build_rows(data["dead_stocks"])
 
     html = f"""
     <html>
@@ -1029,9 +1016,7 @@ def dashboard_page():
                 box-shadow: 0 8px 24px rgba(0,0,0,0.3);
                 overflow-x: auto;
             }}
-            h1 {{
-                margin-top: 0;
-            }}
+            h1 {{ margin-top: 0; }}
             .grid {{
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1042,9 +1027,7 @@ def dashboard_page():
                 padding: 14px;
                 border-radius: 12px;
             }}
-            .metric small {{
-                color: #9ca3af;
-            }}
+            .metric small {{ color: #9ca3af; }}
             .metric strong {{
                 display: block;
                 font-size: 24px;
@@ -1061,9 +1044,7 @@ def dashboard_page():
                 font-size: 14px;
                 white-space: nowrap;
             }}
-            th {{
-                color: #9ca3af;
-            }}
+            th {{ color: #9ca3af; }}
             .badge {{
                 padding: 6px 10px;
                 border-radius: 999px;
@@ -1074,28 +1055,20 @@ def dashboard_page():
             .watch {{ background: #f59e0b; color: #111827; }}
             .hold {{ background: #3b82f6; color: white; }}
             .avoid {{ background: #6b7280; color: white; }}
+            .dead {{ background: #7f1d1d; color: white; }}
+            .green {{ color: #22c55e; font-weight: bold; }}
+            .red {{ color: #ef4444; font-weight: bold; }}
+            .neutral {{ color: #e5e7eb; }}
         </style>
     </head>
     <body>
         <h1>UAE Market Daily Dashboard</h1>
 
         <div class="card grid">
-            <div class="metric">
-                <small>Report Time UAE</small>
-                <strong>{data['report_time_uae']}</strong>
-            </div>
-            <div class="metric">
-                <small>Market Phase</small>
-                <strong>{data['market_phase']}</strong>
-            </div>
-            <div class="metric">
-                <small>Market Mode</small>
-                <strong>{data['market_mode']}</strong>
-            </div>
-            <div class="metric">
-                <small>BUY / WATCH</small>
-                <strong>{data['buy_count']} / {data['watch_count']}</strong>
-            </div>
+            <div class="metric"><small>Report Time UAE</small><strong>{data['report_time_uae']}</strong></div>
+            <div class="metric"><small>Market Phase</small><strong>{data['market_phase']}</strong></div>
+            <div class="metric"><small>Market Mode</small><strong>{data['market_mode']}</strong></div>
+            <div class="metric"><small>BUY / WATCH / DEAD</small><strong>{data['buy_count']} / {data['watch_count']} / {data['dead_count']}</strong></div>
         </div>
 
         <div class="card">
@@ -1103,43 +1076,40 @@ def dashboard_page():
             <table>
                 <thead>
                     <tr>
-                        <th>Symbol</th>
-                        <th>Close</th>
-                        <th>Change</th>
-                        <th>Score</th>
-                        <th>Recommendation</th>
-                        <th>Entry</th>
-                        <th>Stop</th>
-                        <th>Target</th>
-                        <th>R/R</th>
+                        <th>Symbol</th><th>Close</th><th>Change</th><th>Score</th>
+                        <th>Status</th><th>Trend</th><th>Breakout</th><th>Volume</th>
+                        <th>Entry</th><th>Stop</th><th>Target</th>
                     </tr>
                 </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
+                <tbody>{top_rows}</tbody>
             </table>
         </div>
 
         <div class="card">
-            <h2>All Market Positions</h2>
+            <h2>Other Stocks</h2>
             <table>
                 <thead>
                     <tr>
-                        <th>Symbol</th>
-                        <th>Close</th>
-                        <th>Change</th>
-                        <th>Score</th>
-                        <th>Status</th>
-                        <th>Breakout</th>
-                        <th>Volume</th>
-                        <th>Entry</th>
-                        <th>Stop</th>
-                        <th>Target</th>
+                        <th>Symbol</th><th>Close</th><th>Change</th><th>Score</th>
+                        <th>Status</th><th>Trend</th><th>Breakout</th><th>Volume</th>
+                        <th>Entry</th><th>Stop</th><th>Target</th>
                     </tr>
                 </thead>
-                <tbody>
-                    {all_rows_html}
-                </tbody>
+                <tbody>{other_rows}</tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Dead / Weak Stocks</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th><th>Close</th><th>Change</th><th>Score</th>
+                        <th>Status</th><th>Trend</th><th>Breakout</th><th>Volume</th>
+                        <th>Entry</th><th>Stop</th><th>Target</th>
+                    </tr>
+                </thead>
+                <tbody>{dead_rows}</tbody>
             </table>
         </div>
     </body>
