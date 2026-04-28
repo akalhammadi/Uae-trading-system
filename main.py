@@ -5,6 +5,7 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime
 import os
+import ai_engine
 
 SECRET = os.getenv("SECRET", "abc123")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -1117,3 +1118,29 @@ def dashboard_page():
     """
 
     return html
+
+@app.get("/api/ai/status")
+def api_ai_status():
+    conn = db()
+    result = ai_engine.ai_status(conn)
+    conn.close()
+    return result
+
+
+@app.post("/api/ai/train")
+def api_ai_train():
+    conn = db()
+    result = ai_engine.train_models(conn)
+    conn.close()
+    return result
+
+
+@app.get("/api/ai/predict")
+def api_ai_predict():
+    conn = db()
+    result = ai_engine.predict_latest(conn)
+    conn.close()
+    return {
+        "count": len(result),
+        "predictions": result
+    }
