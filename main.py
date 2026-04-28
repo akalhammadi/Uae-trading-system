@@ -1150,7 +1150,7 @@ def api_ai_predict():
 # =========================
 
 @app.get("/api/ai/top-trades")
-def ai_top_trades(limit: int = 10):
+def ai_top_trades(limit: int = 5):
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -1213,7 +1213,10 @@ def ai_top_trades(limit: int = 10):
         elif prob >= 0.7 and profit >= 0.05 and rr >= 1.8 and trend_up:
             action = "STRONG BUY"
         elif prob >= 0.5 and profit >= 0.06 and rr >= 2:
-            action = "SMART RISK"
+            if trend_down:
+                action = "REVERSAL BUY"
+            else:
+                action = "SMART BUY"
         elif prob >= 0.75 and profit >= 0.03:
             action = "SAFE BUY"
         elif prob >= 0.45 and profit >= 0.08 and rr >= 2.5:
@@ -1261,8 +1264,9 @@ def ai_top_trades(limit: int = 10):
             "AI GOOD",
             "SAFE BUY",
             "STRONG BUY",
-            "SMART RISK",
-            "BREAKOUT ATTACK"
+            "SMART BUY",
+            "BREAKOUT ATTACK",
+            "REVERSAL BUY"
         ]
     ][:limit]
 
