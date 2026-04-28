@@ -7,35 +7,6 @@ from datetime import datetime
 URL = "https://uae-market-production.up.railway.app/api/upload-batch"
 
 FILES = {
-    "EMAAR": "EMAAR.csv",
-    "DIB": "DIB.csv",
-    "SALIK": "SALIK.csv",
-    "DEWA": "DEWA.csv",
-    "ALDAR": "ALDAR.csv",
-    "FAB": "FAB.csv",
-    "ADNOCDRILL": "ADNOCDRILL.csv",
-    "ADNOCGAS": "ADNOCGAS.csv",
-    "ADNOCLS": "ADNOCLS.csv",
-    "ADNOCDIST": "ADNOCDIST.csv",
-    "PRESIGHT": "PRESIGHT.csv",
-    "BOROUGE": "BOROUGE.csv",
-    "TAQA": "TAQA.csv",
-    "EAND": "EAND.csv",
-    "DU": "DU.csv",
-    "AIRARABIA": "AIRARABIA.csv",
-    "DFM": "DFM.csv",
-    "EMAARDEV": "EMAARDEV.csv",
-    "ARAMEX": "ARAMEX.csv",
-    "GFH": "GFH.csv",
-    "SHUAA": "SHUAA.csv",
-    "RAKPROP": "RAKPROP.csv",
-    "RAKBANK": "RAKBANK.csv",
-    "AJMANBANK": "AJMANBANK.csv",
-    "ENBD": "ENBD.csv",
-    "MASQ": "MASQ.csv",
-    "NMDC": "NMDC.csv",
-    "ADPORTS": "ADPORTS.csv",
-    "ADIB": "ADIB.csv",
     "SIB": "SIB.csv",
     "MANAZEL": "MANAZEL.csv",
     "INVICTUS": "INVICTUS.csv",
@@ -46,7 +17,7 @@ FILES = {
     "SPACE42": "SPACE42.csv",
     "FERTIGLB": "FERTIGLB.csv",
     "DTC": "DTC.csv",
-    "APEX": "APEX.csv",
+    "APEX": "APEX.csv"
 }
 
 CHUNK_SIZE = 25
