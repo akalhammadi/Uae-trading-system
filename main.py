@@ -749,6 +749,7 @@ def daily_dashboard():
         data[r["symbol"]].append(r)
 
     results = []
+    dead_stocks = []
 
     for symbol, candles in data.items():
         if len(candles) < 30:
@@ -756,36 +757,60 @@ def daily_dashboard():
 
         latest = candles[0]
         last_close = latest["close"]
-        last_high = latest["high"]
-        last_low = latest["low"]
         last_volume = latest["volume"] or 0
-
         prev_close = candles[1]["close"]
+
         change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
 
+        closes = [c["close"] for c in candles[:50] if c["close"] is not None]
         highs_20 = [c["high"] for c in candles[1:21] if c["high"] is not None]
         lows_10 = [c["low"] for c in candles[1:11] if c["low"] is not None]
         volumes_20 = [c["volume"] for c in candles[1:21] if c["volume"] is not None]
 
-        recent_high = max(highs_20) if highs_20 else last_high
-        recent_low = min(lows_10) if lows_10 else last_low
+        recent_high = max(highs_20) if highs_20 else latest["high"]
+        recent_low = min(lows_10) if lows_10 else latest["low"]
         avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else last_volume
+
+        ema20 = sum(closes[:20]) / 20 if len(closes) >= 20 else last_close
+        ema50 = sum(closes[:50]) / 50 if len(closes) >= 50 else ema20
+
+        trend_up = last_close > ema20 and ema20 > ema50
+        trend_down = last_close < ema20 and ema20 < ema50
 
         breakout = last_close > recent_high
         volume_confirmed = last_volume > avg_volume * 1.3 if avg_volume else False
-        positive_momentum = change_pct > 0.5
+        quiet_volume = last_volume < avg_volume * 0.7 if avg_volume else False
 
         score = 0
+
+        if trend_up:
+            score += 25
         if breakout:
-            score += 40
-        if volume_confirmed:
             score += 30
-        if positive_momentum:
-            score += 20
-        if last_close > recent_low:
+        if volume_confirmed:
+            score += 25
+        if change_pct > 0.5:
+            score += 10
+        if change_pct > 1.5:
             score += 10
 
+        if trend_down:
+            score -= 20
+        if change_pct < -1:
+            score -= 10
+        if quiet_volume:
+            score -= 10
+
+        score = max(score, 0)
+
+        dead = False
+        if score <= 10 and quiet_volume and not breakout:
+            dead = True
+        if trend_down and score <= 20:
+            dead = True
+
         recommendation = "AVOID"
+
         if score >= 80:
             recommendation = "BUY"
         elif score >= 60:
@@ -804,23 +829,43 @@ def daily_dashboard():
             "last_close": round(last_close, 3),
             "change_pct": round(change_pct, 2),
             "volume": last_volume,
+            "avg_volume_20": round(avg_volume, 2) if avg_volume else None,
+            "volume_confirmed": volume_confirmed,
+            "quiet_volume": quiet_volume,
+            "breakout": breakout,
+            "trend": "UP" if trend_up else "DOWN" if trend_down else "SIDEWAYS",
+            "recent_high_20": round(recent_high, 3),
+            "recent_low_10": round(recent_low, 3),
             "score": score,
             "recommendation": recommendation,
             "entry": round(entry, 3),
             "stop_loss": round(stop_loss, 3) if stop_loss else None,
             "target": round(target, 3) if target else None,
             "risk_reward": rr,
-            "breakout": breakout,
-            "volume_confirmed": volume_confirmed,
             "bar_time": latest["bar_time"]
         }
 
-        results.append(item)
+        if dead:
+            item["recommendation"] = "DEAD"
+            dead_stocks.append(item)
+        else:
+            results.append(item)
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)
+    dead_stocks = sorted(dead_stocks, key=lambda x: x["score"])
 
-    buy_list = [x for x in results if x["recommendation"] == "BUY"]
-    watch_list = [x for x in results if x["recommendation"] == "WATCH"]
+    top_recommendations = [x for x in results if x["recommendation"] in ["BUY", "WATCH"]][:10]
+
+    top_symbols = set(x["symbol"] for x in top_recommendations)
+    dead_symbols = set(x["symbol"] for x in dead_stocks)
+
+    other_stocks = [
+        x for x in results
+        if x["symbol"] not in top_symbols and x["symbol"] not in dead_symbols
+    ]
+
+    buy_list = [x for x in top_recommendations if x["recommendation"] == "BUY"]
+    watch_list = [x for x in top_recommendations if x["recommendation"] == "WATCH"]
 
     market_mode = "Defensive"
     if len(buy_list) >= 5:
@@ -828,11 +873,10 @@ def daily_dashboard():
     elif len(buy_list) >= 2 or len(watch_list) >= 5:
         market_mode = "Neutral"
 
-    # نحفظ history فقط بعد إغلاق السوق
     if market_phase == "AFTER_CLOSE":
         now = datetime.utcnow().isoformat()
 
-        for item in results:
+        for item in top_recommendations:
             cur.execute("""
             INSERT INTO daily_recommendations
             (report_date, symbol, last_close, change_pct, volume, score,
@@ -880,10 +924,10 @@ def daily_dashboard():
         "market_mode": market_mode,
         "buy_count": len(buy_list),
         "watch_count": len(watch_list),
-        "top_recommendations": results[:10],
-        "buy_list": buy_list,
-        "watch_list": watch_list,
-        "all_stocks": results
+        "dead_count": len(dead_stocks),
+        "top_recommendations": top_recommendations,
+        "other_stocks": other_stocks,
+        "dead_stocks": dead_stocks
     }
 
 
