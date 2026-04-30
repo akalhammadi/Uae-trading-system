@@ -1,31 +1,45 @@
+import os
 import requests
-import pandas as pd
 from datetime import datetime
 
-print("🚀 Starting auto_daily_prices script...")
+API_BASE = os.getenv("API_BASE", "https://uae-market-production.up.railway.app")
+API_URL = f"{API_BASE.rstrip('/')}/api/candles/daily-latest"
 
-API_URL = "https://uae-market-production.up.railway.app/api/candles/latest"
+print("🚀 Starting auto_daily_prices.py")
+print("🌐 API_URL =", API_URL)
 
 try:
     print("📡 Fetching data from API...")
-    res = requests.get(API_URL)
-    data = res.json()
+    response = requests.get(API_URL, timeout=60)
 
-    print(f"✅ Received {len(data.get('prices', []))} records")
+    print("HTTP status:", response.status_code)
+    print("Response preview:", response.text[:500])
 
-    df = pd.DataFrame(data["prices"])
+    response.raise_for_status()
+    data = response.json()
 
-    print("📊 Data sample:")
-    print(df.head())
+    prices = data.get("prices", [])
 
-    # حفظ CSV
-    filename = f"daily_prices_{datetime.now().date()}.csv"
-    df.to_csv(filename, index=False)
+    print(f"✅ Received {len(prices)} records")
 
-    print(f"💾 Saved CSV: {filename}")
+    if not prices:
+        print("⚠️ No prices received. Check /api/candles/daily-latest output.")
+        raise SystemExit(0)
 
-    print("🎯 Script finished successfully")
+    print("📊 Latest prices:")
+    for item in prices:
+        print(
+            item.get("symbol"),
+            item.get("bar_time"),
+            "close=",
+            item.get("close"),
+            "volume=",
+            item.get("volume"),
+        )
+
+    print("✅ Finished successfully at", datetime.utcnow().isoformat())
 
 except Exception as e:
     print("❌ ERROR OCCURRED:")
-    print(str(e))
+    print(repr(e))
+    raise
