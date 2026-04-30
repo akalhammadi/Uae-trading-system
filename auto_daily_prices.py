@@ -3,7 +3,7 @@ import requests
 from datetime import datetime
 
 API_BASE = os.getenv("API_BASE", "https://uae-market-production.up.railway.app")
-API_URL = f"{API_BASE.rstrip('/')}/api/candles/daily-latest"
+API_URL = f"{API_BASE.rstrip('/')}/api/candles/latest?timeframe=1D&limit=200"
 
 print("🚀 Starting auto_daily_prices.py")
 print("🌐 API_URL =", API_URL)
@@ -18,16 +18,11 @@ try:
     response.raise_for_status()
     data = response.json()
 
-    prices = data.get("prices", [])
+    prices = data.get("candles", [])
 
     print(f"✅ Received {len(prices)} records")
 
-    if not prices:
-        print("⚠️ No prices received. Check /api/candles/daily-latest output.")
-        raise SystemExit(0)
-
-    print("📊 Latest prices:")
-    for item in prices:
+    for item in prices[:40]:
         print(
             item.get("symbol"),
             item.get("bar_time"),
