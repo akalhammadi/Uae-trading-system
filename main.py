@@ -5,13 +5,20 @@ from typing import Optional, List
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone, timedelta
-import os, csv, io, json
+import os
+import csv
+import io
+import json
 import ai_engine
+
 
 SECRET = os.getenv("SECRET", "abc123")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = FastAPI(title="UAE Trading AI System")
+app = FastAPI(
+    title="UAE Trading AI System",
+    version="0.2.0"
+)
 
 
 def db():
@@ -20,7 +27,9 @@ def db():
     return psycopg2.connect(DATABASE_URL)
 
 
-SYMBOL_MAP = {"ARAMEX": "ARMX"}
+SYMBOL_MAP = {
+    "ARAMEX": "ARMX",
+}
 
 
 def normalize_symbol(symbol: str):
@@ -32,26 +41,53 @@ def normalize_symbol(symbol: str):
     return SYMBOL_MAP.get(symbol, symbol)
 
 
+def now_utc():
+    return datetime.utcnow().isoformat()
+
+
+def uae_now():
+    return datetime.now(timezone(timedelta(hours=4)))
+
+
 def clean_num(x):
     if x is None:
         return None
+
     s = str(x).replace(",", "").strip().upper()
-    if s in ["", "-", "N/A", "NONE"]:
+
+    if s in ["", "-", "N/A", "NONE", "NULL"]:
         return None
 
     multiplier = 1
+
     if s.endswith("M"):
-        multiplier, s = 1_000_000, s[:-1]
+        multiplier = 1_000_000
+        s = s[:-1]
     elif s.endswith("K"):
-        multiplier, s = 1_000, s[:-1]
+        multiplier = 1_000
+        s = s[:-1]
     elif s.endswith("B"):
-        multiplier, s = 1_000_000_000, s[:-1]
+        multiplier = 1_000_000_000
+        s = s[:-1]
 
     return float(s) * multiplier
 
 
+def get_market_phase():
+    n = uae_now()
+
+    if 10 <= n.hour < 15:
+        phase = "MARKET_OPEN"
+    elif n.hour >= 15:
+        phase = "AFTER_CLOSE"
+    else:
+        phase = "PRE_MARKET"
+
+    return n, phase
+
+
 # =========================
-# DATABASE INIT
+# DB INIT
 # =========================
 
 def init_db():
@@ -107,15 +143,6 @@ def init_db():
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS portfolio_settings (
-        id INTEGER PRIMARY KEY,
-        capital DOUBLE PRECISION NOT NULL,
-        cash DOUBLE PRECISION NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
     CREATE TABLE IF NOT EXISTS daily_recommendations (
         id SERIAL PRIMARY KEY,
         report_date TEXT NOT NULL,
@@ -132,6 +159,15 @@ def init_db():
         market_phase TEXT,
         created_at TEXT NOT NULL,
         UNIQUE(report_date, symbol)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_settings (
+        id INTEGER PRIMARY KEY,
+        capital DOUBLE PRECISION NOT NULL,
+        cash DOUBLE PRECISION NOT NULL,
+        updated_at TEXT NOT NULL
     )
     """)
 
@@ -169,7 +205,7 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signal_outcomes (
         id SERIAL PRIMARY KEY,
-        signal_id INTEGER UNIQUE,
+        signal_id INTEGER,
         symbol TEXT NOT NULL,
         signal TEXT,
         signal_price DOUBLE PRECISION,
@@ -231,7 +267,7 @@ class PortfolioSetup(BaseModel):
     capital: float
 
 
-class TradePayload(BaseModel):
+class PortfolioBuyPayload(BaseModel):
     symbol: str
     qty: float
     price: float
@@ -245,6 +281,42 @@ class PortfolioSellPayload(BaseModel):
     note: Optional[str] = None
 
 
+class TradePayload(BaseModel):
+    symbol: str
+    qty: float
+    price: float
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    note: Optional[str] = None
+
+
+# =========================
+# PRICE HELPERS
+# =========================
+
+def get_latest_daily_candle(conn, symbol):
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT symbol, bar_time, open, high, low, close, volume
+        FROM candles
+        WHERE symbol = %s
+          AND timeframe = '1D'
+          AND close IS NOT NULL
+        ORDER BY bar_time DESC
+        LIMIT 1
+    """, (symbol,))
+
+    return cur.fetchone()
+
+
+def get_latest_daily_price(conn, symbol, fallback=None):
+    row = get_latest_daily_candle(conn, symbol)
+    if not row:
+        return fallback, None
+    return row["close"], row["bar_time"]
+
+
 # =========================
 # WEBHOOK
 # =========================
@@ -254,35 +326,50 @@ def tradingview_webhook(payload: TVPayload):
     if payload.secret != SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    now = datetime.utcnow().isoformat()
-    symbol = normalize_symbol(payload.symbol)
-
     conn = db()
     cur = conn.cursor()
 
+    symbol = normalize_symbol(payload.symbol)
+    current_time = now_utc()
+
     if payload.type == "CANDLE_UPDATE":
+        timeframe = payload.timeframe or "60"
+
         cur.execute("""
             INSERT INTO candles
             (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (symbol, timeframe, bar_time)
             DO UPDATE SET
-                exchange=EXCLUDED.exchange,
-                open=EXCLUDED.open,
-                high=EXCLUDED.high,
-                low=EXCLUDED.low,
-                close=EXCLUDED.close,
-                volume=EXCLUDED.volume,
-                received_at=EXCLUDED.received_at
+                exchange = EXCLUDED.exchange,
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                received_at = EXCLUDED.received_at
         """, (
-            symbol, payload.exchange, payload.timeframe or "60",
-            payload.time or now, payload.open, payload.high,
-            payload.low, payload.close, payload.volume, now
+            symbol,
+            payload.exchange,
+            timeframe,
+            payload.time or current_time,
+            payload.open,
+            payload.high,
+            payload.low,
+            payload.close,
+            payload.volume,
+            current_time
         ))
 
         conn.commit()
         conn.close()
-        return {"status": "ok", "stored": "candle", "symbol": symbol}
+
+        return {
+            "status": "ok",
+            "stored": "candle",
+            "symbol": symbol,
+            "timeframe": timeframe
+        }
 
     if payload.type == "SIGNAL":
         cur.execute("""
@@ -290,25 +377,37 @@ def tradingview_webhook(payload: TVPayload):
             (symbol, exchange, timeframe, signal, price, volume, bar_time, received_at, payload)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            symbol, payload.exchange, payload.timeframe,
+            symbol,
+            payload.exchange,
+            payload.timeframe,
             payload.signal or "UNKNOWN",
             payload.price or payload.close,
             payload.volume,
             payload.time,
-            now,
+            current_time,
             payload.model_dump_json()
         ))
 
         conn.commit()
         conn.close()
-        return {"status": "ok", "stored": "signal", "symbol": symbol}
+
+        return {
+            "status": "ok",
+            "stored": "signal",
+            "symbol": symbol
+        }
 
     conn.close()
-    return {"status": "ignored", "symbol": symbol}
+
+    return {
+        "status": "ignored",
+        "reason": "unknown type",
+        "symbol": symbol
+    }
 
 
 # =========================
-# DATA UPLOAD
+# DATA API
 # =========================
 
 @app.get("/api/candles/latest")
@@ -316,15 +415,19 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    q = "SELECT * FROM candles WHERE 1=1"
+    q = """
+        SELECT *
+        FROM candles
+        WHERE close IS NOT NULL
+    """
     params = []
 
     if symbol:
-        q += " AND symbol=%s"
+        q += " AND symbol = %s"
         params.append(normalize_symbol(symbol))
 
     if timeframe:
-        q += " AND timeframe=%s"
+        q += " AND timeframe = %s"
         params.append(timeframe)
 
     q += " ORDER BY bar_time DESC LIMIT %s"
@@ -337,6 +440,29 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
     return {"count": len(rows), "candles": rows}
 
 
+@app.get("/api/prices/daily-latest")
+def daily_latest_prices():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT DISTINCT ON (symbol)
+            symbol, bar_time, open, high, low, close, volume, received_at
+        FROM candles
+        WHERE timeframe = '1D'
+          AND close IS NOT NULL
+        ORDER BY symbol, bar_time DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "count": len(rows),
+        "prices": rows
+    }
+
+
 @app.get("/api/signals/latest")
 def latest_signals(symbol: Optional[str] = None, limit: int = 50):
     conn = db()
@@ -346,7 +472,7 @@ def latest_signals(symbol: Optional[str] = None, limit: int = 50):
     params = []
 
     if symbol:
-        q += " AND symbol=%s"
+        q += " AND symbol = %s"
         params.append(normalize_symbol(symbol))
 
     q += " ORDER BY received_at DESC LIMIT %s"
@@ -379,7 +505,12 @@ async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
         except Exception:
             date = raw_date
 
+        open_price = row.get("Open") or row.get("open")
+        high = row.get("High") or row.get("high")
+        low = row.get("Low") or row.get("low")
         close = row.get("Price") or row.get("Close") or row.get("close")
+        volume = row.get("Vol.") or row.get("Volume") or row.get("volume")
+
         if not date or not close:
             continue
 
@@ -389,23 +520,23 @@ async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (symbol, timeframe, bar_time)
             DO UPDATE SET
-                open=EXCLUDED.open,
-                high=EXCLUDED.high,
-                low=EXCLUDED.low,
-                close=EXCLUDED.close,
-                volume=EXCLUDED.volume,
-                received_at=EXCLUDED.received_at
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                received_at = EXCLUDED.received_at
         """, (
             symbol,
             "HISTORICAL",
             "1D",
             date,
-            clean_num(row.get("Open") or row.get("open")),
-            clean_num(row.get("High") or row.get("high")),
-            clean_num(row.get("Low") or row.get("low")),
+            clean_num(open_price),
+            clean_num(high),
+            clean_num(low),
             clean_num(close),
-            clean_num(row.get("Vol.") or row.get("Volume") or row.get("volume")),
-            datetime.utcnow().isoformat()
+            clean_num(volume),
+            now_utc()
         ))
 
         inserted += 1
@@ -413,7 +544,11 @@ async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
     conn.commit()
     conn.close()
 
-    return {"status": "ok", "symbol": symbol, "rows_inserted": inserted}
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "rows_inserted": inserted
+    }
 
 
 @app.post("/api/upload-batch")
@@ -424,13 +559,21 @@ def upload_batch(payload: BatchUpload):
     conn = db()
     cur = conn.cursor()
 
-    now = datetime.utcnow().isoformat()
     symbol = normalize_symbol(payload.symbol)
+    current_time = now_utc()
 
     values = [
         (
-            symbol, payload.exchange, payload.timeframe,
-            r.date, r.open, r.high, r.low, r.close, r.volume, now
+            symbol,
+            payload.exchange,
+            payload.timeframe,
+            r.date,
+            r.open,
+            r.high,
+            r.low,
+            r.close,
+            r.volume,
+            current_time
         )
         for r in payload.rows
     ]
@@ -443,12 +586,12 @@ def upload_batch(payload: BatchUpload):
         VALUES %s
         ON CONFLICT (symbol, timeframe, bar_time)
         DO UPDATE SET
-            open=EXCLUDED.open,
-            high=EXCLUDED.high,
-            low=EXCLUDED.low,
-            close=EXCLUDED.close,
-            volume=EXCLUDED.volume,
-            received_at=EXCLUDED.received_at
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            received_at = EXCLUDED.received_at
         """,
         values
     )
@@ -456,38 +599,31 @@ def upload_batch(payload: BatchUpload):
     conn.commit()
     conn.close()
 
-    return {"status": "ok", "symbol": symbol, "inserted": len(values)}
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "timeframe": payload.timeframe,
+        "inserted": len(values)
+    }
 
 
 # =========================
-# MARKET LOGIC
+# MARKET REACTION
 # =========================
-
-def get_market_phase():
-    uae_now = datetime.now(timezone(timedelta(hours=4)))
-
-    if 10 <= uae_now.hour < 15:
-        phase = "MARKET_OPEN"
-    elif uae_now.hour >= 15:
-        phase = "AFTER_CLOSE"
-    else:
-        phase = "PRE_MARKET"
-
-    return uae_now, phase
-
 
 def get_signal_score(conn, symbol):
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        SELECT signal
+        SELECT signal, price, volume, bar_time, received_at
         FROM signals
-        WHERE symbol=%s
+        WHERE symbol = %s
         ORDER BY received_at DESC
         LIMIT 10
     """, (symbol,))
 
     rows = cur.fetchall()
+
     score = 0
     last_signal = None
 
@@ -502,7 +638,7 @@ def get_signal_score(conn, symbol):
         if "VOLUME" in sig:
             score += 15
         if "SELL" in sig or "EXIT" in sig:
-            score -= 25
+            score -= 30
 
     return {
         "signal_score": max(min(score, 100), -100),
@@ -516,7 +652,9 @@ def get_market_reaction_score(conn, symbol):
     cur.execute("""
         SELECT bar_time, open, high, low, close, volume
         FROM candles
-        WHERE symbol=%s AND timeframe='1D' AND close IS NOT NULL
+        WHERE symbol = %s
+          AND timeframe = '1D'
+          AND close IS NOT NULL
         ORDER BY bar_time DESC
         LIMIT 25
     """, (symbol,))
@@ -532,7 +670,8 @@ def get_market_reaction_score(conn, symbol):
             "intraday_strength": 0,
             "volume_ratio": 0,
             "breakout": False,
-            **signal_data
+            "signal_score": signal_data["signal_score"],
+            "last_signal": signal_data["last_signal"]
         }
 
     latest = rows[0]
@@ -554,6 +693,7 @@ def get_market_reaction_score(conn, symbol):
     breakout = close > recent_high
 
     score = 0
+
     if today_change_pct > 0.5:
         score += 10
     if today_change_pct > 1:
@@ -586,7 +726,8 @@ def get_market_reaction_score(conn, symbol):
         "intraday_strength": round(intraday_strength, 2),
         "volume_ratio": round(volume_ratio, 2),
         "breakout": breakout,
-        **signal_data
+        "signal_score": signal_data["signal_score"],
+        "last_signal": signal_data["last_signal"]
     }
 
 
@@ -595,30 +736,40 @@ def market_reaction():
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("SELECT DISTINCT symbol FROM candles WHERE timeframe='1D'")
-    symbols = [r["symbol"] for r in cur.fetchall()]
+    cur.execute("""
+        SELECT DISTINCT symbol
+        FROM candles
+        WHERE timeframe = '1D'
+    """)
 
+    symbols = [r["symbol"] for r in cur.fetchall()]
     results = []
+
     for symbol in symbols:
-        item = get_market_reaction_score(conn, symbol)
-        item["symbol"] = symbol
-        results.append(item)
+        reaction = get_market_reaction_score(conn, symbol)
+        reaction["symbol"] = symbol
+        reaction["total_score"] = reaction["reaction_score"] + reaction["signal_score"]
+        results.append(reaction)
 
     conn.close()
 
-    results = sorted(
-        results,
-        key=lambda x: x["reaction_score"] + x["signal_score"],
-        reverse=True
-    )
+    results = sorted(results, key=lambda x: x["total_score"], reverse=True)
 
-    return {"count": len(results), "hot_stocks": results[:10], "all": results}
+    return {
+        "count": len(results),
+        "hot_stocks": results[:10],
+        "all": results
+    }
 
+
+# =========================
+# DAILY DASHBOARD
+# =========================
 
 @app.get("/api/dashboard/daily")
 def daily_dashboard():
-    uae_now, market_phase = get_market_phase()
-    report_date = uae_now.strftime("%Y-%m-%d")
+    n, market_phase = get_market_phase()
+    report_date = n.strftime("%Y-%m-%d")
 
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -626,7 +777,8 @@ def daily_dashboard():
     cur.execute("""
         SELECT symbol, bar_time, open, high, low, close, volume
         FROM candles
-        WHERE timeframe='1D' AND close IS NOT NULL
+        WHERE timeframe = '1D'
+          AND close IS NOT NULL
         ORDER BY symbol, bar_time DESC
     """)
 
@@ -646,9 +798,11 @@ def daily_dashboard():
             continue
 
         latest = candles[0]
+        prev = candles[1]
+
         last_close = latest["close"]
-        prev_close = candles[1]["close"]
         last_volume = latest["volume"] or 0
+        prev_close = prev["close"]
 
         change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
 
@@ -674,6 +828,7 @@ def daily_dashboard():
         reaction = get_market_reaction_score(conn, symbol)
 
         score = 0
+
         if trend_up:
             score += 25
         if breakout:
@@ -684,6 +839,10 @@ def daily_dashboard():
             score += 10
         if change_pct > 1.5:
             score += 10
+
+        score += reaction["reaction_score"] * 0.25
+        score += reaction["signal_score"] * 0.15
+
         if trend_down:
             score -= 20
         if change_pct < -1:
@@ -691,13 +850,11 @@ def daily_dashboard():
         if quiet_volume:
             score -= 10
 
-        score += reaction["reaction_score"] * 0.4
-        score += reaction["signal_score"] * 0.3
-
         score = max(round(score, 2), 0)
 
         recommendation = "AVOID"
-        if score >= 85:
+
+        if score >= 80 and not trend_down:
             recommendation = "BUY"
         elif score >= 60:
             recommendation = "WATCH"
@@ -707,17 +864,19 @@ def daily_dashboard():
         dead = False
         if score <= 15 and quiet_volume and not breakout:
             dead = True
-        if trend_down and score <= 25 and reaction["reaction_score"] < 35:
+        if trend_down and score <= 25:
             dead = True
 
         entry = last_close
         stop_loss = recent_low
         risk = entry - stop_loss if entry and stop_loss else None
-        target = entry + risk * 2 if risk and risk > 0 else None
+        target = entry + (risk * 2) if risk and risk > 0 else None
+        rr = 2 if target else None
 
         item = {
             "symbol": symbol,
             "last_close": round(last_close, 3),
+            "data_date": latest["bar_time"],
             "change_pct": round(change_pct, 2),
             "volume": last_volume,
             "avg_volume_20": round(avg_volume, 2) if avg_volume else None,
@@ -727,20 +886,21 @@ def daily_dashboard():
             "trend": "UP" if trend_up else "DOWN" if trend_down else "SIDEWAYS",
             "recent_high_20": round(recent_high, 3),
             "recent_low_10": round(recent_low, 3),
-            "score": score,
-            "recommendation": "DEAD" if dead else recommendation,
-            "entry": round(entry, 3),
-            "stop_loss": round(stop_loss, 3) if stop_loss else None,
-            "target": round(target, 3) if target else None,
-            "risk_reward": 2 if target else None,
             "reaction_score": reaction["reaction_score"],
             "reaction_label": reaction["reaction_label"],
             "signal_score": reaction["signal_score"],
             "last_signal": reaction["last_signal"],
+            "score": score,
+            "recommendation": recommendation,
+            "entry": round(entry, 3),
+            "stop_loss": round(stop_loss, 3) if stop_loss else None,
+            "target": round(target, 3) if target else None,
+            "risk_reward": rr,
             "bar_time": latest["bar_time"]
         }
 
         if dead:
+            item["recommendation"] = "DEAD"
             dead_stocks.append(item)
         else:
             results.append(item)
@@ -748,14 +908,14 @@ def daily_dashboard():
     results = sorted(results, key=lambda x: x["score"], reverse=True)
     dead_stocks = sorted(dead_stocks, key=lambda x: x["score"])
 
-    top_recommendations = [
-        x for x in results if x["recommendation"] in ["BUY", "WATCH"]
-    ][:10]
+    top_recommendations = [x for x in results if x["recommendation"] in ["BUY", "WATCH"]][:10]
 
     top_symbols = set(x["symbol"] for x in top_recommendations)
+    dead_symbols = set(x["symbol"] for x in dead_stocks)
 
     other_stocks = [
-        x for x in results if x["symbol"] not in top_symbols
+        x for x in results
+        if x["symbol"] not in top_symbols and x["symbol"] not in dead_symbols
     ]
 
     buy_list = [x for x in top_recommendations if x["recommendation"] == "BUY"]
@@ -768,8 +928,6 @@ def daily_dashboard():
         market_mode = "Neutral"
 
     if market_phase == "AFTER_CLOSE":
-        now = datetime.utcnow().isoformat()
-
         for item in top_recommendations:
             cur.execute("""
                 INSERT INTO daily_recommendations
@@ -779,22 +937,31 @@ def daily_dashboard():
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (report_date, symbol)
                 DO UPDATE SET
-                    last_close=EXCLUDED.last_close,
-                    change_pct=EXCLUDED.change_pct,
-                    volume=EXCLUDED.volume,
-                    score=EXCLUDED.score,
-                    recommendation=EXCLUDED.recommendation,
-                    entry=EXCLUDED.entry,
-                    stop_loss=EXCLUDED.stop_loss,
-                    target=EXCLUDED.target,
-                    risk_reward=EXCLUDED.risk_reward,
-                    market_phase=EXCLUDED.market_phase,
-                    created_at=EXCLUDED.created_at
+                    last_close = EXCLUDED.last_close,
+                    change_pct = EXCLUDED.change_pct,
+                    volume = EXCLUDED.volume,
+                    score = EXCLUDED.score,
+                    recommendation = EXCLUDED.recommendation,
+                    entry = EXCLUDED.entry,
+                    stop_loss = EXCLUDED.stop_loss,
+                    target = EXCLUDED.target,
+                    risk_reward = EXCLUDED.risk_reward,
+                    market_phase = EXCLUDED.market_phase,
+                    created_at = EXCLUDED.created_at
             """, (
-                report_date, item["symbol"], item["last_close"], item["change_pct"],
-                item["volume"], item["score"], item["recommendation"], item["entry"],
-                item["stop_loss"], item["target"], item["risk_reward"],
-                market_phase, now
+                report_date,
+                item["symbol"],
+                item["last_close"],
+                item["change_pct"],
+                item["volume"],
+                item["score"],
+                item["recommendation"],
+                item["entry"],
+                item["stop_loss"],
+                item["target"],
+                item["risk_reward"],
+                market_phase,
+                now_utc()
             ))
 
         conn.commit()
@@ -803,7 +970,7 @@ def daily_dashboard():
 
     return {
         "report_date": report_date,
-        "report_time_uae": uae_now.strftime("%Y-%m-%d %H:%M"),
+        "report_time_uae": n.strftime("%Y-%m-%d %H:%M"),
         "market_phase": market_phase,
         "report_status": "FINAL_AFTER_15:00" if market_phase == "AFTER_CLOSE" else "LIVE_NOT_FINAL",
         "market_mode": market_mode,
@@ -822,17 +989,23 @@ def daily_dashboard():
 
 def get_portfolio_settings(conn):
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM portfolio_settings WHERE id=1")
+
+    cur.execute("SELECT * FROM portfolio_settings WHERE id = 1")
     row = cur.fetchone()
 
     if not row:
-        now = datetime.utcnow().isoformat()
+        current_time = now_utc()
         cur.execute("""
             INSERT INTO portfolio_settings (id, capital, cash, updated_at)
-            VALUES (1,100000,100000,%s)
-        """, (now,))
+            VALUES (1, 100000, 100000, %s)
+        """, (current_time,))
         conn.commit()
-        return {"capital": 100000, "cash": 100000, "updated_at": now}
+
+        return {
+            "capital": 100000,
+            "cash": 100000,
+            "updated_at": current_time
+        }
 
     return row
 
@@ -842,28 +1015,38 @@ def setup_portfolio(payload: PortfolioSetup):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
-    if cur.fetchone()[0] > 0:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Cannot reset portfolio while open trades exist")
+    cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
+    open_count = cur.fetchone()[0]
 
-    now = datetime.utcnow().isoformat()
+    if open_count > 0:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reset portfolio while open trades exist"
+        )
 
     cur.execute("""
         INSERT INTO portfolio_settings (id, capital, cash, updated_at)
-        VALUES (1,%s,%s,%s)
+        VALUES (1, %s, %s, %s)
         ON CONFLICT (id)
-        DO UPDATE SET capital=EXCLUDED.capital, cash=EXCLUDED.cash, updated_at=EXCLUDED.updated_at
-    """, (payload.capital, payload.capital, now))
+        DO UPDATE SET
+            capital = EXCLUDED.capital,
+            cash = EXCLUDED.cash,
+            updated_at = EXCLUDED.updated_at
+    """, (payload.capital, payload.capital, now_utc()))
 
     conn.commit()
     conn.close()
 
-    return {"status": "ok", "capital": payload.capital, "cash": payload.capital}
+    return {
+        "status": "ok",
+        "capital": payload.capital,
+        "cash": payload.capital
+    }
 
 
 @app.post("/api/portfolio/buy")
-def portfolio_buy(payload: TradePayload):
+def portfolio_buy(payload: PortfolioBuyPayload):
     conn = db()
     cur = conn.cursor()
 
@@ -874,7 +1057,6 @@ def portfolio_buy(payload: TradePayload):
         conn.close()
         raise HTTPException(status_code=400, detail="Not enough cash")
 
-    now = datetime.utcnow().isoformat()
     symbol = normalize_symbol(payload.symbol)
 
     cur.execute("""
@@ -883,17 +1065,23 @@ def portfolio_buy(payload: TradePayload):
         VALUES (%s,%s,%s,%s,%s,'OPEN',%s,%s)
         RETURNING id
     """, (
-        symbol, payload.qty, payload.price, payload.stop_loss,
-        payload.target, now, payload.note
+        symbol,
+        payload.qty,
+        payload.price,
+        payload.stop_loss,
+        payload.target,
+        now_utc(),
+        payload.note
     ))
 
     trade_id = cur.fetchone()[0]
 
     cur.execute("""
         UPDATE portfolio_settings
-        SET cash = cash - %s, updated_at=%s
-        WHERE id=1
-    """, (cost, now))
+        SET cash = cash - %s,
+            updated_at = %s
+        WHERE id = 1
+    """, (cost, now_utc()))
 
     conn.commit()
     conn.close()
@@ -913,36 +1101,46 @@ def portfolio_sell(trade_id: int, payload: PortfolioSellPayload):
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    now = datetime.utcnow().isoformat()
+    cur.execute("""
+        SELECT *
+        FROM trades
+        WHERE id = %s AND status = 'OPEN'
+    """, (trade_id,))
 
-    cur.execute("SELECT * FROM trades WHERE id=%s AND status='OPEN'", (trade_id,))
     trade = cur.fetchone()
 
     if not trade:
         conn.close()
         raise HTTPException(status_code=404, detail="Open trade not found")
 
-    sell_value = trade["qty"] * payload.price
-    pnl = (payload.price - trade["entry_price"]) * trade["qty"]
-    pnl_pct = ((payload.price - trade["entry_price"]) / trade["entry_price"]) * 100 if trade["entry_price"] else 0
+    entry_price = trade["entry_price"]
+    qty = trade["qty"]
+    symbol = trade["symbol"]
+
+    sell_value = qty * payload.price
+    pnl = (payload.price - entry_price) * qty
+    pnl_pct = ((payload.price - entry_price) / entry_price) * 100 if entry_price else 0
 
     cur.execute("""
         UPDATE trades
-        SET sell_price=%s, status='CLOSED', closed_at=%s,
-            note = COALESCE(note,'') || %s
-        WHERE id=%s
+        SET sell_price = %s,
+            status = 'CLOSED',
+            closed_at = %s,
+            note = COALESCE(note, '') || %s
+        WHERE id = %s
     """, (
         payload.price,
-        now,
+        now_utc(),
         f" | SELL NOTE: {payload.note}" if payload.note else "",
         trade_id
     ))
 
     cur.execute("""
         UPDATE portfolio_settings
-        SET cash = cash + %s, updated_at=%s
-        WHERE id=1
-    """, (sell_value, now))
+        SET cash = cash + %s,
+            updated_at = %s
+        WHERE id = 1
+    """, (sell_value, now_utc()))
 
     conn.commit()
     conn.close()
@@ -950,7 +1148,7 @@ def portfolio_sell(trade_id: int, payload: PortfolioSellPayload):
     return {
         "status": "SOLD",
         "trade_id": trade_id,
-        "symbol": trade["symbol"],
+        "symbol": symbol,
         "sell_value": round(sell_value, 2),
         "pnl": round(pnl, 2),
         "pnl_pct": round(pnl_pct, 2)
@@ -963,7 +1161,13 @@ def portfolio_summary_data():
 
     settings = get_portfolio_settings(conn)
 
-    cur.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY opened_at DESC")
+    cur.execute("""
+        SELECT *
+        FROM trades
+        WHERE status = 'OPEN'
+        ORDER BY opened_at DESC
+    """)
+
     trades = cur.fetchall()
 
     holdings = []
@@ -971,16 +1175,8 @@ def portfolio_summary_data():
     market_value = 0
 
     for t in trades:
-        cur.execute("""
-            SELECT close
-            FROM candles
-            WHERE symbol=%s
-            ORDER BY bar_time DESC
-            LIMIT 1
-        """, (t["symbol"],))
-
-        row = cur.fetchone()
-        current_price = row["close"] if row else t["entry_price"]
+        symbol = t["symbol"]
+        current_price, price_date = get_latest_daily_price(conn, symbol, t["entry_price"])
 
         cost = t["qty"] * t["entry_price"]
         value = t["qty"] * current_price
@@ -992,10 +1188,11 @@ def portfolio_summary_data():
 
         holdings.append({
             "trade_id": t["id"],
-            "symbol": t["symbol"],
+            "symbol": symbol,
             "qty": t["qty"],
             "entry": round(t["entry_price"], 3),
             "current_price": round(current_price, 3),
+            "price_date": price_date,
             "cost": round(cost, 2),
             "market_value": round(value, 2),
             "pnl": round(pnl, 2),
@@ -1029,12 +1226,27 @@ def portfolio_summary():
 
 @app.post("/api/trades/buy")
 def buy_trade(payload: TradePayload):
-    return portfolio_buy(payload)
+    return portfolio_buy(
+        PortfolioBuyPayload(
+            symbol=payload.symbol,
+            qty=payload.qty,
+            price=payload.price,
+            stop_loss=payload.stop_loss,
+            target=payload.target,
+            note=payload.note
+        )
+    )
 
 
 @app.post("/api/trades/sell/{trade_id}")
-def sell_trade(trade_id: int, payload: PortfolioSellPayload):
-    return portfolio_sell(trade_id, payload)
+def sell_trade(trade_id: int, payload: TradePayload):
+    return portfolio_sell(
+        trade_id,
+        PortfolioSellPayload(
+            price=payload.price,
+            note=payload.note
+        )
+    )
 
 
 @app.get("/api/trades/open")
@@ -1048,7 +1260,7 @@ def open_trades():
         (entry_price - stop_loss) AS risk,
         (target - entry_price) / NULLIF((entry_price - stop_loss),0) AS rr
         FROM trades
-        WHERE status='OPEN'
+        WHERE status = 'OPEN'
         ORDER BY opened_at DESC
     """)
 
@@ -1064,7 +1276,8 @@ def all_trades():
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        SELECT *, (sell_price - entry_price) * qty AS pnl
+        SELECT *,
+        (sell_price - entry_price) * qty AS pnl
         FROM trades
         ORDER BY id DESC
     """)
@@ -1076,76 +1289,19 @@ def all_trades():
 
 
 # =========================
-# AI LEARNING
+# AI
 # =========================
 
 AUTO_TRAIN_HOURS = 12
 LAST_AUTO_TRAIN_AT = None
 
 
-def evaluate_signals(conn):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT id, symbol, signal, price, bar_time, received_at
-        FROM signals
-        WHERE id NOT IN (SELECT signal_id FROM signal_outcomes WHERE signal_id IS NOT NULL)
-        ORDER BY received_at DESC
-        LIMIT 100
-    """)
-
-    signals = cur.fetchall()
-
-    for s in signals:
-        price = s["price"]
-        if not price:
-            continue
-
-        cur.execute("""
-            SELECT close
-            FROM candles
-            WHERE symbol=%s AND timeframe='1D' AND close IS NOT NULL
-            ORDER BY bar_time DESC
-            LIMIT 6
-        """, (s["symbol"],))
-
-        rows = cur.fetchall()
-
-        if len(rows) < 6:
-            continue
-
-        close_1d = rows[1]["close"]
-        close_3d = rows[3]["close"]
-        close_5d = rows[5]["close"]
-
-        def ret(close):
-            return ((close - price) / price) * 100 if price else 0
-
-        cur.execute("""
-            INSERT INTO signal_outcomes
-            (signal_id, symbol, signal, signal_price, signal_time,
-             close_1d, close_3d, close_5d,
-             return_1d, return_3d, return_5d, evaluated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (signal_id) DO NOTHING
-        """, (
-            s["id"], s["symbol"], s["signal"], price, s["bar_time"],
-            close_1d, close_3d, close_5d,
-            ret(close_1d), ret(close_3d), ret(close_5d),
-            datetime.utcnow().isoformat()
-        ))
-
-    conn.commit()
-
-
 def smart_auto_train(conn, force: bool = False):
     global LAST_AUTO_TRAIN_AT
 
-    now = datetime.utcnow()
-
-    evaluate_signals(conn)
-
+    current = datetime.utcnow()
     status = ai_engine.ai_status(conn)
+
     trained_models = status.get("trained_models", {})
     all_ready = all(trained_models.values()) if trained_models else False
 
@@ -1161,7 +1317,7 @@ def smart_auto_train(conn, force: bool = False):
     elif LAST_AUTO_TRAIN_AT is None:
         should_train = True
         reason = "FIRST_AUTO_TRAIN"
-    elif (now - LAST_AUTO_TRAIN_AT).total_seconds() >= AUTO_TRAIN_HOURS * 3600:
+    elif (current - LAST_AUTO_TRAIN_AT).total_seconds() >= AUTO_TRAIN_HOURS * 3600:
         should_train = True
         reason = "SCHEDULED_REFRESH"
 
@@ -1172,15 +1328,20 @@ def smart_auto_train(conn, force: bool = False):
         cur.execute("""
             INSERT INTO ai_training_log (trained_at, reason, result)
             VALUES (%s,%s,%s)
-        """, (now.isoformat(), reason, json.dumps(result, default=str)))
+        """, (
+            current.isoformat(),
+            reason,
+            json.dumps(result, default=str)
+        ))
 
         conn.commit()
-        LAST_AUTO_TRAIN_AT = now
+
+        LAST_AUTO_TRAIN_AT = current
 
         return {
             "trained": True,
             "reason": reason,
-            "trained_at": now.isoformat(),
+            "trained_at": current.isoformat(),
             "result": result
         }
 
@@ -1238,17 +1399,18 @@ def ai_top_trades(limit: int = 5):
         symbol = p.get("symbol")
         horizon = p.get("best_horizon", "5d")
         features = p.get("features", {})
-        last_close = p.get("last_close", 0) or 0
-
-        if not symbol or last_close <= 0:
-            continue
 
         reaction = get_market_reaction_score(conn, symbol)
+
+        last_close = p.get("last_close", 0) or 0
+        if last_close <= 0:
+            continue
 
         cur.execute("""
             SELECT high, low
             FROM candles
-            WHERE symbol=%s AND timeframe='1D'
+            WHERE symbol = %s
+              AND timeframe = '1D'
             ORDER BY bar_time DESC
             LIMIT 20
         """, (symbol,))
@@ -1265,36 +1427,45 @@ def ai_top_trades(limit: int = 5):
         stop = recent_low
         risk = (entry - stop) / entry if entry > stop else 0
 
-        target = max(entry * 1.05, recent_high * 1.02)
+        base_target = entry * 1.05
+        breakout_target = recent_high * 1.02
+        target = max(base_target, breakout_target)
+
         profit = (target - entry) / entry
         rr = profit / risk if risk > 0 else 0
+        rr = min(rr, 5)
 
-        if profit < 0.03 or rr < 1.2:
+        if profit < 0.03:
+            continue
+
+        if rr < 1.2:
             continue
 
         volume_ratio = features.get("volume_ratio", 1) or 1
-        breakout = features.get("breakout", 0)
-        trend_up = features.get("trend_up", 0) or 0
-        trend_down = features.get("trend_down", 0) or 0
+        breakout = bool(features.get("breakout", 0))
+        trend_up = bool(features.get("trend_up", 0))
+        trend_down = bool(features.get("trend_down", 0))
 
         action = "WATCH"
 
-        if prob >= 0.6 and (breakout or reaction["breakout"]) and volume_ratio > 1.3:
+        if prob >= 0.65 and reaction["breakout"] and reaction["volume_ratio"] > 1.3:
             action = "BREAKOUT ATTACK"
-        elif prob >= 0.7 and profit >= 0.05 and rr >= 1.8 and trend_up:
+        elif prob >= 0.72 and profit >= 0.05 and rr >= 1.8 and trend_up:
             action = "STRONG BUY"
-        elif prob >= 0.5 and profit >= 0.06 and rr >= 2:
-            action = "REVERSAL BUY" if trend_down else "SMART BUY"
-        elif prob >= 0.75:
+        elif prob >= 0.58 and profit >= 0.06 and rr >= 2 and not trend_down:
+            action = "SMART BUY"
+        elif prob >= 0.75 and profit >= 0.03 and not trend_down:
             action = "SAFE BUY"
-        elif prob >= 0.45 and profit >= 0.08 and rr >= 2.5:
+        elif prob >= 0.5 and profit >= 0.08 and rr >= 2.5:
             action = "HIGH RISK HIGH REWARD"
         elif prob >= 0.7:
-            action = "AI STRONG"
-        elif prob >= 0.6:
             action = "AI GOOD"
-        elif prob >= 0.5:
-            action = "AI WEAK"
+
+        if trend_down and not reaction["breakout"]:
+            action = "REVERSAL WATCH"
+
+        if market_mode == "Defensive" and not reaction["breakout"] and reaction["reaction_score"] < 60:
+            action = "WATCH"
 
         score = (
             prob * 100
@@ -1304,12 +1475,16 @@ def ai_top_trades(limit: int = 5):
             + reaction["signal_score"] * 1.2
         )
 
+        if market_mode == "Defensive":
+            score -= 20
+
         if reaction["reaction_label"] == "HOT_MOMENTUM":
             score += 25
-        if market_mode == "Defensive":
-            score -= 15
 
-        trade_data = {
+        if reaction["breakout"]:
+            score += 20
+
+        decision = {
             "symbol": symbol,
             "action": action,
             "probability": round(prob, 2),
@@ -1322,17 +1497,20 @@ def ai_top_trades(limit: int = 5):
             "holding": horizon,
             "score": round(score, 2),
             "volume_ratio": volume_ratio,
-            "breakout": bool(breakout),
-            "trend_up": bool(trend_up),
-            "trend_down": bool(trend_down),
+            "breakout": breakout,
+            "trend_up": trend_up,
+            "trend_down": trend_down,
             "reaction_score": reaction["reaction_score"],
             "reaction_label": reaction["reaction_label"],
+            "today_change_pct": reaction["today_change_pct"],
+            "intraday_strength": reaction["intraday_strength"],
+            "market_volume_ratio": reaction["volume_ratio"],
             "signal_score": reaction["signal_score"],
             "last_signal": reaction["last_signal"],
             "market_mode": market_mode
         }
 
-        final_trades.append(trade_data)
+        final_trades.append(decision)
 
         cur.execute("""
             INSERT INTO ai_decisions
@@ -1342,21 +1520,21 @@ def ai_top_trades(limit: int = 5):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             symbol,
-            datetime.utcnow().isoformat(),
+            now_utc(),
             "AI_TOP_TRADES",
             action,
-            trade_data["probability"],
-            trade_data["score"],
-            trade_data["entry"],
-            trade_data["stop_loss"],
-            trade_data["target"],
-            trade_data["expected_profit_pct"],
-            trade_data["risk_pct"],
-            trade_data["rr"],
+            decision["probability"],
+            decision["score"],
+            decision["entry"],
+            decision["stop_loss"],
+            decision["target"],
+            decision["expected_profit_pct"],
+            decision["risk_pct"],
+            decision["rr"],
             reaction["reaction_score"],
             reaction["signal_score"],
             market_mode,
-            json.dumps(trade_data, default=str)
+            json.dumps(decision, default=str)
         ))
 
     conn.commit()
@@ -1364,19 +1542,22 @@ def ai_top_trades(limit: int = 5):
 
     final_trades = sorted(final_trades, key=lambda x: x["score"], reverse=True)
 
-    top = [
-        x for x in final_trades
-        if x["action"] in [
-            "BUY", "AI STRONG", "AI GOOD", "SAFE BUY",
-            "STRONG BUY", "SMART BUY", "BREAKOUT ATTACK", "REVERSAL BUY"
-        ]
-    ][:limit]
+    top_actions = [
+        "BUY",
+        "AI GOOD",
+        "SAFE BUY",
+        "STRONG BUY",
+        "SMART BUY",
+        "BREAKOUT ATTACK"
+    ]
 
+    top = [x for x in final_trades if x["action"] in top_actions][:limit]
     aggressive = [x for x in final_trades if x["action"] == "HIGH RISK HIGH REWARD"][:5]
-    watch = [x for x in final_trades if x["action"] in ["WATCH", "AI WEAK", "REVERSAL WATCH"]][:10]
+    watch = [x for x in final_trades if x["action"] in ["WATCH", "REVERSAL WATCH", "AI WEAK"]][:10]
 
     return {
         "auto_train": train_info,
+        "market_mode": market_mode,
         "top_trades": top,
         "aggressive_opportunities": aggressive,
         "watchlist": watch
@@ -1388,52 +1569,51 @@ def ai_monitor_trades():
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("SELECT * FROM trades WHERE status='OPEN'")
-    trades = cur.fetchall()
+    cur.execute("""
+        SELECT *
+        FROM trades
+        WHERE status = 'OPEN'
+    """)
 
+    trades = cur.fetchall()
     results = []
 
     for t in trades:
-        cur.execute("""
-            SELECT close
-            FROM candles
-            WHERE symbol=%s
-            ORDER BY bar_time DESC
-            LIMIT 1
-        """, (t["symbol"],))
-
-        row = cur.fetchone()
-        if not row:
-            continue
-
-        price = row["close"]
+        symbol = t["symbol"]
         entry = t["entry_price"]
+        stop = t["stop_loss"]
+        target = t["target"]
+
+        price, price_date = get_latest_daily_price(conn, symbol, entry)
 
         action = "HOLD"
 
-        if t["target"] and price >= t["target"]:
+        if target and price >= target:
             action = "TAKE PROFIT"
-        elif t["stop_loss"] and price <= t["stop_loss"]:
+        elif stop and price <= stop:
             action = "EXIT NOW"
-        elif t["stop_loss"] and price <= t["stop_loss"] * 1.02:
+        elif stop and price <= stop * 1.02:
             action = "STOP WARNING"
-        elif t["target"] and price > entry * 1.05 and price < t["target"]:
+        elif target and price > entry * 1.05 and price < target:
             action = "TRAIL PROFIT"
 
         results.append({
-            "trade_id": t["id"],
-            "symbol": t["symbol"],
+            "symbol": symbol,
             "entry": entry,
             "current_price": price,
+            "price_date": price_date,
             "pnl_pct": round(((price - entry) / entry) * 100, 2),
             "action": action,
-            "target": t["target"],
-            "stop": t["stop_loss"]
+            "target": target,
+            "stop": stop
         })
 
     conn.close()
 
-    return {"count": len(results), "trades": results}
+    return {
+        "count": len(results),
+        "trades": results
+    }
 
 
 @app.get("/api/ai/risk-manager")
@@ -1442,11 +1622,11 @@ def ai_risk_manager():
     daily = daily_dashboard()
 
     market_mode = daily["market_mode"]
+    buy_count = daily["buy_count"]
+    watch_count = daily["watch_count"]
     exposure = portfolio["exposure_pct"]
 
     max_exposure = 25
-    decision = "HOLD"
-    advice = "Keep current positions and monitor."
 
     if market_mode == "Aggressive":
         max_exposure = 80
@@ -1455,30 +1635,33 @@ def ai_risk_manager():
     elif market_mode == "Defensive":
         max_exposure = 25
 
+    decision = "HOLD"
+    advice = "Keep current positions and monitor."
+
     if market_mode == "Defensive" and exposure > 40:
         decision = "REDUCE RISK"
-        advice = "Market is weak. Reduce exposure and keep only strong positions."
-    elif market_mode == "Defensive":
+        advice = "Market is weak. Reduce exposure and avoid new buying."
+    elif market_mode == "Defensive" and buy_count == 0:
         decision = "NO NEW BUY"
-        advice = "No new trades unless exceptional setup appears."
+        advice = "No new trades. Wait for real market strength."
     elif market_mode == "Neutral" and exposure < max_exposure:
         decision = "SELECTIVE BUY"
-        advice = "Use smaller positions and only top-ranked setups."
+        advice = "Only buy the strongest setups."
     elif market_mode == "Aggressive" and exposure < max_exposure:
         decision = "BUY ALLOWED"
-        advice = "Buying allowed, but respect risk limits."
+        advice = "Buying allowed but position sizing must be controlled."
 
     position_actions = []
 
     for h in portfolio["holdings"]:
         action = "HOLD"
 
-        if market_mode == "Defensive" and h["pnl_pct"] < -2:
-            action = "SELL / CUT LOSS"
-        elif h["target"] and h["current_price"] >= h["target"]:
+        if h["target"] and h["current_price"] >= h["target"]:
             action = "TAKE PROFIT"
         elif h["stop_loss"] and h["current_price"] <= h["stop_loss"]:
             action = "EXIT NOW"
+        elif market_mode == "Defensive" and h["pnl_pct"] < -2:
+            action = "SELL / CUT LOSS"
         elif h["pnl_pct"] > 5:
             action = "TRAIL PROFIT"
 
@@ -1489,14 +1672,19 @@ def ai_risk_manager():
             "action": action
         })
 
+    suggested_cash = portfolio["total_equity"] * (1 - max_exposure / 100)
+    suggested_invested = portfolio["total_equity"] * (max_exposure / 100)
+
     return {
         "market_mode": market_mode,
         "decision": decision,
         "advice": advice,
+        "buy_count": buy_count,
+        "watch_count": watch_count,
         "current_exposure_pct": exposure,
         "max_allowed_exposure_pct": max_exposure,
-        "suggested_cash": round(portfolio["total_equity"] * (1 - max_exposure / 100), 2),
-        "suggested_invested": round(portfolio["total_equity"] * (max_exposure / 100), 2),
+        "suggested_cash": round(suggested_cash, 2),
+        "suggested_invested": round(suggested_invested, 2),
         "portfolio": portfolio,
         "position_actions": position_actions
     }
@@ -1508,40 +1696,28 @@ def learning_report():
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        SELECT
-            COUNT(*) AS evaluated_signals,
-            AVG(return_1d) AS avg_1d,
-            AVG(return_3d) AS avg_3d,
-            AVG(return_5d) AS avg_5d
-        FROM signal_outcomes
-    """)
-
-    signal_stats = cur.fetchone()
-
-    cur.execute("""
         SELECT action, COUNT(*) AS count, AVG(score) AS avg_score
         FROM ai_decisions
         GROUP BY action
         ORDER BY avg_score DESC
     """)
 
-    action_stats = cur.fetchall()
+    stats = cur.fetchall()
 
     cur.execute("""
         SELECT *
         FROM ai_training_log
         ORDER BY trained_at DESC
-        LIMIT 20
+        LIMIT 10
     """)
 
-    training_log = cur.fetchall()
+    logs = cur.fetchall()
 
     conn.close()
 
     return {
-        "signal_outcomes": signal_stats,
-        "ai_action_stats": action_stats,
-        "training_log": training_log
+        "ai_action_stats": stats,
+        "training_log": logs
     }
 
 
@@ -1555,12 +1731,15 @@ def dashboard_page():
     portfolio = portfolio_summary_data()
 
     def badge_class(rec):
-        return {
-            "BUY": "buy",
-            "WATCH": "watch",
-            "HOLD": "hold",
-            "DEAD": "dead"
-        }.get(rec, "avoid")
+        if rec == "BUY":
+            return "buy"
+        if rec == "WATCH":
+            return "watch"
+        if rec == "HOLD":
+            return "hold"
+        if rec == "DEAD":
+            return "dead"
+        return "avoid"
 
     def change_class(change):
         return "green" if change > 0 else "red" if change < 0 else "neutral"
@@ -1572,16 +1751,10 @@ def dashboard_page():
             <tr>
                 <td>{item['symbol']}</td>
                 <td>{item['last_close']}</td>
+                <td>{item.get('data_date', '-')}</td>
                 <td class="{change_class(item['change_pct'])}">{item['change_pct']}%</td>
                 <td>{item['score']}</td>
                 <td><span class="badge {badge_class(item['recommendation'])}">{item['recommendation']}</span></td>
-                <td>{item.get('trend','-')}</td>
-                <td>{item.get('reaction_score','-')}</td>
-                <td>{item.get('signal_score','-')}</td>
-                <td>{item.get('reaction_label','-')}</td>
-                <td>{item.get('entry','-')}</td>
-                <td>{item.get('stop_loss','-')}</td>
-                <td>{item.get('target','-')}</td>
             </tr>
             """
         return rows
@@ -1596,11 +1769,10 @@ def dashboard_page():
                 <td>{h['qty']}</td>
                 <td>{h['entry']}</td>
                 <td>{h['current_price']}</td>
+                <td>{h.get('price_date', '-')}</td>
                 <td>{h['market_value']}</td>
                 <td>{h['pnl']}</td>
                 <td>{h['pnl_pct']}%</td>
-                <td>{h['stop_loss']}</td>
-                <td>{h['target']}</td>
             </tr>
             """
         return rows
@@ -1626,7 +1798,7 @@ def dashboard_page():
             }}
             .grid {{
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
                 gap: 12px;
             }}
             .metric {{
@@ -1637,7 +1809,7 @@ def dashboard_page():
             .metric small {{ color: #9ca3af; }}
             .metric strong {{
                 display: block;
-                font-size: 22px;
+                font-size: 24px;
                 margin-top: 6px;
             }}
             table {{
@@ -1645,24 +1817,22 @@ def dashboard_page():
                 border-collapse: collapse;
             }}
             th, td {{
-                padding: 10px;
+                padding: 12px;
                 border-bottom: 1px solid #374151;
-                text-align: left;
                 white-space: nowrap;
-                font-size: 13px;
+                text-align: left;
             }}
             th {{ color: #9ca3af; }}
             .badge {{
-                padding: 6px 10px;
+                padding: 6px 12px;
                 border-radius: 999px;
                 font-weight: bold;
-                font-size: 12px;
             }}
-            .buy {{ background: #16a34a; color: white; }}
+            .buy {{ background: #16a34a; }}
             .watch {{ background: #f59e0b; color: #111827; }}
-            .hold {{ background: #3b82f6; color: white; }}
-            .avoid {{ background: #6b7280; color: white; }}
-            .dead {{ background: #7f1d1d; color: white; }}
+            .hold {{ background: #3b82f6; }}
+            .avoid {{ background: #6b7280; }}
+            .dead {{ background: #991b1b; }}
             .green {{ color: #22c55e; font-weight: bold; }}
             .red {{ color: #ef4444; font-weight: bold; }}
             .neutral {{ color: #e5e7eb; }}
@@ -1687,8 +1857,8 @@ def dashboard_page():
             <table>
                 <thead>
                     <tr>
-                        <th>ID</th><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th>
-                        <th>Value</th><th>PnL</th><th>PnL %</th><th>Stop</th><th>Target</th>
+                        <th>ID</th><th>Symbol</th><th>Qty</th><th>Entry</th>
+                        <th>Current</th><th>Price Date</th><th>Value</th><th>PnL</th><th>PnL %</th>
                     </tr>
                 </thead>
                 <tbody>{build_holdings(portfolio['holdings'])}</tbody>
@@ -1700,9 +1870,7 @@ def dashboard_page():
             <table>
                 <thead>
                     <tr>
-                        <th>Symbol</th><th>Close</th><th>Change</th><th>Score</th>
-                        <th>Status</th><th>Trend</th><th>Reaction</th><th>Signal</th>
-                        <th>Label</th><th>Entry</th><th>Stop</th><th>Target</th>
+                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
                     </tr>
                 </thead>
                 <tbody>{build_rows(data['top_recommendations'])}</tbody>
@@ -1712,6 +1880,11 @@ def dashboard_page():
         <div class="card">
             <h2>Other Stocks</h2>
             <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
+                    </tr>
+                </thead>
                 <tbody>{build_rows(data['other_stocks'])}</tbody>
             </table>
         </div>
@@ -1719,10 +1892,16 @@ def dashboard_page():
         <div class="card">
             <h2>Dead / Weak Stocks</h2>
             <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
+                    </tr>
+                </thead>
                 <tbody>{build_rows(data['dead_stocks'])}</tbody>
             </table>
         </div>
     </body>
     </html>
     """
+
     return html
