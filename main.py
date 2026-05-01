@@ -10,6 +10,8 @@ import csv
 import io
 import json
 import ai_engine
+import requests
+import json
 
 
 SECRET = os.getenv("SECRET", "abc123")
@@ -1905,3 +1907,432 @@ def dashboard_page():
     """
 
     return html
+
+# =========================
+# DUAL AI SIGNALS + TELEGRAM
+# =========================
+
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://uae-market-production.up.railway.app/dashboard")
+
+
+def ensure_alert_tables():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_alerts_log (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            trigger_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            message TEXT,
+            payload TEXT,
+            UNIQUE(symbol, signal_type, trigger_key)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def send_telegram_message(message: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    r = requests.post(url, json={
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }, timeout=15)
+
+    return {
+        "ok": r.ok,
+        "status_code": r.status_code,
+        "response": r.text[:500]
+    }
+
+
+def get_symbol_candles(symbol: str, timeframe: str, limit: int = 250):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at
+        FROM candles
+        WHERE symbol = %s
+          AND timeframe = %s
+          AND close IS NOT NULL
+        ORDER BY bar_time DESC
+        LIMIT %s
+    """, (normalize_symbol(symbol), timeframe, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    rows = list(reversed(rows))
+    return rows
+
+
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    k = 2 / (period + 1)
+    e = values[0]
+
+    for price in values[1:]:
+        e = price * k + e * (1 - k)
+
+    return e
+
+
+def atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+
+    trs = []
+
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+
+        if high is None or low is None or prev_close is None:
+            continue
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return None
+
+    return sum(trs[-period:]) / period
+
+
+def analyze_dual_symbol(symbol: str):
+    symbol = normalize_symbol(symbol)
+
+    daily = get_symbol_candles(symbol, "1D", 260)
+    one_hour = get_symbol_candles(symbol, "60", 180)
+    one_min = get_symbol_candles(symbol, "1", 180)
+
+    active_tf = "60" if len(one_hour) >= 50 else "1"
+    short_data = one_hour if len(one_hour) >= 50 else one_min
+
+    signals = []
+
+    # =====================
+    # SWING SYSTEM
+    # =====================
+    if len(daily) >= 60:
+        closes = [x["close"] for x in daily if x["close"] is not None]
+        latest = daily[-1]
+        close = latest["close"]
+
+        ema50 = ema(closes, 50)
+        ema200 = ema(closes, 200) if len(closes) >= 200 else None
+
+        lows_30 = [x["low"] for x in daily[-30:] if x["low"] is not None]
+        highs_60 = [x["high"] for x in daily[-60:] if x["high"] is not None]
+        volumes_20 = [x["volume"] for x in daily[-21:-1] if x["volume"]]
+
+        support = min(lows_30) if lows_30 else None
+        resistance = max(highs_60) if highs_60 else None
+        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else None
+        volume_ratio = (latest["volume"] or 0) / avg_volume if avg_volume else 1
+
+        trend_ok = close > ema50 if ema50 else False
+        if ema200:
+            trend_ok = close > ema50 and ema50 >= ema200 * 0.97
+
+        near_support = support and close <= support * 1.04
+        breakout = resistance and close > resistance
+
+        if trend_ok and (near_support or breakout):
+            entry = close
+            stop = support if support and support < entry else entry * 0.94
+
+            target1 = entry * 1.07
+            target2 = entry * 1.12
+            target3 = entry * 1.15
+
+            risk_pct = ((entry - stop) / entry) * 100
+            expected_pct = ((target1 - entry) / entry) * 100
+            rr = expected_pct / risk_pct if risk_pct > 0 else 0
+
+            if expected_pct >= 7 and rr >= 1:
+                signals.append({
+                    "symbol": symbol,
+                    "type": "SWING",
+                    "action": "SWING BUY WATCH",
+                    "timeframe": "1D",
+                    "price": round(entry, 3),
+                    "entry_zone": [round(entry * 0.99, 3), round(entry * 1.01, 3)],
+                    "stop_loss": round(stop, 3),
+                    "target1": round(target1, 3),
+                    "target2": round(target2, 3),
+                    "target3": round(target3, 3),
+                    "expected_move_pct": round(expected_pct, 2),
+                    "risk_pct": round(risk_pct, 2),
+                    "rr": round(rr, 2),
+                    "trend": "UP",
+                    "reason": "Daily trend + support/retest/breakout",
+                    "volume_ratio": round(volume_ratio, 2),
+                    "holding": "1 week to 1 month",
+                    "trigger_key": f"SWING-{latest['bar_time']}"
+                })
+
+    # =====================
+    # SHORT SWING SYSTEM
+    # 3% - 5%, holding 1-5 days
+    # =====================
+    if len(short_data) >= 50:
+        closes = [x["close"] for x in short_data if x["close"] is not None]
+        latest = short_data[-1]
+        close = latest["close"]
+
+        ema20 = ema(closes, 20)
+        ema50 = ema(closes, 50)
+        short_atr = atr(short_data, 14)
+
+        highs_30 = [x["high"] for x in short_data[-31:-1] if x["high"] is not None]
+        lows_20 = [x["low"] for x in short_data[-21:-1] if x["low"] is not None]
+        volumes_20 = [x["volume"] for x in short_data[-21:-1] if x["volume"]]
+
+        resistance = max(highs_30) if highs_30 else None
+        support = min(lows_20) if lows_20 else None
+        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else None
+        volume_ratio = (latest["volume"] or 0) / avg_volume if avg_volume else 1
+
+        trend_ok = ema20 and ema50 and ema20 >= ema50 * 0.995
+        breakout = resistance and close >= resistance * 0.995
+        volume_ok = volume_ratio >= 1.2
+
+        if trend_ok and breakout and volume_ok:
+            entry = close
+
+            atr_stop = entry - (short_atr * 1.5) if short_atr else None
+            structure_stop = support if support and support < entry else None
+
+            if atr_stop and structure_stop:
+                stop = max(atr_stop, structure_stop)
+            elif atr_stop:
+                stop = atr_stop
+            elif structure_stop:
+                stop = structure_stop
+            else:
+                stop = entry * 0.97
+
+            target1 = entry * 1.03
+            target2 = entry * 1.05
+
+            risk_pct = ((entry - stop) / entry) * 100
+            expected_pct = ((target1 - entry) / entry) * 100
+            rr = expected_pct / risk_pct if risk_pct > 0 else 0
+
+            if expected_pct >= 3 and rr >= 0.8:
+                signals.append({
+                    "symbol": symbol,
+                    "type": "SHORT_SWING",
+                    "action": "SHORT SWING BUY",
+                    "timeframe": active_tf,
+                    "price": round(entry, 3),
+                    "entry_zone": [round(entry * 0.995, 3), round(entry * 1.005, 3)],
+                    "stop_loss": round(stop, 3),
+                    "target1": round(target1, 3),
+                    "target2": round(target2, 3),
+                    "expected_move_pct": round(expected_pct, 2),
+                    "risk_pct": round(risk_pct, 2),
+                    "rr": round(rr, 2),
+                    "trend": "UP",
+                    "reason": "Breakout + volume + short trend",
+                    "volume_ratio": round(volume_ratio, 2),
+                    "holding": "1 to 5 days",
+                    "trigger_key": f"SHORT-{latest['bar_time']}"
+                })
+
+    return signals
+
+
+def get_all_symbols():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT DISTINCT symbol
+        FROM candles
+        WHERE close IS NOT NULL
+        ORDER BY symbol
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return [r["symbol"] for r in rows]
+
+
+def build_alert_message(signal):
+    return f"""
+🚨 <b>UAE Trading AI Alert</b>
+
+<b>Symbol:</b> {signal['symbol']}
+<b>Type:</b> {signal['type']}
+<b>Action:</b> {signal['action']}
+
+<b>Price:</b> {signal['price']}
+<b>Entry Zone:</b> {signal['entry_zone'][0]} - {signal['entry_zone'][1]}
+<b>Stop Loss:</b> {signal['stop_loss']}
+
+<b>Target 1:</b> {signal['target1']}
+<b>Target 2:</b> {signal['target2']}
+
+<b>Expected Move:</b> +{signal['expected_move_pct']}%
+<b>Risk:</b> {signal['risk_pct']}%
+<b>R/R:</b> {signal['rr']}
+
+<b>Timeframe:</b> {signal['timeframe']}
+<b>Holding:</b> {signal['holding']}
+<b>Reason:</b> {signal['reason']}
+
+Dashboard:
+{DASHBOARD_URL}
+""".strip()
+
+
+@app.get("/api/ai/dual-signals")
+def api_dual_signals(symbol: Optional[str] = None):
+    ensure_alert_tables()
+
+    if symbol:
+        signals = analyze_dual_symbol(symbol)
+    else:
+        signals = []
+        for s in get_all_symbols():
+            signals.extend(analyze_dual_symbol(s))
+
+    signals = sorted(
+        signals,
+        key=lambda x: (x["expected_move_pct"], x["rr"], x["volume_ratio"]),
+        reverse=True
+    )
+
+    return {
+        "count": len(signals),
+        "signals": signals
+    }
+
+
+@app.get("/api/ai/test-telegram")
+def api_test_telegram():
+    result = send_telegram_message(
+        f"✅ UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
+    )
+    return result
+
+
+@app.post("/api/ai/send-alerts")
+def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = False):
+    ensure_alert_tables()
+
+    conn = db()
+    cur = conn.cursor()
+
+    if symbol:
+        all_signals = analyze_dual_symbol(symbol)
+    else:
+        all_signals = []
+        for s in get_all_symbols():
+            all_signals.extend(analyze_dual_symbol(s))
+
+    sent = []
+    skipped = []
+
+    for sig in all_signals:
+        message = build_alert_message(sig)
+
+        try:
+            cur.execute("""
+                INSERT INTO ai_alerts_log
+                (symbol, signal_type, trigger_key, sent_at, price, message, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                sig["symbol"],
+                sig["type"],
+                sig["trigger_key"],
+                datetime.utcnow().isoformat(),
+                sig["price"],
+                message,
+                json.dumps(sig)
+            ))
+
+            if not dry_run:
+                tg = send_telegram_message(message)
+            else:
+                tg = {"ok": True, "dry_run": True}
+
+            sent.append({
+                "symbol": sig["symbol"],
+                "type": sig["type"],
+                "telegram": tg
+            })
+
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            skipped.append({
+                "symbol": sig["symbol"],
+                "type": sig["type"],
+                "reason": "duplicate_alert"
+            })
+            continue
+
+        conn.commit()
+
+    conn.close()
+
+    return {
+        "dry_run": dry_run,
+        "signals_found": len(all_signals),
+        "sent_count": len(sent),
+        "skipped_count": len(skipped),
+        "sent": sent,
+        "skipped": skipped
+    }
+
+
+@app.get("/api/ai/alerts-log")
+def api_alerts_log(limit: int = 50):
+    ensure_alert_tables()
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM ai_alerts_log
+        ORDER BY id DESC
+        LIMIT %s
+    """, (limit,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "count": len(rows),
+        "alerts": rows
+    }
