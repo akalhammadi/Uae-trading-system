@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from datetime import datetime, timezone, timedelta
 import os
 import csv
