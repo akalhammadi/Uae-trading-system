@@ -1909,15 +1909,25 @@ def dashboard_page():
     return html
 
 # =========================
-# DUAL AI SIGNALS + TELEGRAM
+# DUAL AI SIGNALS + TELEGRAM - MEDIUM MODE
 # =========================
 
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://uae-market-production.up.railway.app/dashboard")
+import json
+import requests
+import psycopg2.errors
+
+DASHBOARD_URL = os.getenv(
+    "DASHBOARD_URL",
+    "https://uae-market-production.up.railway.app/dashboard"
+)
+
+SYSTEM_MODE = "MEDIUM"
 
 
 def ensure_alert_tables():
     conn = db()
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_alerts_log (
             id SERIAL PRIMARY KEY,
@@ -1931,6 +1941,7 @@ def ensure_alert_tables():
             UNIQUE(symbol, signal_type, trigger_key)
         )
     """)
+
     conn.commit()
     conn.close()
 
@@ -1940,16 +1951,20 @@ def send_telegram_message(message: str):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
+        return {"ok": False, "error": "Missing Telegram variables"}
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    r = requests.post(url, json={
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }, timeout=15)
+    r = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        },
+        timeout=15
+    )
 
     return {
         "ok": r.ok,
@@ -1975,14 +1990,24 @@ def get_symbol_candles(symbol: str, timeframe: str, limit: int = 250):
     rows = cur.fetchall()
     conn.close()
 
-    rows = list(reversed(rows))
-    return rows
+    return list(reversed(rows))
 
 
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
+def get_all_symbols():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT DISTINCT symbol
+        FROM candles
+        WHERE close IS NOT NULL
+        ORDER BY symbol
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return [r["symbol"] for r in rows]
 
 
 def ema(values, period):
@@ -1996,6 +2021,42 @@ def ema(values, period):
         e = price * k + e * (1 - k)
 
     return e
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def macd(values):
+    if len(values) < 35:
+        return None
+
+    ema12 = ema(values[-60:], 12)
+    ema26 = ema(values[-60:], 26)
+
+    if ema12 is None or ema26 is None:
+        return None
+
+    line = ema12 - ema26
+    return line
 
 
 def atr(candles, period=14):
@@ -2017,6 +2078,7 @@ def atr(candles, period=14):
             abs(high - prev_close),
             abs(low - prev_close)
         )
+
         trs.append(tr)
 
     if len(trs) < period:
@@ -2025,48 +2087,118 @@ def atr(candles, period=14):
     return sum(trs[-period:]) / period
 
 
+def support_resistance(candles, lookback=40):
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+
+    lows = [x["low"] for x in recent if x["low"] is not None]
+    highs = [x["high"] for x in recent if x["high"] is not None]
+
+    support = min(lows) if lows else None
+    resistance = max(highs) if highs else None
+
+    return support, resistance
+
+
+def volume_ratio(candles, lookback=20):
+    if len(candles) < lookback + 1:
+        return 1
+
+    latest_volume = candles[-1]["volume"] or 0
+    volumes = [x["volume"] for x in candles[-lookback - 1:-1] if x["volume"]]
+
+    if not volumes:
+        return 1
+
+    avg_volume = sum(volumes) / len(volumes)
+    return latest_volume / avg_volume if avg_volume else 1
+
+
+def classify_strength(score):
+    if score >= 80:
+        return "VERY STRONG"
+    if score >= 65:
+        return "STRONG"
+    if score >= 50:
+        return "MEDIUM"
+    return "WEAK"
+
+
 def analyze_dual_symbol(symbol: str):
     symbol = normalize_symbol(symbol)
 
     daily = get_symbol_candles(symbol, "1D", 260)
-    one_hour = get_symbol_candles(symbol, "60", 180)
-    one_min = get_symbol_candles(symbol, "1", 180)
+    h1 = get_symbol_candles(symbol, "60", 180)
+    m1 = get_symbol_candles(symbol, "1", 180)
 
-    active_tf = "60" if len(one_hour) >= 50 else "1"
-    short_data = one_hour if len(one_hour) >= 50 else one_min
+    short_data = h1 if len(h1) >= 50 else m1
+    active_tf = "60" if len(h1) >= 50 else "1"
 
     signals = []
 
-    # =====================
+    # =========================
     # SWING SYSTEM
-    # =====================
+    # Target: 7% - 15%
+    # Holding: 1 week - 1 month
+    # =========================
+
     if len(daily) >= 60:
         closes = [x["close"] for x in daily if x["close"] is not None]
         latest = daily[-1]
-        close = latest["close"]
+        price = latest["close"]
 
         ema50 = ema(closes, 50)
         ema200 = ema(closes, 200) if len(closes) >= 200 else None
+        rsi14 = rsi(closes, 14)
+        macd_line = macd(closes)
 
-        lows_30 = [x["low"] for x in daily[-30:] if x["low"] is not None]
-        highs_60 = [x["high"] for x in daily[-60:] if x["high"] is not None]
-        volumes_20 = [x["volume"] for x in daily[-21:-1] if x["volume"]]
+        support, resistance = support_resistance(daily, 60)
+        vr = volume_ratio(daily, 20)
+        day_atr = atr(daily, 14)
 
-        support = min(lows_30) if lows_30 else None
-        resistance = max(highs_60) if highs_60 else None
-        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else None
-        volume_ratio = (latest["volume"] or 0) / avg_volume if avg_volume else 1
+        trend_score = 0
+        momentum_score = 0
+        structure_score = 0
+        volume_score = 0
 
-        trend_ok = close > ema50 if ema50 else False
-        if ema200:
-            trend_ok = close > ema50 and ema50 >= ema200 * 0.97
+        if ema50 and price > ema50:
+            trend_score += 25
 
-        near_support = support and close <= support * 1.04
-        breakout = resistance and close > resistance
+        if ema200 and ema50 and ema50 > ema200 * 0.97:
+            trend_score += 20
 
-        if trend_ok and (near_support or breakout):
-            entry = close
-            stop = support if support and support < entry else entry * 0.94
+        if rsi14 and 45 <= rsi14 <= 70:
+            momentum_score += 15
+
+        if macd_line and macd_line > 0:
+            momentum_score += 10
+
+        near_support = support and price <= support * 1.05
+        breakout = resistance and price >= resistance * 0.995
+
+        if near_support:
+            structure_score += 20
+
+        if breakout:
+            structure_score += 25
+
+        if vr >= 0.9:
+            volume_score += 10
+
+        if vr >= 1.3:
+            volume_score += 15
+
+        total_score = trend_score + momentum_score + structure_score + volume_score
+
+        if total_score >= 55 and support:
+            entry = price
+
+            if day_atr:
+                stop = max(support, entry - day_atr * 2)
+            else:
+                stop = support
+
+            if stop >= entry:
+                stop = entry * 0.94
 
             target1 = entry * 1.07
             target2 = entry * 1.12
@@ -2076,7 +2208,7 @@ def analyze_dual_symbol(symbol: str):
             expected_pct = ((target1 - entry) / entry) * 100
             rr = expected_pct / risk_pct if risk_pct > 0 else 0
 
-            if expected_pct >= 7 and rr >= 1:
+            if expected_pct >= 7 and rr >= 0.9:
                 signals.append({
                     "symbol": symbol,
                     "type": "SWING",
@@ -2091,52 +2223,86 @@ def analyze_dual_symbol(symbol: str):
                     "expected_move_pct": round(expected_pct, 2),
                     "risk_pct": round(risk_pct, 2),
                     "rr": round(rr, 2),
-                    "trend": "UP",
-                    "reason": "Daily trend + support/retest/breakout",
-                    "volume_ratio": round(volume_ratio, 2),
+                    "score": round(total_score, 2),
+                    "strength": classify_strength(total_score),
+                    "trend": "UP" if trend_score >= 25 else "MIXED",
+                    "support": round(support, 3) if support else None,
+                    "resistance": round(resistance, 3) if resistance else None,
+                    "rsi": round(rsi14, 2) if rsi14 else None,
+                    "volume_ratio": round(vr, 2),
                     "holding": "1 week to 1 month",
+                    "reason": "Daily trend + support/breakout + momentum filter",
                     "trigger_key": f"SWING-{latest['bar_time']}"
                 })
 
-    # =====================
+    # =========================
     # SHORT SWING SYSTEM
-    # 3% - 5%, holding 1-5 days
-    # =====================
+    # Target: 3% - 5%
+    # Holding: 1 - 5 days
+    # =========================
+
     if len(short_data) >= 50:
         closes = [x["close"] for x in short_data if x["close"] is not None]
         latest = short_data[-1]
-        close = latest["close"]
+        price = latest["close"]
 
         ema20 = ema(closes, 20)
         ema50 = ema(closes, 50)
+        rsi14 = rsi(closes, 14)
+        macd_line = macd(closes)
+
+        support, resistance = support_resistance(short_data, 40)
         short_atr = atr(short_data, 14)
+        vr = volume_ratio(short_data, 20)
 
-        highs_30 = [x["high"] for x in short_data[-31:-1] if x["high"] is not None]
-        lows_20 = [x["low"] for x in short_data[-21:-1] if x["low"] is not None]
-        volumes_20 = [x["volume"] for x in short_data[-21:-1] if x["volume"]]
+        trend_score = 0
+        momentum_score = 0
+        structure_score = 0
+        volume_score = 0
 
-        resistance = max(highs_30) if highs_30 else None
-        support = min(lows_20) if lows_20 else None
-        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else None
-        volume_ratio = (latest["volume"] or 0) / avg_volume if avg_volume else 1
+        if ema20 and ema50 and ema20 >= ema50 * 0.995:
+            trend_score += 25
 
-        trend_ok = ema20 and ema50 and ema20 >= ema50 * 0.995
-        breakout = resistance and close >= resistance * 0.995
-        volume_ok = volume_ratio >= 1.2
+        if ema20 and price >= ema20 * 0.995:
+            trend_score += 15
 
-        if trend_ok and breakout and volume_ok:
-            entry = close
+        if rsi14 and 45 <= rsi14 <= 75:
+            momentum_score += 15
 
-            atr_stop = entry - (short_atr * 1.5) if short_atr else None
-            structure_stop = support if support and support < entry else None
+        if macd_line and macd_line >= 0:
+            momentum_score += 10
 
-            if atr_stop and structure_stop:
-                stop = max(atr_stop, structure_stop)
-            elif atr_stop:
-                stop = atr_stop
-            elif structure_stop:
-                stop = structure_stop
+        breakout = resistance and price >= resistance * 0.995
+        near_support = support and price <= support * 1.035
+
+        if breakout:
+            structure_score += 25
+
+        if near_support:
+            structure_score += 15
+
+        if vr >= 0.8:
+            volume_score += 10
+
+        if vr >= 1.2:
+            volume_score += 15
+
+        total_score = trend_score + momentum_score + structure_score + volume_score
+
+        if total_score >= 50:
+            entry = price
+
+            if short_atr:
+                stop = entry - short_atr * 1.5
+            elif support:
+                stop = support
             else:
+                stop = entry * 0.97
+
+            if support and support < entry:
+                stop = max(stop, support)
+
+            if stop >= entry:
                 stop = entry * 0.97
 
             target1 = entry * 1.03
@@ -2146,7 +2312,7 @@ def analyze_dual_symbol(symbol: str):
             expected_pct = ((target1 - entry) / entry) * 100
             rr = expected_pct / risk_pct if risk_pct > 0 else 0
 
-            if expected_pct >= 3 and rr >= 0.8:
+            if expected_pct >= 3 and rr >= 0.75:
                 signals.append({
                     "symbol": symbol,
                     "type": "SHORT_SWING",
@@ -2160,47 +2326,47 @@ def analyze_dual_symbol(symbol: str):
                     "expected_move_pct": round(expected_pct, 2),
                     "risk_pct": round(risk_pct, 2),
                     "rr": round(rr, 2),
-                    "trend": "UP",
-                    "reason": "Breakout + volume + short trend",
-                    "volume_ratio": round(volume_ratio, 2),
+                    "score": round(total_score, 2),
+                    "strength": classify_strength(total_score),
+                    "trend": "UP" if trend_score >= 25 else "MIXED",
+                    "support": round(support, 3) if support else None,
+                    "resistance": round(resistance, 3) if resistance else None,
+                    "rsi": round(rsi14, 2) if rsi14 else None,
+                    "volume_ratio": round(vr, 2),
                     "holding": "1 to 5 days",
+                    "reason": "Short trend + breakout/support + volume/momentum",
                     "trigger_key": f"SHORT-{latest['bar_time']}"
                 })
 
     return signals
 
 
-def get_all_symbols():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT DISTINCT symbol
-        FROM candles
-        WHERE close IS NOT NULL
-        ORDER BY symbol
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return [r["symbol"] for r in rows]
-
-
 def build_alert_message(signal):
+    t2 = signal.get("target2")
+    t3 = signal.get("target3")
+
+    targets = f"""
+<b>Target 1:</b> {signal['target1']}
+<b>Target 2:</b> {t2}
+""".strip()
+
+    if t3:
+        targets += f"\n<b>Target 3:</b> {t3}"
+
     return f"""
 🚨 <b>UAE Trading AI Alert</b>
 
 <b>Symbol:</b> {signal['symbol']}
 <b>Type:</b> {signal['type']}
 <b>Action:</b> {signal['action']}
+<b>Strength:</b> {signal['strength']}
+<b>Score:</b> {signal['score']}
 
 <b>Price:</b> {signal['price']}
 <b>Entry Zone:</b> {signal['entry_zone'][0]} - {signal['entry_zone'][1]}
 <b>Stop Loss:</b> {signal['stop_loss']}
 
-<b>Target 1:</b> {signal['target1']}
-<b>Target 2:</b> {signal['target2']}
+{targets}
 
 <b>Expected Move:</b> +{signal['expected_move_pct']}%
 <b>Risk:</b> {signal['risk_pct']}%
@@ -2208,6 +2374,9 @@ def build_alert_message(signal):
 
 <b>Timeframe:</b> {signal['timeframe']}
 <b>Holding:</b> {signal['holding']}
+<b>RSI:</b> {signal.get('rsi')}
+<b>Volume Ratio:</b> {signal['volume_ratio']}
+
 <b>Reason:</b> {signal['reason']}
 
 Dashboard:
@@ -2228,11 +2397,12 @@ def api_dual_signals(symbol: Optional[str] = None):
 
     signals = sorted(
         signals,
-        key=lambda x: (x["expected_move_pct"], x["rr"], x["volume_ratio"]),
+        key=lambda x: (x["score"], x["expected_move_pct"], x["rr"]),
         reverse=True
     )
 
     return {
+        "mode": SYSTEM_MODE,
         "count": len(signals),
         "signals": signals
     }
@@ -2246,8 +2416,8 @@ def api_test_telegram():
     return result
 
 
-@app.post("/api/ai/send-alerts")
-def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = False):
+@app.get("/api/ai/send-alerts")
+def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True):
     ensure_alert_tables()
 
     conn = db()
@@ -2292,6 +2462,8 @@ def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = False):
                 "telegram": tg
             })
 
+            conn.commit()
+
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
             skipped.append({
@@ -2299,13 +2471,11 @@ def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = False):
                 "type": sig["type"],
                 "reason": "duplicate_alert"
             })
-            continue
-
-        conn.commit()
 
     conn.close()
 
     return {
+        "mode": SYSTEM_MODE,
         "dry_run": dry_run,
         "signals_found": len(all_signals),
         "sent_count": len(sent),
