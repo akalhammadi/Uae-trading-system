@@ -1,40 +1,65 @@
 import os
+import json
+import time
+from datetime import datetime, timezone
+
 import requests
-from datetime import datetime
 
-API_BASE = os.getenv("API_BASE", "https://uae-market-production.up.railway.app")
-API_URL = f"{API_BASE.rstrip('/')}/api/candles/latest?timeframe=1D&limit=200"
+API_BASE = os.getenv("API_BASE", "https://uae-market-production.up.railway.app").rstrip("/")
+TIMEOUT = 60
 
-print("🚀 Starting auto_daily_prices.py")
-print("🌐 API_URL =", API_URL)
 
-try:
-    print("📡 Fetching data from API...")
-    response = requests.get(API_URL, timeout=60)
+def log(message):
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {message}", flush=True)
 
-    print("HTTP status:", response.status_code)
-    print("Response preview:", response.text[:500])
 
-    response.raise_for_status()
-    data = response.json()
+def get_json(path):
+    url = f"{API_BASE}{path}"
+    log(f"GET {url}")
+    r = requests.get(url, timeout=TIMEOUT)
+    log(f"HTTP {r.status_code}")
+    if r.status_code != 200:
+        log(f"Response preview: {r.text[:500]}")
+    r.raise_for_status()
+    return r.json()
 
-    prices = data.get("candles", [])
 
-    print(f"✅ Received {len(prices)} records")
+def main():
+    log("🚀 Starting auto_daily_prices.py")
+    log(f"API_BASE={API_BASE}")
 
-    for item in prices[:40]:
-        print(
-            item.get("symbol"),
-            item.get("bar_time"),
-            "close=",
-            item.get("close"),
-            "volume=",
-            item.get("volume"),
+    # Daily data check: this only reads what is already stored in the main API.
+    daily = get_json("/api/candles/latest?timeframe=1D&limit=500")
+    candles = daily.get("candles", [])
+    log(f"✅ Daily candle rows received: {len(candles)}")
+
+    for row in candles[:30]:
+        log(
+            f"{row.get('symbol')} | tf={row.get('timeframe')} | date={row.get('bar_time')} | "
+            f"close={row.get('close')} | volume={row.get('volume')}"
         )
 
-    print("✅ Finished successfully at", datetime.utcnow().isoformat())
+    time.sleep(2)
 
-except Exception as e:
-    print("❌ ERROR OCCURRED:")
-    print(repr(e))
-    raise
+    # Generate signals using 1D + 1H only.
+    signals = get_json("/api/ai/dual-signals")
+    log(f"✅ Dual signals count: {signals.get('count')}")
+    log(json.dumps(signals, ensure_ascii=False)[:1500])
+
+    time.sleep(2)
+
+    # Send Telegram alerts if new non-duplicate signals exist.
+    alerts = get_json("/api/ai/send-alerts?dry_run=false")
+    log(f"✅ Alerts result: sent={alerts.get('sent_count')} skipped={alerts.get('skipped_count')}")
+    log(json.dumps(alerts, ensure_ascii=False)[:1500])
+
+    log("✅ Finished successfully")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        log("❌ ERROR OCCURRED")
+        log(repr(exc))
+        raise
