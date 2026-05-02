@@ -120,7 +120,7 @@ def build_training_dataset(conn):
 
             sdf[f"future_return_{h}d"] = future_return
 
-            # WIN = حقق 5% أو أكثر خلال الفترة
+            # WIN = Ø­ÙÙ 5% Ø£Ù Ø£ÙØ«Ø± Ø®ÙØ§Ù Ø§ÙÙØªØ±Ø©
             sdf[f"label_{h}d"] = (future_return >= 0.05).astype(int)
 
         frames.append(sdf)
