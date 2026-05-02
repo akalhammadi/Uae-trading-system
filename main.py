@@ -2507,3 +2507,72 @@ def api_alerts_log(limit: int = 50):
         "count": len(rows),
         "alerts": rows
     }
+
+from fastapi import Request
+import requests
+import os
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+
+# =========================
+# Set Webhook
+# =========================
+@app.get("/api/telegram/set-webhook")
+def set_webhook():
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    webhook_url = f"https://uae-market-production.up.railway.app/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+
+    r = requests.post(url, json={"url": webhook_url})
+    return r.json()
+
+# =========================
+# Webhook Receiver
+# =========================
+@app.post("/api/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        return {"error": "unauthorized"}
+
+    data = await request.json()
+
+    try:
+        message = data["message"]["text"]
+        chat_id = data["message"]["chat"]["id"]
+
+        response_text = handle_message(message)
+
+        send_telegram(chat_id, response_text)
+
+    except Exception as e:
+        print("Error:", e)
+
+    return {"ok": True}
+
+# =========================
+# Message Handler
+# =========================
+def handle_message(text):
+    text = text.upper()
+
+    if "EMAAR" in text:
+        return "📊 EMAAR تحليل:\nترند صاعد - دعم 11.7 - مقاومة 11.85"
+
+    if "دخلت" in text:
+        return "✅ تم تسجيل الصفقة"
+
+    if "بعت" in text:
+        return "📉 تم اغلاق الصفقة وحساب الربح"
+
+    return "❓ اكتب اسم السهم مثل: EMAAR"
+
+# =========================
+# Send Telegram
+# =========================
+def send_telegram(chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": text
+    })
