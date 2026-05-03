@@ -20,8 +20,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI(
     title="UAE Trading AI System",
-    version="0.2.0"
+    version="0.3.0-pro"
 )
+
+
+@app.get("/api/health")
+def api_health():
+    return {"status": "ok", "version": app.version, "time_utc": now_utc() if 'now_utc' in globals() else datetime.utcnow().isoformat()}
+
 
 
 def db():
@@ -35,12 +41,56 @@ SYMBOL_MAP = {
 }
 
 
+# =========================
+# PRO WATCHLIST - 53 UAE STOCKS
+# هذه القائمة هي مصدر الحقيقة للداشبورد والـ AI scan
+# =========================
+DEFAULT_WATCHLIST = [
+    "DTC", "DU", "EAND", "EMSTEEL", "ESHRAQ", "GFH", "GHITHA", "GULFNAV",
+    "MANAZEL", "PRESIGHT", "SALIK", "SHUAA", "SIB", "UPP", "TECOM", "JULPHAR",
+    "2POINTZERO", "INVICTUS", "MODON", "EMPOWER", "SPACE42", "ADPORTS", "RAKPROP",
+    "ALEFEDT", "TALABAT", "PUREHEALTH", "TAQA", "NMDC", "RAKBANK", "FAB", "ADIB",
+    "ADNOCGAS", "ADNOCDRILL", "ADNOCLS", "ADNOCDIST", "BURJEEL", "BOROUGE", "DEWA",
+    "DIB", "EMAARDEV", "EMAAR", "AIRARABIA", "ESG", "AGTHIA", "AMR", "APEX",
+    "ARMX", "ALDAR", "FERTIGLB", "DANA", "DFM", "AJMANBANK", "DIC"
+]
+
+# aliases from TradingView / CSV names to your preferred symbols
+SYMBOL_ALIASES = {
+    "ARAMEX": "ARMX",
+    "ARABTEC": "ARMX",
+    "EMAARDEVELOPMENT": "EMAARDEV",
+    "EMAARDEV": "EMAARDEV",
+    "TWOPOINTZERO": "2POINTZERO",
+    "TWO_POINT_ZERO": "2POINTZERO",
+    "TWO POINT ZERO": "2POINTZERO",
+    "2POINTZERO": "2POINTZERO",
+    "2POINTZERO.AE": "2POINTZERO",
+    "ADNOC DISTRIBUTION": "ADNOCDIST",
+    "ADNOCDIST": "ADNOCDIST",
+    "ADNOC DRILLING": "ADNOCDRILL",
+    "ADNOC DRILL": "ADNOCDRILL",
+    "ADNOC LOGISTICS": "ADNOCLS",
+    "ADNOC L&S": "ADNOCLS",
+    "ADNOC GAS": "ADNOCGAS",
+    "DUBAI ISLAMIC BANK": "DIB",
+    "DUBAI FINANCIAL MARKET": "DFM",
+    "RAKPROPERTIES": "RAKPROP",
+    "RAK PROPERTIES": "RAKPROP",
+    "SHARJAH ISLAMIC BANK": "SIB",
+    "ALDAR PROPERTIES": "ALDAR",
+}
+
+
+
 def normalize_symbol(symbol: str):
     if not symbol:
         return symbol
-    symbol = symbol.upper().strip()
+    symbol = str(symbol).upper().strip()
     if ":" in symbol:
         symbol = symbol.split(":")[-1]
+    symbol = symbol.replace("-", "").replace("/", "").strip()
+    symbol = SYMBOL_ALIASES.get(symbol, symbol) if "SYMBOL_ALIASES" in globals() else symbol
     return SYMBOL_MAP.get(symbol, symbol)
 
 
@@ -228,6 +278,112 @@ def init_db():
 
 
 init_db()
+
+
+# =========================
+# WATCHLIST API + DB PERSISTENCE
+# =========================
+class WatchlistPayload(BaseModel):
+    symbols: List[str]
+
+
+def ensure_watchlist_table():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist_symbols (
+            symbol TEXT PRIMARY KEY,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    for sym in DEFAULT_WATCHLIST:
+        ns = normalize_symbol(sym)
+        cur.execute("""
+            INSERT INTO watchlist_symbols (symbol, active, created_at, updated_at)
+            VALUES (%s, TRUE, %s, %s)
+            ON CONFLICT (symbol) DO UPDATE SET active = TRUE, updated_at = EXCLUDED.updated_at
+        """, (ns, now_utc(), now_utc()))
+    conn.commit()
+    conn.close()
+
+
+def get_watchlist_symbols():
+    try:
+        ensure_watchlist_table()
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT symbol FROM watchlist_symbols
+            WHERE active = TRUE
+            ORDER BY symbol
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        symbols = [r["symbol"] for r in rows]
+        return symbols or DEFAULT_WATCHLIST
+    except Exception:
+        return DEFAULT_WATCHLIST
+
+
+@app.get("/api/watchlist")
+def api_get_watchlist():
+    symbols = get_watchlist_symbols()
+    return {"count": len(symbols), "symbols": symbols}
+
+
+@app.post("/api/watchlist/set")
+def api_set_watchlist(payload: WatchlistPayload):
+    ensure_watchlist_table()
+    clean = sorted(set(normalize_symbol(x) for x in payload.symbols if x))
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE watchlist_symbols SET active = FALSE, updated_at = %s", (now_utc(),))
+    for sym in clean:
+        cur.execute("""
+            INSERT INTO watchlist_symbols (symbol, active, created_at, updated_at)
+            VALUES (%s, TRUE, %s, %s)
+            ON CONFLICT (symbol) DO UPDATE SET active = TRUE, updated_at = EXCLUDED.updated_at
+        """, (sym, now_utc(), now_utc()))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "count": len(clean), "symbols": clean}
+
+
+@app.get("/api/watchlist/reset-default")
+def api_reset_default_watchlist():
+    ensure_watchlist_table()
+    return {"status": "ok", "count": len(get_watchlist_symbols()), "symbols": get_watchlist_symbols()}
+
+
+@app.get("/api/watchlist/coverage")
+def api_watchlist_coverage():
+    symbols = get_watchlist_symbols()
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    results = []
+    for sym in symbols:
+        cur.execute("""
+            SELECT timeframe, COUNT(*) AS candles, MAX(bar_time) AS latest_bar, MAX(received_at) AS latest_received
+            FROM candles
+            WHERE symbol = %s AND timeframe IN ('60','1D')
+            GROUP BY timeframe
+        """, (sym,))
+        rows = cur.fetchall()
+        by_tf = {r["timeframe"]: dict(r) for r in rows}
+        results.append({
+            "symbol": sym,
+            "has_60": "60" in by_tf,
+            "has_1D": "1D" in by_tf,
+            "candles_60": by_tf.get("60", {}).get("candles", 0),
+            "candles_1D": by_tf.get("1D", {}).get("candles", 0),
+            "latest_60": by_tf.get("60", {}).get("latest_bar"),
+            "latest_1D": by_tf.get("1D", {}).get("latest_bar"),
+        })
+    conn.close()
+    return {"count": len(results), "coverage": results}
+
 
 
 # =========================
@@ -777,91 +933,82 @@ def daily_dashboard():
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("""
-        SELECT symbol, bar_time, open, high, low, close, volume
-        FROM candles
-        WHERE timeframe = '1D'
-          AND close IS NOT NULL
-        ORDER BY symbol, bar_time DESC
-    """)
-
-    rows = cur.fetchall()
-
-    from collections import defaultdict
-    data = defaultdict(list)
-
-    for r in rows:
-        data[r["symbol"]].append(r)
-
+    symbols = get_watchlist_symbols()
     results = []
     dead_stocks = []
+    no_data_stocks = []
 
-    for symbol, candles in data.items():
-        if len(candles) < 30:
+    for symbol in symbols:
+        cur.execute("""
+            SELECT symbol, bar_time, open, high, low, close, volume, received_at
+            FROM candles
+            WHERE symbol = %s
+              AND timeframe = '1D'
+              AND close IS NOT NULL
+            ORDER BY bar_time DESC
+            LIMIT 80
+        """, (symbol,))
+        candles = cur.fetchall()
+
+        if not candles:
+            no_data_stocks.append({
+                "symbol": symbol,
+                "last_close": None,
+                "data_date": None,
+                "change_pct": None,
+                "volume": None,
+                "score": 0,
+                "recommendation": "NO_DATA",
+                "trend": "NO_DATA",
+                "bar_time": None,
+            })
             continue
 
         latest = candles[0]
-        prev = candles[1]
-
+        prev = candles[1] if len(candles) > 1 else latest
         last_close = latest["close"]
-        last_volume = latest["volume"] or 0
-        prev_close = prev["close"]
-
+        prev_close = prev["close"] or last_close
         change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
 
-        closes = [c["close"] for c in candles[:50] if c["close"] is not None]
+        closes = [c["close"] for c in candles if c["close"] is not None]
         highs_20 = [c["high"] for c in candles[1:21] if c["high"] is not None]
         lows_10 = [c["low"] for c in candles[1:11] if c["low"] is not None]
         volumes_20 = [c["volume"] for c in candles[1:21] if c["volume"] is not None]
 
-        recent_high = max(highs_20) if highs_20 else latest["high"]
-        recent_low = min(lows_10) if lows_10 else latest["low"]
-        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else last_volume
+        recent_high = max(highs_20) if highs_20 else latest["high"] or last_close
+        recent_low = min(lows_10) if lows_10 else latest["low"] or last_close
+        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else latest["volume"] or 0
+        volume_ratio_local = (latest["volume"] or 0) / avg_volume if avg_volume else 1
 
-        ema20 = sum(closes[:20]) / 20 if len(closes) >= 20 else last_close
+        ema20 = sum(closes[:20]) / 20 if len(closes) >= 20 else sum(closes) / len(closes)
         ema50 = sum(closes[:50]) / 50 if len(closes) >= 50 else ema20
-
-        trend_up = last_close > ema20 and ema20 > ema50
+        trend_up = last_close > ema20 and ema20 >= ema50 * 0.995
         trend_down = last_close < ema20 and ema20 < ema50
-
-        breakout = last_close > recent_high
-        volume_confirmed = last_volume > avg_volume * 1.3 if avg_volume else False
-        quiet_volume = last_volume < avg_volume * 0.7 if avg_volume else False
+        breakout = last_close > recent_high if recent_high else False
+        volume_confirmed = volume_ratio_local >= 1.2
+        quiet_volume = volume_ratio_local < 0.7
 
         reaction = get_market_reaction_score(conn, symbol)
-
         score = 0
-
-        if trend_up:
-            score += 25
-        if breakout:
-            score += 30
-        if volume_confirmed:
-            score += 25
-        if change_pct > 0.5:
-            score += 10
-        if change_pct > 1.5:
-            score += 10
-
-        score += reaction["reaction_score"] * 0.25
-        score += reaction["signal_score"] * 0.15
-
-        if trend_down:
-            score -= 20
-        if change_pct < -1:
-            score -= 10
-        if quiet_volume:
-            score -= 10
-
+        if trend_up: score += 25
+        if breakout: score += 25
+        if volume_confirmed: score += 20
+        if change_pct > 0.3: score += 8
+        if change_pct > 1.0: score += 12
+        if volume_ratio_local >= 1.5: score += 10
+        score += reaction["reaction_score"] * 0.20
+        score += reaction["signal_score"] * 0.10
+        if trend_down: score -= 18
+        if change_pct < -1: score -= 8
+        if quiet_volume: score -= 6
         score = max(round(score, 2), 0)
 
         recommendation = "AVOID"
-
-        if score >= 80 and not trend_down:
+        if score >= 75 and not trend_down:
             recommendation = "BUY"
-        elif score >= 60:
+        elif score >= 55:
             recommendation = "WATCH"
-        elif score >= 40:
+        elif score >= 35:
             recommendation = "HOLD"
 
         dead = False
@@ -871,55 +1018,48 @@ def daily_dashboard():
             dead = True
 
         entry = last_close
-        stop_loss = recent_low
+        stop_loss = recent_low if recent_low and recent_low < entry else entry * 0.96
         risk = entry - stop_loss if entry and stop_loss else None
-        target = entry + (risk * 2) if risk and risk > 0 else None
-        rr = 2 if target else None
+        target = entry + (risk * 2) if risk and risk > 0 else entry * 1.07
+        rr = round((target - entry) / risk, 2) if risk and risk > 0 else None
 
         item = {
             "symbol": symbol,
-            "last_close": round(last_close, 3),
+            "last_close": round(last_close, 3) if last_close is not None else None,
             "data_date": latest["bar_time"],
             "change_pct": round(change_pct, 2),
-            "volume": last_volume,
+            "volume": latest["volume"] or 0,
             "avg_volume_20": round(avg_volume, 2) if avg_volume else None,
+            "volume_ratio": round(volume_ratio_local, 2),
             "volume_confirmed": volume_confirmed,
             "quiet_volume": quiet_volume,
             "breakout": breakout,
             "trend": "UP" if trend_up else "DOWN" if trend_down else "SIDEWAYS",
-            "recent_high_20": round(recent_high, 3),
-            "recent_low_10": round(recent_low, 3),
+            "recent_high_20": round(recent_high, 3) if recent_high else None,
+            "recent_low_10": round(recent_low, 3) if recent_low else None,
             "reaction_score": reaction["reaction_score"],
             "reaction_label": reaction["reaction_label"],
             "signal_score": reaction["signal_score"],
             "last_signal": reaction["last_signal"],
             "score": score,
-            "recommendation": recommendation,
+            "recommendation": "DEAD" if dead else recommendation,
             "entry": round(entry, 3),
             "stop_loss": round(stop_loss, 3) if stop_loss else None,
             "target": round(target, 3) if target else None,
             "risk_reward": rr,
-            "bar_time": latest["bar_time"]
+            "bar_time": latest["bar_time"],
         }
 
         if dead:
-            item["recommendation"] = "DEAD"
             dead_stocks.append(item)
         else:
             results.append(item)
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)
     dead_stocks = sorted(dead_stocks, key=lambda x: x["score"])
-
     top_recommendations = [x for x in results if x["recommendation"] in ["BUY", "WATCH"]][:10]
-
     top_symbols = set(x["symbol"] for x in top_recommendations)
-    dead_symbols = set(x["symbol"] for x in dead_stocks)
-
-    other_stocks = [
-        x for x in results
-        if x["symbol"] not in top_symbols and x["symbol"] not in dead_symbols
-    ]
+    other_stocks = [x for x in results if x["symbol"] not in top_symbols]
 
     buy_list = [x for x in top_recommendations if x["recommendation"] == "BUY"]
     watch_list = [x for x in top_recommendations if x["recommendation"] == "WATCH"]
@@ -930,45 +1070,6 @@ def daily_dashboard():
     elif len(buy_list) >= 2 or len(watch_list) >= 5:
         market_mode = "Neutral"
 
-    if market_phase == "AFTER_CLOSE":
-        for item in top_recommendations:
-            cur.execute("""
-                INSERT INTO daily_recommendations
-                (report_date, symbol, last_close, change_pct, volume, score,
-                 recommendation, entry, stop_loss, target, risk_reward,
-                 market_phase, created_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (report_date, symbol)
-                DO UPDATE SET
-                    last_close = EXCLUDED.last_close,
-                    change_pct = EXCLUDED.change_pct,
-                    volume = EXCLUDED.volume,
-                    score = EXCLUDED.score,
-                    recommendation = EXCLUDED.recommendation,
-                    entry = EXCLUDED.entry,
-                    stop_loss = EXCLUDED.stop_loss,
-                    target = EXCLUDED.target,
-                    risk_reward = EXCLUDED.risk_reward,
-                    market_phase = EXCLUDED.market_phase,
-                    created_at = EXCLUDED.created_at
-            """, (
-                report_date,
-                item["symbol"],
-                item["last_close"],
-                item["change_pct"],
-                item["volume"],
-                item["score"],
-                item["recommendation"],
-                item["entry"],
-                item["stop_loss"],
-                item["target"],
-                item["risk_reward"],
-                market_phase,
-                now_utc()
-            ))
-
-        conn.commit()
-
     conn.close()
 
     return {
@@ -977,12 +1078,16 @@ def daily_dashboard():
         "market_phase": market_phase,
         "report_status": "FINAL_AFTER_15:00" if market_phase == "AFTER_CLOSE" else "LIVE_NOT_FINAL",
         "market_mode": market_mode,
+        "watchlist_count": len(symbols),
+        "stocks_with_data": len(results) + len(dead_stocks),
+        "no_data_count": len(no_data_stocks),
         "buy_count": len(buy_list),
         "watch_count": len(watch_list),
         "dead_count": len(dead_stocks),
         "top_recommendations": top_recommendations,
         "other_stocks": other_stocks,
-        "dead_stocks": dead_stocks
+        "dead_stocks": dead_stocks,
+        "no_data_stocks": no_data_stocks,
     }
 
 
@@ -1995,20 +2100,22 @@ def get_symbol_candles(symbol: str, timeframe: str, limit: int = 250):
 
 
 def get_all_symbols():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT DISTINCT symbol
-        FROM candles
-        WHERE close IS NOT NULL
-        ORDER BY symbol
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return [r["symbol"] for r in rows]
+    # PRO: scan the full 53-stock watchlist, not only symbols that already have candles.
+    symbols = set(get_watchlist_symbols())
+    try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT DISTINCT symbol
+            FROM candles
+            WHERE close IS NOT NULL
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        symbols.update(r["symbol"] for r in rows)
+    except Exception:
+        pass
+    return sorted(symbols)
 
 
 def ema(values, period):
@@ -2124,254 +2231,179 @@ def classify_strength(score):
     return "WEAK"
 
 
+def _smart_stop_for_buy(entry, entry_low, support=None, atr_value=None, min_stop_pct=0.018, max_stop_pct=0.045, atr_mult=2.0, support_buffer=0.006):
+    """Hybrid Smart Stop: structure + ATR + min/max risk guard."""
+    candidates = []
+    if support and support < entry_low:
+        candidates.append(support * (1 - support_buffer))
+    if atr_value and atr_value > 0:
+        candidates.append(entry - atr_value * atr_mult)
+    raw_stop = min(candidates) if candidates else entry * (1 - min_stop_pct)
+    max_allowed_stop = entry_low * (1 - min_stop_pct)
+    min_allowed_stop = entry * (1 - max_stop_pct)
+    stop = raw_stop
+    if stop >= entry_low:
+        stop = max_allowed_stop
+    if stop > max_allowed_stop:
+        stop = max_allowed_stop
+    if stop < min_allowed_stop:
+        stop = min_allowed_stop
+    return stop
+
+
+def _signal_dict(symbol, signal_type, action, timeframe, entry, entry_low, entry_high, stop, targets, score, trend_label, support, resistance, rsi14, vr, holding, reason, bar_time):
+    target1 = targets[0]
+    risk_pct = ((entry - stop) / entry) * 100 if entry else 0
+    expected_pct = ((target1 - entry) / entry) * 100 if entry else 0
+    rr = expected_pct / risk_pct if risk_pct > 0 else 0
+    d = {
+        "symbol": symbol,
+        "type": signal_type,
+        "action": action,
+        "timeframe": timeframe,
+        "price": round(entry, 3),
+        "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
+        "stop_loss": round(stop, 3),
+        "target1": round(targets[0], 3),
+        "target2": round(targets[1], 3) if len(targets) > 1 else None,
+        "target3": round(targets[2], 3) if len(targets) > 2 else None,
+        "expected_move_pct": round(expected_pct, 2),
+        "risk_pct": round(risk_pct, 2),
+        "rr": round(rr, 2),
+        "score": round(score, 2),
+        "strength": classify_strength(score),
+        "trend": trend_label,
+        "support": round(support, 3) if support else None,
+        "resistance": round(resistance, 3) if resistance else None,
+        "rsi": round(rsi14, 2) if rsi14 else None,
+        "volume_ratio": round(vr, 2) if vr is not None else None,
+        "holding": holding,
+        "reason": reason,
+        "trigger_key": f"{signal_type}-{bar_time}-{round(entry,3)}-{round(score,1)}"
+    }
+    return d
+
+
 def analyze_dual_symbol(symbol: str):
+    """PRO AI scan. Uses 1H for short swing and 1D for swing only. Scans all 53 watchlist symbols."""
     symbol = normalize_symbol(symbol)
-
     daily = get_symbol_candles(symbol, "1D", 260)
-    h1 = get_symbol_candles(symbol, "60", 180)
-
-    # Short-swing analysis uses 1H only.
-    # We intentionally do NOT fall back to 1-minute data because it creates noisy
-    # signals and unrealistically tight stops.
-    short_data = h1
-    active_tf = "60"
-
+    h1 = get_symbol_candles(symbol, "60", 220)
     signals = []
 
-    # =========================
-    # SWING SYSTEM
-    # Target: 7% - 15%
-    # Holding: 1 week - 1 month
-    # =========================
-
-    if len(daily) >= 60:
-        closes = [x["close"] for x in daily if x["close"] is not None]
+    # -------------------------
+    # 1D SWING SYSTEM
+    # -------------------------
+    if len(daily) >= 25:
+        closes = [float(x["close"]) for x in daily if x["close"] is not None]
         latest = daily[-1]
-        price = latest["close"]
-
-        ema50 = ema(closes, 50)
-        ema200 = ema(closes, 200) if len(closes) >= 200 else None
+        entry = float(latest["close"])
+        ema20_d = ema(closes[-80:], 20) if len(closes) >= 20 else None
+        ema50_d = ema(closes[-120:], 50) if len(closes) >= 50 else None
         rsi14 = rsi(closes, 14)
         macd_line = macd(closes)
-
-        support, resistance = support_resistance(daily, 60)
-        vr = volume_ratio(daily, 20)
+        support, resistance = support_resistance(daily, min(60, len(daily)))
         day_atr = atr(daily, 14)
+        vr = volume_ratio(daily, min(20, max(len(daily)-1, 1)))
 
         trend_score = 0
         momentum_score = 0
         structure_score = 0
         volume_score = 0
 
-        if ema50 and price > ema50:
-            trend_score += 25
-
-        if ema200 and ema50 and ema50 > ema200 * 0.97:
+        if ema20_d and entry >= ema20_d * 0.995:
             trend_score += 20
-
-        if rsi14 and 45 <= rsi14 <= 70:
+        if ema20_d and ema50_d and ema20_d >= ema50_d * 0.985:
+            trend_score += 20
+        if len(closes) >= 5 and closes[-1] > closes[-5]:
+            trend_score += 10
+        if rsi14 and 42 <= rsi14 <= 72:
             momentum_score += 15
-
-        if macd_line and macd_line > 0:
+        if macd_line is not None and macd_line >= 0:
             momentum_score += 10
-
-        near_support = support and price <= support * 1.05
-        breakout = resistance and price >= resistance * 0.995
-
-        if near_support:
-            structure_score += 20
-
-        if breakout:
-            structure_score += 25
-
-        if vr >= 0.9:
-            volume_score += 10
-
-        if vr >= 1.3:
-            volume_score += 15
-
-        total_score = trend_score + momentum_score + structure_score + volume_score
-
-        if total_score >= 55 and support:
-            entry = price
-
-            if day_atr:
-                stop = max(support, entry - day_atr * 2)
-            else:
-                stop = support
-
-            if stop >= entry:
-                stop = entry * 0.94
-
-            target1 = entry * 1.07
-            target2 = entry * 1.12
-            target3 = entry * 1.15
-
-            risk_pct = ((entry - stop) / entry) * 100
-            expected_pct = ((target1 - entry) / entry) * 100
-            rr = expected_pct / risk_pct if risk_pct > 0 else 0
-
-            if expected_pct >= 7 and rr >= 0.9:
-                signals.append({
-                    "symbol": symbol,
-                    "type": "SWING",
-                    "action": "SWING BUY WATCH",
-                    "timeframe": "1D",
-                    "price": round(entry, 3),
-                    "entry_zone": [round(entry * 0.99, 3), round(entry * 1.01, 3)],
-                    "stop_loss": round(stop, 3),
-                    "target1": round(target1, 3),
-                    "target2": round(target2, 3),
-                    "target3": round(target3, 3),
-                    "expected_move_pct": round(expected_pct, 2),
-                    "risk_pct": round(risk_pct, 2),
-                    "rr": round(rr, 2),
-                    "score": round(total_score, 2),
-                    "strength": classify_strength(total_score),
-                    "trend": "UP" if trend_score >= 25 else "MIXED",
-                    "support": round(support, 3) if support else None,
-                    "resistance": round(resistance, 3) if resistance else None,
-                    "rsi": round(rsi14, 2) if rsi14 else None,
-                    "volume_ratio": round(vr, 2),
-                    "holding": "1 week to 1 month",
-                    "reason": "Daily trend + support/breakout + momentum filter",
-                    "trigger_key": f"SWING-{latest['bar_time']}"
-                })
-
-    # =========================
-    # SHORT SWING SYSTEM
-    # Target: 3% - 5%
-    # Holding: 1 - 5 days
-    # =========================
-
-    if len(short_data) >= 50:
-        closes = [x["close"] for x in short_data if x["close"] is not None]
-        latest = short_data[-1]
-        price = latest["close"]
-
-        ema20 = ema(closes, 20)
-        ema50 = ema(closes, 50)
-        rsi14 = rsi(closes, 14)
-        macd_line = macd(closes)
-
-        support, resistance = support_resistance(short_data, 40)
-        short_atr = atr(short_data, 14)
-        vr = volume_ratio(short_data, 20)
-
-        trend_score = 0
-        momentum_score = 0
-        structure_score = 0
-        volume_score = 0
-
-        if ema20 and ema50 and ema20 >= ema50 * 0.995:
-            trend_score += 25
-
-        if ema20 and price >= ema20 * 0.995:
-            trend_score += 15
-
-        if rsi14 and 45 <= rsi14 <= 75:
-            momentum_score += 15
-
-        if macd_line and macd_line >= 0:
-            momentum_score += 10
-
-        breakout = resistance and price >= resistance * 0.995
-        near_support = support and price <= support * 1.035
-
-        if breakout:
-            structure_score += 25
-
-        if near_support:
-            structure_score += 15
-
+        if support and entry <= support * 1.06:
+            structure_score += 18
+        if resistance and entry >= resistance * 0.99:
+            structure_score += 22
         if vr >= 0.8:
-            volume_score += 10
-
+            volume_score += 8
         if vr >= 1.2:
             volume_score += 15
 
-        total_score = trend_score + momentum_score + structure_score + volume_score
+        score = trend_score + momentum_score + structure_score + volume_score
+        entry_low = entry * 0.99
+        entry_high = entry * 1.01
+        stop = _smart_stop_for_buy(entry, entry_low, support=support, atr_value=day_atr, min_stop_pct=0.035, max_stop_pct=0.085, atr_mult=2.2, support_buffer=0.008)
+        targets = [entry * 1.07, entry * 1.12, entry * 1.15]
+        risk_pct = ((entry - stop) / entry) * 100 if entry else 0
+        rr = 7 / risk_pct if risk_pct > 0 else 0
+        trend_label = "UP" if trend_score >= 30 else "MIXED"
+        if score >= 55 and rr >= 0.75 and stop < entry_low:
+            signals.append(_signal_dict(
+                symbol, "SWING", "SWING BUY WATCH", "1D", entry, entry_low, entry_high,
+                stop, targets, score, trend_label, support, resistance, rsi14, vr,
+                "1 week to 1 month", "Daily structure + momentum + volume + Hybrid Smart Stop", latest["bar_time"]
+            ))
 
-        if total_score >= 50:
-            entry = price
+    # -------------------------
+    # 1H SHORT SWING SYSTEM
+    # -------------------------
+    if len(h1) >= 20:
+        closes = [float(x["close"]) for x in h1 if x["close"] is not None]
+        latest = h1[-1]
+        entry = float(latest["close"])
+        ema20_h = ema(closes[-80:], 20) if len(closes) >= 20 else None
+        ema50_h = ema(closes[-120:], 50) if len(closes) >= 50 else None
+        rsi14 = rsi(closes, 14)
+        macd_line = macd(closes)
+        support, resistance = support_resistance(h1, min(50, len(h1)))
+        short_atr = atr(h1, 14)
+        vr = volume_ratio(h1, min(20, max(len(h1)-1, 1)))
 
-            # =========================
-            # HYBRID SMART STOP
-            # =========================
-            # For BUY setups, the stop must always be BELOW the entry zone.
-            # It is derived from market structure + ATR volatility + safety bounds.
-            entry_low = entry * 0.995
-            entry_high = entry * 1.005
+        trend_score = 0
+        momentum_score = 0
+        structure_score = 0
+        volume_score = 0
 
-            min_stop_pct = 0.018   # minimum realistic risk: 1.8%
-            max_stop_pct = 0.045   # maximum allowed risk: 4.5%
-            support_buffer_pct = 0.006  # put stop slightly below support
+        if ema20_h and entry >= ema20_h * 0.995:
+            trend_score += 20
+        if ema20_h and ema50_h and ema20_h >= ema50_h * 0.99:
+            trend_score += 18
+        if len(closes) >= 4 and closes[-1] >= closes[-4] * 0.998:
+            trend_score += 8
+        if rsi14 and 43 <= rsi14 <= 76:
+            momentum_score += 14
+        if macd_line is not None and macd_line >= -0.01:
+            momentum_score += 8
+        breakout = resistance and entry >= resistance * 0.995
+        near_support = support and entry <= support * 1.04
+        if breakout:
+            structure_score += 25
+        if near_support:
+            structure_score += 15
+        if vr >= 0.75:
+            volume_score += 8
+        if vr >= 1.15:
+            volume_score += 14
 
-            atr_stop = entry - (short_atr * 2.0) if short_atr else None
-            support_stop = support * (1 - support_buffer_pct) if support and support < entry else None
-            fallback_stop = entry * (1 - min_stop_pct)
+        score = trend_score + momentum_score + structure_score + volume_score
+        entry_low = entry * 0.995
+        entry_high = entry * 1.005
+        stop = _smart_stop_for_buy(entry, entry_low, support=support, atr_value=short_atr, min_stop_pct=0.018, max_stop_pct=0.045, atr_mult=2.0, support_buffer=0.006)
+        targets = [entry * 1.03, entry * 1.05]
+        risk_pct = ((entry - stop) / entry) * 100 if entry else 0
+        rr = 3 / risk_pct if risk_pct > 0 else 0
+        trend_label = "UP" if trend_score >= 28 else "MIXED"
 
-            candidates = []
+        # Medium mode: allow clean 1H signals, but avoid weak/noisy setups.
+        if score >= 50 and rr >= 0.65 and stop < entry_low:
+            signals.append(_signal_dict(
+                symbol, "SHORT_SWING", "SHORT SWING BUY", "60", entry, entry_low, entry_high,
+                stop, targets, score, trend_label, support, resistance, rsi14, vr,
+                "1 to 5 days", "1H trend + structure + volume/momentum + Hybrid Smart Stop", latest["bar_time"]
+            ))
 
-            # Only accept stops that are below the entry zone.
-            if support_stop and support_stop < entry_low:
-                candidates.append(support_stop)
-
-            if atr_stop and atr_stop < entry_low:
-                candidates.append(atr_stop)
-
-            # For a BUY, choose the farther logical stop to avoid noise stop-outs.
-            raw_stop = min(candidates) if candidates else fallback_stop
-
-            # Safety rails: stop cannot be inside entry zone, too tight, or too far.
-            max_allowed_stop = entry_low * (1 - min_stop_pct)
-            min_allowed_stop = entry * (1 - max_stop_pct)
-
-            stop = raw_stop
-
-            if stop >= entry_low:
-                stop = max_allowed_stop
-
-            if stop > max_allowed_stop:
-                stop = max_allowed_stop
-
-            if stop < min_allowed_stop:
-                stop = min_allowed_stop
-
-            target1 = entry * 1.03
-            target2 = entry * 1.05
-
-            risk_pct = ((entry - stop) / entry) * 100
-            expected_pct = ((target1 - entry) / entry) * 100
-            rr = expected_pct / risk_pct if risk_pct > 0 else 0
-
-            if expected_pct >= 3 and rr >= 0.75:
-                signals.append({
-                    "symbol": symbol,
-                    "type": "SHORT_SWING",
-                    "action": "SHORT SWING BUY",
-                    "timeframe": active_tf,
-                    "price": round(entry, 3),
-                    "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
-                    "stop_loss": round(stop, 3),
-                    "target1": round(target1, 3),
-                    "target2": round(target2, 3),
-                    "expected_move_pct": round(expected_pct, 2),
-                    "risk_pct": round(risk_pct, 2),
-                    "rr": round(rr, 2),
-                    "score": round(total_score, 2),
-                    "strength": classify_strength(total_score),
-                    "trend": "UP" if trend_score >= 25 else "MIXED",
-                    "support": round(support, 3) if support else None,
-                    "resistance": round(resistance, 3) if resistance else None,
-                    "rsi": round(rsi14, 2) if rsi14 else None,
-                    "volume_ratio": round(vr, 2),
-                    "holding": "1 to 5 days",
-                    "reason": "Short trend + breakout/support + volume/momentum",
-                    "trigger_key": f"SHORT-{latest['bar_time']}"
-                })
-
-    return signals
+    return sorted(signals, key=lambda x: (x.get("score", 0), x.get("rr", 0)), reverse=True)
 
 
 def build_alert_message(signal):
@@ -2387,7 +2419,7 @@ def build_alert_message(signal):
         targets += f"\n<b>Target 3:</b> {t3}"
 
     return f"""
-ð¨ <b>UAE Trading AI Alert</b>
+🚨 <b>UAE Trading AI Alert</b>
 
 <b>Symbol:</b> {signal['symbol']}
 <b>Type:</b> {signal['type']}
@@ -2441,16 +2473,33 @@ def api_dual_signals(symbol: Optional[str] = None):
     }
 
 
+
+
+@app.get("/api/ai/pro-scan")
+def api_ai_pro_scan(limit: int = 20):
+    signals = []
+    no_data = []
+    for s in get_watchlist_symbols():
+        sigs = analyze_dual_symbol(s)
+        if sigs:
+            signals.extend(sigs)
+        else:
+            p = latest_price(s) if 'latest_price' in globals() else None
+            no_data.append({"symbol": s, "has_price": bool(p), "price": p})
+    signals = sorted(signals, key=lambda x: (x.get("score", 0), x.get("rr", 0)), reverse=True)
+    return {"mode": SYSTEM_MODE, "watchlist_count": len(get_watchlist_symbols()), "signals_count": len(signals), "signals": signals[:limit], "no_signal_count": len(no_data), "no_signal": no_data[:100]}
+
+
 @app.get("/api/ai/test-telegram")
 def api_test_telegram():
     result = send_telegram_message(
-        f"â UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
+        f"✅ UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
     )
     return result
 
 
 @app.get("/api/ai/send-alerts")
-def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True):
+def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True, force: bool = False):
     ensure_alert_tables()
 
     conn = db()
@@ -2470,6 +2519,9 @@ def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True):
         message = build_alert_message(sig)
 
         try:
+            if force:
+                cur.execute("DELETE FROM ai_alerts_log WHERE symbol = %s AND signal_type = %s AND trigger_key = %s", (sig["symbol"], sig["type"], sig["trigger_key"]))
+                conn.commit()
             cur.execute("""
                 INSERT INTO ai_alerts_log
                 (symbol, signal_type, trigger_key, sent_at, price, message, payload)
@@ -2510,12 +2562,37 @@ def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True):
     return {
         "mode": SYSTEM_MODE,
         "dry_run": dry_run,
+        "force": force,
         "signals_found": len(all_signals),
         "sent_count": len(sent),
         "skipped_count": len(skipped),
         "sent": sent,
         "skipped": skipped
     }
+
+
+
+
+@app.post("/api/ai/send-alerts")
+def api_send_alerts_post(symbol: Optional[str] = None, dry_run: bool = True, force: bool = False):
+    return api_send_alerts(symbol=symbol, dry_run=dry_run, force=force)
+
+
+
+
+@app.get("/api/ai/reset-alerts")
+def api_reset_alerts(symbol: Optional[str] = None):
+    ensure_alert_tables()
+    conn = db()
+    cur = conn.cursor()
+    if symbol:
+        cur.execute("DELETE FROM ai_alerts_log WHERE symbol = %s", (normalize_symbol(symbol),))
+    else:
+        cur.execute("DELETE FROM ai_alerts_log")
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "deleted": deleted}
 
 
 @app.get("/api/ai/alerts-log")
@@ -2753,40 +2830,40 @@ def ai_symbol_analysis(symbol: str):
         "rsi": None,
         "volume_ratio": None,
         "holding": "Watch only",
-        "reason": "No confirmed AI signal. ÙØ±Ø§ÙØ¨Ø© ÙÙØ·."
+        "reason": "No confirmed AI signal. مراقبة فقط."
     }
 
 
 def format_analysis(signal: dict):
     if not signal:
-        return "â ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ."
+        return "❌ لا توجد بيانات كافية لهذا السهم."
 
     t3 = signal.get("target3")
-    t3_line = f"\nð¯ Target 3: <b>{t3}</b>" if t3 else ""
+    t3_line = f"\n🎯 Target 3: <b>{t3}</b>" if t3 else ""
 
     return f"""
-ð <b>{signal['symbol']} AI Analysis</b>
+📊 <b>{signal['symbol']} AI Analysis</b>
 
 <b>Action:</b> {signal.get('action')}
 <b>Type:</b> {signal.get('type')}
 <b>Strength:</b> {signal.get('strength')}
 <b>Score:</b> {signal.get('score')}
 
-ð° <b>Price:</b> {signal.get('price')}
-ð <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
-ð <b>Stop:</b> {signal.get('stop_loss')}
+💰 <b>Price:</b> {signal.get('price')}
+📍 <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
+🛑 <b>Stop:</b> {signal.get('stop_loss')}
 
-ð¯ Target 1: <b>{signal.get('target1')}</b>
-ð¯ Target 2: <b>{signal.get('target2')}</b>{t3_line}
+🎯 Target 1: <b>{signal.get('target1')}</b>
+🎯 Target 2: <b>{signal.get('target2')}</b>{t3_line}
 
-ð Expected Move: <b>{signal.get('expected_move_pct')}%</b>
-âï¸ Risk: <b>{signal.get('risk_pct')}%</b>
-ð R/R: <b>{signal.get('rr')}</b>
+📈 Expected Move: <b>{signal.get('expected_move_pct')}%</b>
+⚖️ Risk: <b>{signal.get('risk_pct')}%</b>
+📐 R/R: <b>{signal.get('rr')}</b>
 
-â± Timeframe: <b>{signal.get('timeframe')}</b>
-ð Holding: <b>{signal.get('holding')}</b>
+⏱ Timeframe: <b>{signal.get('timeframe')}</b>
+🕒 Holding: <b>{signal.get('holding')}</b>
 
-ð Reason:
+📌 Reason:
 {signal.get('reason')}
 
 Dashboard:
@@ -2798,11 +2875,11 @@ def analysis_keyboard(symbol: str):
     return {
         "inline_keyboard": [
             [
-                {"text": "â Ø¯Ø®ÙØª Ø§ÙØµÙÙØ©", "callback_data": f"enter:{symbol}"},
-                {"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}
+                {"text": "✅ دخلت الصفقة", "callback_data": f"enter:{symbol}"},
+                {"text": "📊 تحليل أكثر", "callback_data": f"more:{symbol}"}
             ],
             [
-                {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}
+                {"text": "👀 تجاهل", "callback_data": f"ignore:{symbol}"}
             ]
         ]
     }
@@ -2817,7 +2894,7 @@ def amount_keyboard(symbol: str):
             ],
             [
                 {"text": "80,000", "callback_data": f"amt:{symbol}:80000"},
-                {"text": "ÙØ¨ÙØº ÙØ¯ÙÙ", "callback_data": f"amtmanual:{symbol}"}
+                {"text": "مبلغ يدوي", "callback_data": f"amtmanual:{symbol}"}
             ]
         ]
     }
@@ -2827,11 +2904,11 @@ def price_keyboard(symbol: str):
     return {
         "inline_keyboard": [
             [
-                {"text": "Ø³Ø¹Ø± Ø§ÙØ³ÙÙ", "callback_data": f"price:{symbol}:market"},
-                {"text": "ÙÙØªØµÙ Ø§ÙØ¯Ø®ÙÙ", "callback_data": f"price:{symbol}:mid"}
+                {"text": "سعر السوق", "callback_data": f"price:{symbol}:market"},
+                {"text": "منتصف الدخول", "callback_data": f"price:{symbol}:mid"}
             ],
             [
-                {"text": "Ø³Ø¹Ø± ÙØ¯ÙÙ", "callback_data": f"pricemanual:{symbol}"}
+                {"text": "سعر يدوي", "callback_data": f"pricemanual:{symbol}"}
             ]
         ]
     }
@@ -2841,8 +2918,8 @@ def trade_keyboard(trade_id: int):
     return {
         "inline_keyboard": [
             [
-                {"text": "ð° Ø¨ÙØ¹ ÙØ§ÙÙ", "callback_data": f"sell:{trade_id}:full"},
-                {"text": "ð¡ Ø§Ø³ØªÙØ±Ø§Ø±", "callback_data": f"hold:{trade_id}"}
+                {"text": "💰 بيع كامل", "callback_data": f"sell:{trade_id}:full"},
+                {"text": "🟡 استمرار", "callback_data": f"hold:{trade_id}"}
             ]
         ]
     }
@@ -3084,7 +3161,7 @@ def open_trades_report(chat_id):
     conn.close()
 
     if not trades:
-        return "ÙØ§ ØªÙØ¬Ø¯ ØµÙÙØ§Øª ÙÙØªÙØ­Ø© Ø­Ø§ÙÙØ§Ù."
+        return "لا توجد صفقات مفتوحة حالياً."
 
     messages = []
 
@@ -3097,16 +3174,16 @@ def open_trades_report(chat_id):
 
         status = "HOLD"
         if t["target1"] and current >= t["target1"]:
-            status = "ð¯ Target 1 reached"
+            status = "🎯 Target 1 reached"
         elif t["stop_loss"] and current <= t["stop_loss"]:
-            status = "â ï¸ Stop touched"
+            status = "⚠️ Stop touched"
         elif pnl_pct > 2:
-            status = "ð¢ Profit running"
+            status = "🟢 Profit running"
         elif pnl_pct < -1.5:
-            status = "ð´ Risk warning"
+            status = "🔴 Risk warning"
 
         messages.append(f"""
-ð <b>{t['symbol']}</b>
+📌 <b>{t['symbol']}</b>
 Entry: {round(t['entry_price'], 3)}
 Current: {round(current, 3)}
 Amount: {round(t['amount'], 2)}
@@ -3120,11 +3197,11 @@ Target1: {t['target1']}
 
 
 def parse_buy_text(text):
-    parts = text.replace("Ø", " ").split()
+    parts = text.replace("،", " ").split()
     if len(parts) < 4:
         return None
 
-    # Ø¯Ø®ÙØª EMAAR 11.22 40000
+    # دخلت EMAAR 11.22 40000
     symbol = parts[1].upper()
     price = float(parts[2])
     amount = float(parts[3])
@@ -3133,11 +3210,11 @@ def parse_buy_text(text):
 
 
 def parse_sell_text(text):
-    parts = text.replace("Ø", " ").split()
+    parts = text.replace("،", " ").split()
     if len(parts) < 4:
         return None
 
-    # Ø¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40
+    # بعت EMAAR على 11.40
     symbol = parts[1].upper()
     price = float(parts[-1])
 
@@ -3157,13 +3234,13 @@ def handle_text_message(chat_id, text):
 
     session = get_session(chat_id)
 
-    if raw in ["/start", "start", "Hello", "hello", "ÙÙØ§", "ÙØ±Ø­Ø¨Ø§"]:
+    if raw in ["/start", "start", "Hello", "hello", "هلا", "مرحبا"]:
         return tg_send_message(
             chat_id,
-            "Ø£ÙÙØ§Ù ð\nØ§ÙØªØ¨ Ø±ÙØ² Ø§ÙØ³ÙÙ ÙØ«Ù EMAAR Ø£Ù Ø§Ø³ØªØ®Ø¯Ù:\n\nØ¯Ø®ÙØª EMAAR 11.22 40000\nØ¨Ø¹Øª EMAAR 11.40\nØµÙÙØ§ØªÙ\nÙØ±Ø§ÙØ¨Ø©"
+            "أهلاً 👋\nاكتب رمز السهم مثل EMAAR أو استخدم:\n\nدخلت EMAAR 11.22 40000\nبعت EMAAR 11.40\nصفقاتي\nمراقبة"
         )
 
-    if upper in ["ØµÙÙØ§ØªÙ", "ÙØ±Ø§ÙØ¨Ø©", "TRADES", "MONITOR"]:
+    if upper in ["صفقاتي", "مراقبة", "TRADES", "MONITOR"]:
         return tg_send_message(chat_id, open_trades_report(chat_id))
 
     if session and session["state"] == "WAIT_AMOUNT":
@@ -3171,9 +3248,9 @@ def handle_text_message(chat_id, text):
             amount = float(raw.replace(",", ""))
             symbol = session["symbol"]
             set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-            return tg_send_message(chat_id, f"ØªÙØ§Ù. Ø§ÙÙØ¨ÙØº {amount} AED\nØ§Ø®ØªØ± Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ:", price_keyboard(symbol))
+            return tg_send_message(chat_id, f"تمام. المبلغ {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
         except Exception:
-            return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø§ÙÙØ¨ÙØº Ø¨Ø§ÙØ£Ø±ÙØ§Ù ÙÙØ·Ø ÙØ«Ø§Ù: 40000")
+            return tg_send_message(chat_id, "اكتب المبلغ بالأرقام فقط، مثال: 40000")
 
     if session and session["state"] == "WAIT_PRICE":
         try:
@@ -3186,7 +3263,7 @@ def handle_text_message(chat_id, text):
             return tg_send_message(
                 chat_id,
                 f"""
-â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
+✅ تم تسجيل الصفقة
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3198,17 +3275,17 @@ Stop: {signal.get('stop_loss') if signal else '-'}
 Target1: {signal.get('target1') if signal else '-'}
 Target2: {signal.get('target2') if signal else '-'}
 
-Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
+سأتابع الصفقة معك.
 """.strip()
             )
         except Exception:
-            return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ Ø¨Ø§ÙØ£Ø±ÙØ§Ù ÙÙØ·Ø ÙØ«Ø§Ù: 11.22")
+            return tg_send_message(chat_id, "اكتب سعر الدخول بالأرقام فقط، مثال: 11.22")
 
-    if upper.startswith("Ø¯Ø®ÙØª"):
+    if upper.startswith("دخلت"):
         try:
             parsed = parse_buy_text(raw)
             if not parsed:
-                return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¯Ø®ÙØª EMAAR 11.22 40000")
+                return tg_send_message(chat_id, "الصيغة:\nدخلت EMAAR 11.22 40000")
 
             symbol, price, amount = parsed
             trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
@@ -3216,7 +3293,7 @@ Target2: {signal.get('target2') if signal else '-'}
             return tg_send_message(
                 chat_id,
                 f"""
-â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
+✅ تم تسجيل الصفقة
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3228,28 +3305,28 @@ Stop: {signal.get('stop_loss') if signal else '-'}
 Target1: {signal.get('target1') if signal else '-'}
 Target2: {signal.get('target2') if signal else '-'}
 
-Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
+سأتابع الصفقة معك.
 """.strip()
             )
         except Exception as e:
-            return tg_send_message(chat_id, f"ÙÙ Ø£Ø³ØªØ·Ø¹ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©.\nØ§ÙØµÙØºØ©:\nØ¯Ø®ÙØª EMAAR 11.22 40000")
+            return tg_send_message(chat_id, f"لم أستطع تسجيل الصفقة.\nالصيغة:\nدخلت EMAAR 11.22 40000")
 
-    if upper.startswith("Ø¨Ø¹Øª"):
+    if upper.startswith("بعت"):
         try:
             parsed = parse_sell_text(raw)
             if not parsed:
-                return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40")
+                return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
 
             symbol, price = parsed
             result = close_telegram_trade(chat_id, symbol=symbol, exit_price=price)
 
             if not result:
-                return tg_send_message(chat_id, "ÙØ§ Ø­ØµÙØª ØµÙÙØ© ÙÙØªÙØ­Ø© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ.")
+                return tg_send_message(chat_id, "ما حصلت صفقة مفتوحة لهذا السهم.")
 
             return tg_send_message(
                 chat_id,
                 f"""
-ð ØªÙ Ø¥ØºÙØ§Ù Ø§ÙØµÙÙØ©
+📉 تم إغلاق الصفقة
 
 Symbol: {result['symbol']}
 Entry: {round(result['entry'], 3)}
@@ -3259,13 +3336,13 @@ PnL: {round(result['pnl'], 2)} AED
 Return: {round(result['pnl_pct'], 2)}%
 Result: {result['result']}
 
-ØªÙ Ø­ÙØ¸ Ø§ÙÙØªÙØ¬Ø© ÙÙØªØ¹ÙÙ.
+تم حفظ النتيجة للتعلم.
 """.strip()
             )
         except Exception:
-            return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40")
+            return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
 
-    if upper.startswith("Ø­ÙÙ"):
+    if upper.startswith("حلل"):
         parts = upper.split()
         if len(parts) >= 2:
             symbol = normalize_symbol(parts[1])
@@ -3277,7 +3354,7 @@ Result: {result['result']}
         signal = ai_symbol_analysis(symbol)
         return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
 
-    return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø±ÙØ² Ø³ÙÙ ÙØ«Ù EMAAR Ø£Ù:\nØµÙÙØ§ØªÙ\nÙØ±Ø§ÙØ¨Ø©\nØ¯Ø®ÙØª EMAAR 11.22 40000")
+    return tg_send_message(chat_id, "اكتب رمز سهم مثل EMAAR أو:\nصفقاتي\nمراقبة\nدخلت EMAAR 11.22 40000")
 
 
 def handle_callback(chat_id, callback_id, data):
@@ -3294,23 +3371,23 @@ def handle_callback(chat_id, callback_id, data):
         return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
 
     if action == "ignore":
-        return tg_send_message(chat_id, "ØªÙ ØªØ¬Ø§ÙÙ Ø§ÙØ¥Ø´Ø§Ø±Ø© ð")
+        return tg_send_message(chat_id, "تم تجاهل الإشارة 👀")
 
     if action == "enter":
         symbol = parts[1]
         set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, f"Ø§Ø®ØªØ± ÙØ¨ÙØº Ø§ÙØ¯Ø®ÙÙ ÙÙ {symbol}:", amount_keyboard(symbol))
+        return tg_send_message(chat_id, f"اختر مبلغ الدخول لـ {symbol}:", amount_keyboard(symbol))
 
     if action == "amt":
         symbol = parts[1]
         amount = float(parts[2])
         set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-        return tg_send_message(chat_id, f"Ø§ÙÙØ¨ÙØº: {amount} AED\nØ§Ø®ØªØ± Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ:", price_keyboard(symbol))
+        return tg_send_message(chat_id, f"المبلغ: {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
 
     if action == "amtmanual":
         symbol = parts[1]
         set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø§ÙÙØ¨ÙØº Ø¨Ø§ÙØ£Ø±ÙØ§ÙØ ÙØ«Ø§Ù: 40000")
+        return tg_send_message(chat_id, "اكتب المبلغ بالأرقام، مثال: 40000")
 
     if action == "price":
         symbol = parts[1]
@@ -3318,7 +3395,7 @@ def handle_callback(chat_id, callback_id, data):
         session = get_session(chat_id)
 
         if not session or not session["amount"]:
-            return tg_send_message(chat_id, "Ø§ÙØªÙØª Ø§ÙØ¬ÙØ³Ø©. Ø§Ø¶ØºØ· Ø¯Ø®ÙØª Ø§ÙØµÙÙØ© ÙØ±Ø© Ø«Ø§ÙÙØ©.")
+            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
 
         amount = float(session["amount"])
         signal = ai_symbol_analysis(symbol)
@@ -3336,7 +3413,7 @@ def handle_callback(chat_id, callback_id, data):
         return tg_send_message(
             chat_id,
             f"""
-â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
+✅ تم تسجيل الصفقة
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3348,7 +3425,7 @@ Stop: {signal.get('stop_loss')}
 Target1: {signal.get('target1')}
 Target2: {signal.get('target2')}
 
-Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
+سأتابع الصفقة معك.
 """.strip()
         )
 
@@ -3357,22 +3434,22 @@ Target2: {signal.get('target2')}
         session = get_session(chat_id)
 
         if not session or not session["amount"]:
-            return tg_send_message(chat_id, "Ø§ÙØªÙØª Ø§ÙØ¬ÙØ³Ø©. Ø§Ø¶ØºØ· Ø¯Ø®ÙØª Ø§ÙØµÙÙØ© ÙØ±Ø© Ø«Ø§ÙÙØ©.")
+            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
 
         set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=session["amount"])
-        return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙØ ÙØ«Ø§Ù: 11.22")
+        return tg_send_message(chat_id, "اكتب سعر الدخول، مثال: 11.22")
 
     if action == "sell":
         trade_id = int(parts[1])
         result = close_telegram_trade(chat_id, trade_id=trade_id)
 
         if not result:
-            return tg_send_message(chat_id, "ÙØ§ Ø­ØµÙØª Ø§ÙØµÙÙØ© Ø£Ù ØªÙ Ø¥ØºÙØ§ÙÙØ§ Ø³Ø§Ø¨ÙØ§Ù.")
+            return tg_send_message(chat_id, "ما حصلت الصفقة أو تم إغلاقها سابقاً.")
 
         return tg_send_message(
             chat_id,
             f"""
-ð° ØªÙ Ø§ÙØ¨ÙØ¹
+💰 تم البيع
 
 Symbol: {result['symbol']}
 Entry: {round(result['entry'], 3)}
@@ -3382,14 +3459,14 @@ PnL: {round(result['pnl'], 2)} AED
 Return: {round(result['pnl_pct'], 2)}%
 Result: {result['result']}
 
-ØªÙ Ø­ÙØ¸ Ø§ÙÙØªÙØ¬Ø© ÙÙØªØ¹ÙÙ.
+تم حفظ النتيجة للتعلم.
 """.strip()
         )
 
     if action == "hold":
-        return tg_send_message(chat_id, "ØªÙØ§ÙØ Ø¨ÙØ³ØªÙØ± ÙÙ ÙØ±Ø§ÙØ¨Ø© Ø§ÙØµÙÙØ©.")
+        return tg_send_message(chat_id, "تمام، بنستمر في مراقبة الصفقة.")
 
-    return tg_send_message(chat_id, "Ø£ÙØ± ØºÙØ± ÙØ¹Ø±ÙÙ.")
+    return tg_send_message(chat_id, "أمر غير معروف.")
 
 
 @app.get("/api/telegram/set-webhook")
@@ -3447,8 +3524,3 @@ def api_telegram_trades(chat_id: str, status: str = "OPEN"):
         "count": len(rows),
         "trades": rows
     }
-
-
-@app.get("/api/health")
-def api_health():
-    return {"status": "ok", "service": "uae-trading-ai"}
