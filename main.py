@@ -48,6 +48,14 @@ BROKER_API_KEY = os.getenv("BROKER_API_KEY", "")
 MAX_LIVE_ORDER_AED = float(os.getenv("MAX_LIVE_ORDER_AED", "10000"))
 MAX_DAILY_LIVE_ORDERS = int(os.getenv("MAX_DAILY_LIVE_ORDERS", "3"))
 
+# V6 Risk + Auto Paper Tracking
+AUTO_PAPER_TRACKING = os.getenv("AUTO_PAPER_TRACKING", "true").lower() == "true"
+MIN_AUTO_PAPER_SCORE = float(os.getenv("MIN_AUTO_PAPER_SCORE", "75"))
+MIN_AUTO_PAPER_RR = float(os.getenv("MIN_AUTO_PAPER_RR", "0.6"))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "20.0"))
+DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "true").lower() == "true"
+
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
 LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
@@ -1001,6 +1009,12 @@ def run_scan(scan_type: str):
     if OBSERVATION_LEARNING:
         record_observations(payload)
 
+    auto_paper_created = 0
+    for sig in signals[:TELEGRAM_TOP_N]:
+        if auto_track_paper_trade(sig):
+            auto_paper_created += 1
+    payload["auto_paper_created"] = auto_paper_created
+
     return payload
 
 @app.get("/api/ai/pro-scan")
@@ -1132,6 +1146,7 @@ def learning_scan():
 
     evaluated = evaluate_virtual_signals()
     observed_evaluated = evaluate_observations()
+    paper_evaluated = evaluate_open_paper_trades()
     return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
 
 
@@ -1254,13 +1269,14 @@ def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
 
     evaluated = evaluate_virtual_signals()
     observed_evaluated = evaluate_observations()
+    paper_evaluated = evaluate_open_paper_trades()
 
     if send:
         send_alerts(force=True, top=TELEGRAM_TOP_N)
 
     save_combined_scan()
 
-    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
+    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated), "paper_evaluated": len(paper_evaluated)}
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -1282,7 +1298,7 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
 
     save_combined_scan()
 
-    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
+    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated), "paper_evaluated": len(paper_evaluated)}
 
 def save_combined_scan():
     hourly = latest_scan_result("HOURLY") or {}
@@ -1399,6 +1415,214 @@ def readiness_report():
     }
 
 
+
+
+# ============================================================
+# V6 RISK ENGINE + AUTO PAPER TRACKING
+# ============================================================
+
+def calc_v6_risk_plan(sig: Dict[str, Any]) -> Dict[str, Any]:
+    price = safe_float(sig.get("price"), 0) or 0
+    stop = safe_float(sig.get("stop_loss"), 0) or 0
+    target1 = safe_float(sig.get("target1"), 0) or 0
+
+    if price <= 0 or stop <= 0 or stop >= price:
+        return {
+            "ok": False,
+            "reason": "Invalid price or stop",
+            "amount_aed": 0,
+            "qty": 0,
+            "risk_aed": 0,
+            "reward_aed": 0,
+        }
+
+    max_risk_aed = CAPITAL * (RISK_PER_TRADE_PCT / 100)
+    max_position_aed = CAPITAL * (MAX_POSITION_PCT / 100)
+
+    risk_per_share = price - stop
+    qty_by_risk = max_risk_aed / risk_per_share
+    qty_by_position = max_position_aed / price
+    qty = max(0, min(qty_by_risk, qty_by_position))
+
+    amount = qty * price
+    risk_aed = qty * risk_per_share
+    reward_aed = qty * (target1 - price) if target1 > price else 0
+
+    return {
+        "ok": True,
+        "amount_aed": round(amount, 2),
+        "qty": round(qty, 2),
+        "risk_aed": round(risk_aed, 2),
+        "reward_aed": round(reward_aed, 2),
+        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+        "max_position_pct": MAX_POSITION_PCT,
+    }
+
+def should_auto_track_paper(sig: Dict[str, Any]) -> bool:
+    if not AUTO_PAPER_TRACKING:
+        return False
+    return (
+        get_ai_mode() in ["PAPER", "LEARNING"]
+        and (sig.get("model_action") == "BUY" or sig.get("display_action") in ["BUY", "STRONG WATCH"] or sig.get("action") in ["PAPER_BUY", "BUY", "STRONG_LEARNING_ALERT"])
+        and float(sig.get("score") or 0) >= MIN_AUTO_PAPER_SCORE
+        and float(sig.get("rr") or 0) >= MIN_AUTO_PAPER_RR
+    )
+
+def auto_track_paper_trade(sig: Dict[str, Any]) -> bool:
+    if not should_auto_track_paper(sig):
+        return False
+
+    plan = calc_v6_risk_plan(sig)
+    if not plan.get("ok"):
+        return False
+
+    symbol = sig.get("symbol")
+    price = safe_float(sig.get("price"), 0)
+    amount = plan["amount_aed"]
+    qty = plan["qty"]
+
+    conn = db()
+    cur = conn.cursor()
+    key_payload = json.dumps(sig, sort_keys=True)
+
+    # avoid duplicate paper tracking for same symbol/type/price during same day
+    today = datetime.now(timezone.utc).date().isoformat()
+    cur.execute("""
+        SELECT id FROM telegram_trades
+        WHERE symbol=%s AND status='PAPER_OPEN' AND opened_at >= %s
+        LIMIT 1
+    """, (symbol, today))
+    exists = cur.fetchone()
+    if exists:
+        conn.close()
+        return False
+
+    cur.execute("""
+        INSERT INTO telegram_trades
+        (chat_id,symbol,status,entry_price,amount,qty,stop_loss,target1,target2,target3,
+         signal_score,signal_strength,signal_type,signal_payload,opened_at)
+        VALUES(%s,%s,'PAPER_OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        TELEGRAM_CHAT_ID or "paper",
+        symbol,
+        price,
+        amount,
+        qty,
+        sig.get("stop_loss"),
+        sig.get("target1"),
+        sig.get("target2"),
+        sig.get("target3"),
+        sig.get("score"),
+        sig.get("strength"),
+        sig.get("type"),
+        key_payload,
+        utc_now()
+    ))
+    conn.commit()
+    conn.close()
+    return True
+
+def evaluate_open_paper_trades():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM telegram_trades WHERE status='PAPER_OPEN' ORDER BY id ASC LIMIT 500")
+    trades = cur.fetchall()
+    evaluated = []
+
+    for tr in trades:
+        symbol = tr["symbol"]
+        # use 60 first, fallback 1D
+        candles = get_candles(symbol, "60", 200) or get_candles(symbol, "1D", 200)
+        if not candles:
+            continue
+
+        entry = float(tr["entry_price"])
+        stop = safe_float(tr.get("stop_loss"))
+        target1 = safe_float(tr.get("target1"))
+        latest = float(candles[-1]["close"])
+        max_high = max(float(x["high"]) for x in candles[-48:])
+        min_low = min(float(x["low"]) for x in candles[-48:])
+
+        close_reason = None
+        exit_price = None
+
+        if target1 and max_high >= target1:
+            close_reason = "TARGET1_HIT"
+            exit_price = target1
+        elif stop and min_low <= stop:
+            close_reason = "STOP_HIT"
+            exit_price = stop
+        else:
+            opened = parse_dt(tr["opened_at"])
+            if opened and (utc_now_dt() - opened) > timedelta(days=5):
+                close_reason = "TIME_EXIT"
+                exit_price = latest
+
+        if close_reason:
+            qty = float(tr["qty"])
+            pnl = (exit_price - entry) * qty
+            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
+
+            cur.execute("""
+                UPDATE telegram_trades
+                SET status='PAPER_CLOSED', exit_price=%s, closed_at=%s, pnl=%s, pnl_pct=%s, close_note=%s
+                WHERE id=%s
+            """, (exit_price, utc_now(), pnl, pnl_pct, close_reason, tr["id"]))
+
+            apply_loss_learning(symbol, pnl_pct, tr.get("signal_type") or "PAPER")
+            evaluated.append({
+                "trade_id": tr["id"],
+                "symbol": symbol,
+                "reason": close_reason,
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+            })
+
+    conn.commit()
+    conn.close()
+    return evaluated
+
+@app.get("/api/v6/evaluate-paper")
+def api_evaluate_paper():
+    evaluated = evaluate_open_paper_trades()
+    return {"ok": True, "evaluated_count": len(evaluated), "evaluated": evaluated}
+
+@app.get("/api/v6/report")
+def api_v6_report(send: bool = False):
+    evaluated = evaluate_open_paper_trades()
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT COUNT(*) c FROM telegram_trades WHERE status='PAPER_OPEN'")
+    open_count = int(cur.fetchone()["c"])
+    cur.execute("SELECT COUNT(*) c FROM telegram_trades WHERE status='PAPER_CLOSED'")
+    closed_count = int(cur.fetchone()["c"])
+    cur.execute("SELECT COALESCE(SUM(pnl),0) pnl, COALESCE(AVG(pnl_pct),0) avg_pct FROM telegram_trades WHERE status='PAPER_CLOSED'")
+    row = cur.fetchone()
+    conn.close()
+
+    msg = (
+        "ð <b>UAE PRO AI V6 Report</b>\n\n"
+        f"Mode: <b>{get_ai_mode()}</b>\n"
+        f"Paper Open Trades: <b>{open_count}</b>\n"
+        f"Paper Closed Trades: <b>{closed_count}</b>\n"
+        f"Total Paper PnL: <b>{round(float(row['pnl']), 2)} AED</b>\n"
+        f"Average Paper Return: <b>{round(float(row['avg_pct']), 2)}%</b>\n"
+        f"Evaluated Now: <b>{len(evaluated)}</b>\n\n"
+        f"Dashboard:\n{DASHBOARD_URL}"
+    )
+
+    if send:
+        tg_main_send(msg)
+
+    return {
+        "mode": get_ai_mode(),
+        "open_paper_trades": open_count,
+        "closed_paper_trades": closed_count,
+        "total_paper_pnl": round(float(row["pnl"]), 2),
+        "avg_paper_return_pct": round(float(row["avg_pct"]), 2),
+        "evaluated_now": evaluated,
+    }
 
 # ============================================================
 # V5 LIVE ORDER ENGINE + LOSS LEARNING
@@ -1694,12 +1918,16 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         price_txt = price if price is not None else "-"
         rr_txt = rr if rr is not None else "-"
         vol_txt = vol if vol is not None else "-"
+        risk_plan = calc_v6_risk_plan(x)
+        risk_line = ""
+        if risk_plan.get("ok"):
+            risk_line = f"\nRisk Plan: Amount {risk_plan['amount_aed']} AED | Qty {risk_plan['qty']} | Risk {risk_plan['risk_aed']} AED"
 
         lines.append(
             f"{i}. <b>{symbol}</b> | {status}\n"
             f"Action: <b>{action}</b> | Model: {model_action}\n"
             f"Strength: {strength} | Score: {score} | Rank: {rank_score}\n"
-            f"Price: {price_txt} | RR: {rr_txt} | Vol: {vol_txt}\n"
+            f"Price: {price_txt} | RR: {rr_txt} | Vol: {vol_txt}{risk_line}\n"
             f"{comment}\n"
         )
 
