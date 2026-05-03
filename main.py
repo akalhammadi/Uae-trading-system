@@ -1488,3 +1488,16 @@ def dashboard():
     </body>
     </html>
     """
+
+@app.get("/trigger/hourly")
+def trigger_hourly():
+    from threading import Thread
+    Thread(target=run_hourly_scan).start()
+    return {"status": "started"}
+
+@app.get("/trigger/daily")
+def trigger_daily():
+    from threading import Thread
+    Thread(target=run_daily_scan).start()
+    return {"status": "started"}
+
