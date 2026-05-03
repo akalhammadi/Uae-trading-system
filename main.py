@@ -2129,10 +2129,12 @@ def analyze_dual_symbol(symbol: str):
 
     daily = get_symbol_candles(symbol, "1D", 260)
     h1 = get_symbol_candles(symbol, "60", 180)
-    m1 = get_symbol_candles(symbol, "1", 180)
 
-    short_data = h1 if len(h1) >= 50 else m1
-    active_tf = "60" if len(h1) >= 50 else "1"
+    # Short-swing analysis uses 1H only.
+    # We intentionally do NOT fall back to 1-minute data because it creates noisy
+    # signals and unrealistically tight stops.
+    short_data = h1
+    active_tf = "60"
 
     signals = []
 
@@ -2293,18 +2295,48 @@ def analyze_dual_symbol(symbol: str):
         if total_score >= 50:
             entry = price
 
-            if short_atr:
-                stop = entry - short_atr * 1.5
-            elif support:
-                stop = support
-            else:
-                stop = entry * 0.97
+            # =========================
+            # HYBRID SMART STOP
+            # =========================
+            # For BUY setups, the stop must always be BELOW the entry zone.
+            # It is derived from market structure + ATR volatility + safety bounds.
+            entry_low = entry * 0.995
+            entry_high = entry * 1.005
 
-            if support and support < entry:
-                stop = max(stop, support)
+            min_stop_pct = 0.018   # minimum realistic risk: 1.8%
+            max_stop_pct = 0.045   # maximum allowed risk: 4.5%
+            support_buffer_pct = 0.006  # put stop slightly below support
 
-            if stop >= entry:
-                stop = entry * 0.97
+            atr_stop = entry - (short_atr * 2.0) if short_atr else None
+            support_stop = support * (1 - support_buffer_pct) if support and support < entry else None
+            fallback_stop = entry * (1 - min_stop_pct)
+
+            candidates = []
+
+            # Only accept stops that are below the entry zone.
+            if support_stop and support_stop < entry_low:
+                candidates.append(support_stop)
+
+            if atr_stop and atr_stop < entry_low:
+                candidates.append(atr_stop)
+
+            # For a BUY, choose the farther logical stop to avoid noise stop-outs.
+            raw_stop = min(candidates) if candidates else fallback_stop
+
+            # Safety rails: stop cannot be inside entry zone, too tight, or too far.
+            max_allowed_stop = entry_low * (1 - min_stop_pct)
+            min_allowed_stop = entry * (1 - max_stop_pct)
+
+            stop = raw_stop
+
+            if stop >= entry_low:
+                stop = max_allowed_stop
+
+            if stop > max_allowed_stop:
+                stop = max_allowed_stop
+
+            if stop < min_allowed_stop:
+                stop = min_allowed_stop
 
             target1 = entry * 1.03
             target2 = entry * 1.05
@@ -2320,7 +2352,7 @@ def analyze_dual_symbol(symbol: str):
                     "action": "SHORT SWING BUY",
                     "timeframe": active_tf,
                     "price": round(entry, 3),
-                    "entry_zone": [round(entry * 0.995, 3), round(entry * 1.005, 3)],
+                    "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
                     "stop_loss": round(stop, 3),
                     "target1": round(target1, 3),
                     "target2": round(target2, 3),
@@ -2355,7 +2387,7 @@ def build_alert_message(signal):
         targets += f"\n<b>Target 3:</b> {t3}"
 
     return f"""
-🚨 <b>UAE Trading AI Alert</b>
+ð¨ <b>UAE Trading AI Alert</b>
 
 <b>Symbol:</b> {signal['symbol']}
 <b>Type:</b> {signal['type']}
@@ -2412,7 +2444,7 @@ def api_dual_signals(symbol: Optional[str] = None):
 @app.get("/api/ai/test-telegram")
 def api_test_telegram():
     result = send_telegram_message(
-        f"✅ UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
+        f"â UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
     )
     return result
 
@@ -2721,40 +2753,40 @@ def ai_symbol_analysis(symbol: str):
         "rsi": None,
         "volume_ratio": None,
         "holding": "Watch only",
-        "reason": "No confirmed AI signal. مراقبة فقط."
+        "reason": "No confirmed AI signal. ÙØ±Ø§ÙØ¨Ø© ÙÙØ·."
     }
 
 
 def format_analysis(signal: dict):
     if not signal:
-        return "❌ لا توجد بيانات كافية لهذا السهم."
+        return "â ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ."
 
     t3 = signal.get("target3")
-    t3_line = f"\n🎯 Target 3: <b>{t3}</b>" if t3 else ""
+    t3_line = f"\nð¯ Target 3: <b>{t3}</b>" if t3 else ""
 
     return f"""
-📊 <b>{signal['symbol']} AI Analysis</b>
+ð <b>{signal['symbol']} AI Analysis</b>
 
 <b>Action:</b> {signal.get('action')}
 <b>Type:</b> {signal.get('type')}
 <b>Strength:</b> {signal.get('strength')}
 <b>Score:</b> {signal.get('score')}
 
-💰 <b>Price:</b> {signal.get('price')}
-📍 <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
-🛑 <b>Stop:</b> {signal.get('stop_loss')}
+ð° <b>Price:</b> {signal.get('price')}
+ð <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
+ð <b>Stop:</b> {signal.get('stop_loss')}
 
-🎯 Target 1: <b>{signal.get('target1')}</b>
-🎯 Target 2: <b>{signal.get('target2')}</b>{t3_line}
+ð¯ Target 1: <b>{signal.get('target1')}</b>
+ð¯ Target 2: <b>{signal.get('target2')}</b>{t3_line}
 
-📈 Expected Move: <b>{signal.get('expected_move_pct')}%</b>
-⚖️ Risk: <b>{signal.get('risk_pct')}%</b>
-📐 R/R: <b>{signal.get('rr')}</b>
+ð Expected Move: <b>{signal.get('expected_move_pct')}%</b>
+âï¸ Risk: <b>{signal.get('risk_pct')}%</b>
+ð R/R: <b>{signal.get('rr')}</b>
 
-⏱ Timeframe: <b>{signal.get('timeframe')}</b>
-🕒 Holding: <b>{signal.get('holding')}</b>
+â± Timeframe: <b>{signal.get('timeframe')}</b>
+ð Holding: <b>{signal.get('holding')}</b>
 
-📌 Reason:
+ð Reason:
 {signal.get('reason')}
 
 Dashboard:
@@ -2766,11 +2798,11 @@ def analysis_keyboard(symbol: str):
     return {
         "inline_keyboard": [
             [
-                {"text": "✅ دخلت الصفقة", "callback_data": f"enter:{symbol}"},
-                {"text": "📊 تحليل أكثر", "callback_data": f"more:{symbol}"}
+                {"text": "â Ø¯Ø®ÙØª Ø§ÙØµÙÙØ©", "callback_data": f"enter:{symbol}"},
+                {"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}
             ],
             [
-                {"text": "👀 تجاهل", "callback_data": f"ignore:{symbol}"}
+                {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}
             ]
         ]
     }
@@ -2785,7 +2817,7 @@ def amount_keyboard(symbol: str):
             ],
             [
                 {"text": "80,000", "callback_data": f"amt:{symbol}:80000"},
-                {"text": "مبلغ يدوي", "callback_data": f"amtmanual:{symbol}"}
+                {"text": "ÙØ¨ÙØº ÙØ¯ÙÙ", "callback_data": f"amtmanual:{symbol}"}
             ]
         ]
     }
@@ -2795,11 +2827,11 @@ def price_keyboard(symbol: str):
     return {
         "inline_keyboard": [
             [
-                {"text": "سعر السوق", "callback_data": f"price:{symbol}:market"},
-                {"text": "منتصف الدخول", "callback_data": f"price:{symbol}:mid"}
+                {"text": "Ø³Ø¹Ø± Ø§ÙØ³ÙÙ", "callback_data": f"price:{symbol}:market"},
+                {"text": "ÙÙØªØµÙ Ø§ÙØ¯Ø®ÙÙ", "callback_data": f"price:{symbol}:mid"}
             ],
             [
-                {"text": "سعر يدوي", "callback_data": f"pricemanual:{symbol}"}
+                {"text": "Ø³Ø¹Ø± ÙØ¯ÙÙ", "callback_data": f"pricemanual:{symbol}"}
             ]
         ]
     }
@@ -2809,8 +2841,8 @@ def trade_keyboard(trade_id: int):
     return {
         "inline_keyboard": [
             [
-                {"text": "💰 بيع كامل", "callback_data": f"sell:{trade_id}:full"},
-                {"text": "🟡 استمرار", "callback_data": f"hold:{trade_id}"}
+                {"text": "ð° Ø¨ÙØ¹ ÙØ§ÙÙ", "callback_data": f"sell:{trade_id}:full"},
+                {"text": "ð¡ Ø§Ø³ØªÙØ±Ø§Ø±", "callback_data": f"hold:{trade_id}"}
             ]
         ]
     }
@@ -3052,7 +3084,7 @@ def open_trades_report(chat_id):
     conn.close()
 
     if not trades:
-        return "لا توجد صفقات مفتوحة حالياً."
+        return "ÙØ§ ØªÙØ¬Ø¯ ØµÙÙØ§Øª ÙÙØªÙØ­Ø© Ø­Ø§ÙÙØ§Ù."
 
     messages = []
 
@@ -3065,16 +3097,16 @@ def open_trades_report(chat_id):
 
         status = "HOLD"
         if t["target1"] and current >= t["target1"]:
-            status = "🎯 Target 1 reached"
+            status = "ð¯ Target 1 reached"
         elif t["stop_loss"] and current <= t["stop_loss"]:
-            status = "⚠️ Stop touched"
+            status = "â ï¸ Stop touched"
         elif pnl_pct > 2:
-            status = "🟢 Profit running"
+            status = "ð¢ Profit running"
         elif pnl_pct < -1.5:
-            status = "🔴 Risk warning"
+            status = "ð´ Risk warning"
 
         messages.append(f"""
-📌 <b>{t['symbol']}</b>
+ð <b>{t['symbol']}</b>
 Entry: {round(t['entry_price'], 3)}
 Current: {round(current, 3)}
 Amount: {round(t['amount'], 2)}
@@ -3088,11 +3120,11 @@ Target1: {t['target1']}
 
 
 def parse_buy_text(text):
-    parts = text.replace("،", " ").split()
+    parts = text.replace("Ø", " ").split()
     if len(parts) < 4:
         return None
 
-    # دخلت EMAAR 11.22 40000
+    # Ø¯Ø®ÙØª EMAAR 11.22 40000
     symbol = parts[1].upper()
     price = float(parts[2])
     amount = float(parts[3])
@@ -3101,11 +3133,11 @@ def parse_buy_text(text):
 
 
 def parse_sell_text(text):
-    parts = text.replace("،", " ").split()
+    parts = text.replace("Ø", " ").split()
     if len(parts) < 4:
         return None
 
-    # بعت EMAAR على 11.40
+    # Ø¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40
     symbol = parts[1].upper()
     price = float(parts[-1])
 
@@ -3125,13 +3157,13 @@ def handle_text_message(chat_id, text):
 
     session = get_session(chat_id)
 
-    if raw in ["/start", "start", "Hello", "hello", "هلا", "مرحبا"]:
+    if raw in ["/start", "start", "Hello", "hello", "ÙÙØ§", "ÙØ±Ø­Ø¨Ø§"]:
         return tg_send_message(
             chat_id,
-            "أهلاً 👋\nاكتب رمز السهم مثل EMAAR أو استخدم:\n\nدخلت EMAAR 11.22 40000\nبعت EMAAR 11.40\nصفقاتي\nمراقبة"
+            "Ø£ÙÙØ§Ù ð\nØ§ÙØªØ¨ Ø±ÙØ² Ø§ÙØ³ÙÙ ÙØ«Ù EMAAR Ø£Ù Ø§Ø³ØªØ®Ø¯Ù:\n\nØ¯Ø®ÙØª EMAAR 11.22 40000\nØ¨Ø¹Øª EMAAR 11.40\nØµÙÙØ§ØªÙ\nÙØ±Ø§ÙØ¨Ø©"
         )
 
-    if upper in ["صفقاتي", "مراقبة", "TRADES", "MONITOR"]:
+    if upper in ["ØµÙÙØ§ØªÙ", "ÙØ±Ø§ÙØ¨Ø©", "TRADES", "MONITOR"]:
         return tg_send_message(chat_id, open_trades_report(chat_id))
 
     if session and session["state"] == "WAIT_AMOUNT":
@@ -3139,9 +3171,9 @@ def handle_text_message(chat_id, text):
             amount = float(raw.replace(",", ""))
             symbol = session["symbol"]
             set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-            return tg_send_message(chat_id, f"تمام. المبلغ {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
+            return tg_send_message(chat_id, f"ØªÙØ§Ù. Ø§ÙÙØ¨ÙØº {amount} AED\nØ§Ø®ØªØ± Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ:", price_keyboard(symbol))
         except Exception:
-            return tg_send_message(chat_id, "اكتب المبلغ بالأرقام فقط، مثال: 40000")
+            return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø§ÙÙØ¨ÙØº Ø¨Ø§ÙØ£Ø±ÙØ§Ù ÙÙØ·Ø ÙØ«Ø§Ù: 40000")
 
     if session and session["state"] == "WAIT_PRICE":
         try:
@@ -3154,7 +3186,7 @@ def handle_text_message(chat_id, text):
             return tg_send_message(
                 chat_id,
                 f"""
-✅ تم تسجيل الصفقة
+â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3166,17 +3198,17 @@ Stop: {signal.get('stop_loss') if signal else '-'}
 Target1: {signal.get('target1') if signal else '-'}
 Target2: {signal.get('target2') if signal else '-'}
 
-سأتابع الصفقة معك.
+Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
 """.strip()
             )
         except Exception:
-            return tg_send_message(chat_id, "اكتب سعر الدخول بالأرقام فقط، مثال: 11.22")
+            return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ Ø¨Ø§ÙØ£Ø±ÙØ§Ù ÙÙØ·Ø ÙØ«Ø§Ù: 11.22")
 
-    if upper.startswith("دخلت"):
+    if upper.startswith("Ø¯Ø®ÙØª"):
         try:
             parsed = parse_buy_text(raw)
             if not parsed:
-                return tg_send_message(chat_id, "الصيغة:\nدخلت EMAAR 11.22 40000")
+                return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¯Ø®ÙØª EMAAR 11.22 40000")
 
             symbol, price, amount = parsed
             trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
@@ -3184,7 +3216,7 @@ Target2: {signal.get('target2') if signal else '-'}
             return tg_send_message(
                 chat_id,
                 f"""
-✅ تم تسجيل الصفقة
+â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3196,28 +3228,28 @@ Stop: {signal.get('stop_loss') if signal else '-'}
 Target1: {signal.get('target1') if signal else '-'}
 Target2: {signal.get('target2') if signal else '-'}
 
-سأتابع الصفقة معك.
+Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
 """.strip()
             )
         except Exception as e:
-            return tg_send_message(chat_id, f"لم أستطع تسجيل الصفقة.\nالصيغة:\nدخلت EMAAR 11.22 40000")
+            return tg_send_message(chat_id, f"ÙÙ Ø£Ø³ØªØ·Ø¹ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©.\nØ§ÙØµÙØºØ©:\nØ¯Ø®ÙØª EMAAR 11.22 40000")
 
-    if upper.startswith("بعت"):
+    if upper.startswith("Ø¨Ø¹Øª"):
         try:
             parsed = parse_sell_text(raw)
             if not parsed:
-                return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
+                return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40")
 
             symbol, price = parsed
             result = close_telegram_trade(chat_id, symbol=symbol, exit_price=price)
 
             if not result:
-                return tg_send_message(chat_id, "ما حصلت صفقة مفتوحة لهذا السهم.")
+                return tg_send_message(chat_id, "ÙØ§ Ø­ØµÙØª ØµÙÙØ© ÙÙØªÙØ­Ø© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ.")
 
             return tg_send_message(
                 chat_id,
                 f"""
-📉 تم إغلاق الصفقة
+ð ØªÙ Ø¥ØºÙØ§Ù Ø§ÙØµÙÙØ©
 
 Symbol: {result['symbol']}
 Entry: {round(result['entry'], 3)}
@@ -3227,13 +3259,13 @@ PnL: {round(result['pnl'], 2)} AED
 Return: {round(result['pnl_pct'], 2)}%
 Result: {result['result']}
 
-تم حفظ النتيجة للتعلم.
+ØªÙ Ø­ÙØ¸ Ø§ÙÙØªÙØ¬Ø© ÙÙØªØ¹ÙÙ.
 """.strip()
             )
         except Exception:
-            return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
+            return tg_send_message(chat_id, "Ø§ÙØµÙØºØ©:\nØ¨Ø¹Øª EMAAR Ø¹ÙÙ 11.40")
 
-    if upper.startswith("حلل"):
+    if upper.startswith("Ø­ÙÙ"):
         parts = upper.split()
         if len(parts) >= 2:
             symbol = normalize_symbol(parts[1])
@@ -3245,7 +3277,7 @@ Result: {result['result']}
         signal = ai_symbol_analysis(symbol)
         return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
 
-    return tg_send_message(chat_id, "اكتب رمز سهم مثل EMAAR أو:\nصفقاتي\nمراقبة\nدخلت EMAAR 11.22 40000")
+    return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø±ÙØ² Ø³ÙÙ ÙØ«Ù EMAAR Ø£Ù:\nØµÙÙØ§ØªÙ\nÙØ±Ø§ÙØ¨Ø©\nØ¯Ø®ÙØª EMAAR 11.22 40000")
 
 
 def handle_callback(chat_id, callback_id, data):
@@ -3262,23 +3294,23 @@ def handle_callback(chat_id, callback_id, data):
         return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
 
     if action == "ignore":
-        return tg_send_message(chat_id, "تم تجاهل الإشارة 👀")
+        return tg_send_message(chat_id, "ØªÙ ØªØ¬Ø§ÙÙ Ø§ÙØ¥Ø´Ø§Ø±Ø© ð")
 
     if action == "enter":
         symbol = parts[1]
         set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, f"اختر مبلغ الدخول لـ {symbol}:", amount_keyboard(symbol))
+        return tg_send_message(chat_id, f"Ø§Ø®ØªØ± ÙØ¨ÙØº Ø§ÙØ¯Ø®ÙÙ ÙÙ {symbol}:", amount_keyboard(symbol))
 
     if action == "amt":
         symbol = parts[1]
         amount = float(parts[2])
         set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-        return tg_send_message(chat_id, f"المبلغ: {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
+        return tg_send_message(chat_id, f"Ø§ÙÙØ¨ÙØº: {amount} AED\nØ§Ø®ØªØ± Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙ:", price_keyboard(symbol))
 
     if action == "amtmanual":
         symbol = parts[1]
         set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, "اكتب المبلغ بالأرقام، مثال: 40000")
+        return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø§ÙÙØ¨ÙØº Ø¨Ø§ÙØ£Ø±ÙØ§ÙØ ÙØ«Ø§Ù: 40000")
 
     if action == "price":
         symbol = parts[1]
@@ -3286,7 +3318,7 @@ def handle_callback(chat_id, callback_id, data):
         session = get_session(chat_id)
 
         if not session or not session["amount"]:
-            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
+            return tg_send_message(chat_id, "Ø§ÙØªÙØª Ø§ÙØ¬ÙØ³Ø©. Ø§Ø¶ØºØ· Ø¯Ø®ÙØª Ø§ÙØµÙÙØ© ÙØ±Ø© Ø«Ø§ÙÙØ©.")
 
         amount = float(session["amount"])
         signal = ai_symbol_analysis(symbol)
@@ -3304,7 +3336,7 @@ def handle_callback(chat_id, callback_id, data):
         return tg_send_message(
             chat_id,
             f"""
-✅ تم تسجيل الصفقة
+â ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØµÙÙØ©
 
 Trade ID: {trade_id}
 Symbol: {symbol}
@@ -3316,7 +3348,7 @@ Stop: {signal.get('stop_loss')}
 Target1: {signal.get('target1')}
 Target2: {signal.get('target2')}
 
-سأتابع الصفقة معك.
+Ø³Ø£ØªØ§Ø¨Ø¹ Ø§ÙØµÙÙØ© ÙØ¹Ù.
 """.strip()
         )
 
@@ -3325,22 +3357,22 @@ Target2: {signal.get('target2')}
         session = get_session(chat_id)
 
         if not session or not session["amount"]:
-            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
+            return tg_send_message(chat_id, "Ø§ÙØªÙØª Ø§ÙØ¬ÙØ³Ø©. Ø§Ø¶ØºØ· Ø¯Ø®ÙØª Ø§ÙØµÙÙØ© ÙØ±Ø© Ø«Ø§ÙÙØ©.")
 
         set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=session["amount"])
-        return tg_send_message(chat_id, "اكتب سعر الدخول، مثال: 11.22")
+        return tg_send_message(chat_id, "Ø§ÙØªØ¨ Ø³Ø¹Ø± Ø§ÙØ¯Ø®ÙÙØ ÙØ«Ø§Ù: 11.22")
 
     if action == "sell":
         trade_id = int(parts[1])
         result = close_telegram_trade(chat_id, trade_id=trade_id)
 
         if not result:
-            return tg_send_message(chat_id, "ما حصلت الصفقة أو تم إغلاقها سابقاً.")
+            return tg_send_message(chat_id, "ÙØ§ Ø­ØµÙØª Ø§ÙØµÙÙØ© Ø£Ù ØªÙ Ø¥ØºÙØ§ÙÙØ§ Ø³Ø§Ø¨ÙØ§Ù.")
 
         return tg_send_message(
             chat_id,
             f"""
-💰 تم البيع
+ð° ØªÙ Ø§ÙØ¨ÙØ¹
 
 Symbol: {result['symbol']}
 Entry: {round(result['entry'], 3)}
@@ -3350,14 +3382,14 @@ PnL: {round(result['pnl'], 2)} AED
 Return: {round(result['pnl_pct'], 2)}%
 Result: {result['result']}
 
-تم حفظ النتيجة للتعلم.
+ØªÙ Ø­ÙØ¸ Ø§ÙÙØªÙØ¬Ø© ÙÙØªØ¹ÙÙ.
 """.strip()
         )
 
     if action == "hold":
-        return tg_send_message(chat_id, "تمام، بنستمر في مراقبة الصفقة.")
+        return tg_send_message(chat_id, "ØªÙØ§ÙØ Ø¨ÙØ³ØªÙØ± ÙÙ ÙØ±Ø§ÙØ¨Ø© Ø§ÙØµÙÙØ©.")
 
-    return tg_send_message(chat_id, "أمر غير معروف.")
+    return tg_send_message(chat_id, "Ø£ÙØ± ØºÙØ± ÙØ¹Ø±ÙÙ.")
 
 
 @app.get("/api/telegram/set-webhook")
@@ -3415,3 +3447,8 @@ def api_telegram_trades(chat_id: str, status: str = "OPEN"):
         "count": len(rows),
         "trades": rows
     }
+
+
+@app.get("/api/health")
+def api_health():
+    return {"status": "ok", "service": "uae-trading-ai"}
