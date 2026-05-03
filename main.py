@@ -30,14 +30,14 @@ CAPITAL = float(os.getenv("CAPITAL", "200000"))
 # Hybrid Learning Alerts:
 # Keep AI_MODE=LEARNING but send alerts only for the strongest setups.
 HYBRID_STRONG_ALERTS = os.getenv("HYBRID_STRONG_ALERTS", "true").lower() == "true"
-STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "90"))
-STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.9"))
+STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "75"))
+STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.6"))
 
 # V4 Ranking + Observation Learning
 OBSERVATION_LEARNING = os.getenv("OBSERVATION_LEARNING", "true").lower() == "true"
 OBSERVATION_TARGET_PCT = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
 OBSERVATION_DROP_PCT = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
-TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "5"))
+TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "10"))
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
@@ -820,7 +820,7 @@ def build_signal(symbol, kind, candles, d1):
     rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
 
     strength = "VERY STRONG" if score >= 85 else "STRONG" if score >= 70 else "MEDIUM" if score >= 55 else "WEAK"
-    model_action = "BUY" if score >= 70 and rr >= 0.9 and (risk_pct <= (4.5 if kind == "SHORT_SWING" else 11)) else "WATCH"
+    model_action = "BUY" if score >= 65 and rr >= 0.6 and (risk_pct <= (5.5 if kind == "SHORT_SWING" else 12)) else "WATCH"
 
     mode = get_ai_mode()
     if mode == "LEARNING":
@@ -1241,8 +1241,8 @@ def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
     evaluated = evaluate_virtual_signals()
     observed_evaluated = evaluate_observations()
 
-    if send and scan["signals"]:
-        tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
+    if send:
+        send_alerts(force=True, top=TELEGRAM_TOP_N)
 
     save_combined_scan()
 
@@ -1263,8 +1263,8 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
 
     evaluated = evaluate_virtual_signals()
 
-    if send and scan["signals"]:
-        tg_main_send(format_scan_summary(scan, "Daily 1D Long Swing"))
+    if send:
+        send_alerts(force=True, top=TELEGRAM_TOP_N)
 
     save_combined_scan()
 
@@ -1491,40 +1491,116 @@ Reasons:
 """.strip()
 
 @app.get("/api/ai/send-alerts")
-def send_alerts(force: bool = False, dry_run: bool = False):
+def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
+    """
+    V4 PRO Light Filter:
+    Sends ranked opportunities from strongest to weakest.
+    If no trade setup exists, it still sends the ranked watchlist and states market is WEAK.
+    """
+    if top is None:
+        top = TELEGRAM_TOP_N
+
     scan = latest_scan_result("COMBINED")
     if not scan:
-        return {"ok": False, "message": "No saved scan yet. Run hourly/daily cron first."}
-
-    sent, skipped = [], []
-
-    conn = db()
-    cur = conn.cursor()
-
-    for sig in scan["signals"][:5]:
-        key = f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['mode']}"
-
-        if not force:
-            cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
-            if cur.fetchone():
-                skipped.append({"symbol": sig["symbol"], "type": sig["type"], "reason": "duplicate_alert"})
-                continue
-
+        msg = "ð ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ­Øµ ÙØ­ÙÙØ¸Ø© Ø­Ø§ÙÙØ§Ù.\nØ´ØºÙ hourly scan Ø£ÙÙØ§Ù."
         if not dry_run:
-            tg_main_send(format_signal(sig), signal_keyboard(sig["symbol"]))
+            tg_main_send(msg)
+        return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
 
-        cur.execute("""
-            INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
-            VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT DO NOTHING
-        """, (key, sig["symbol"], sig["type"], utc_now(), json.dumps(sig)))
+    ranked = scan.get("ranked", []) or []
+    coverage = scan.get("coverage", []) or []
 
-        sent.append({"symbol": sig["symbol"], "type": sig["type"]})
+    items = ranked if ranked else coverage
+    items = sorted(
+        items,
+        key=lambda x: (x.get("rank_score") or x.get("score") or 0),
+        reverse=True
+    )
 
-    conn.commit()
-    conn.close()
+    if not items:
+        msg = "ð <b>UAE PRO AI</b>\nÙØ§ ØªÙØ¬Ø¯ ÙØ±Øµ Ø­Ø§ÙÙØ§Ù.\nMarket status: <b>WEAK / NO DATA</b>"
+        if not dry_run:
+            tg_main_send(msg)
+        return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
 
-    return {"mode": get_ai_mode(), "dry_run": dry_run, "sent_count": len(sent), "skipped_count": len(skipped), "sent": sent, "skipped": skipped}
+    lines = []
+    lines.append("ð <b>UAE PRO AI V4 - Ranked Opportunities</b>")
+    lines.append(f"Mode: <b>{get_ai_mode()}</b>")
+    lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
+    lines.append("")
+    lines.append("Ø§ÙØªØ±ØªÙØ¨ ÙÙ Ø§ÙØ£ÙÙÙ Ø¥ÙÙ Ø§ÙØ£Ø¶Ø¹Ù:")
+    lines.append("")
+
+    sent_items = []
+    real_opportunities = 0
+
+    for i, x in enumerate(items[:top], start=1):
+        symbol = x.get("symbol")
+        action = x.get("display_action") or x.get("action") or "WATCH"
+        model_action = x.get("model_action") or "WATCH"
+        strength = x.get("strength")
+        score = x.get("score")
+        rank_score = x.get("rank_score") or score
+        price = x.get("price")
+        rr = x.get("rr")
+        vol = x.get("volume_ratio")
+        comment = x.get("ai_comment") or ""
+
+        if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
+            status = "ð¥ ÙØ±ØµØ©"
+            real_opportunities += 1
+        elif strength in ["VERY STRONG", "STRONG"]:
+            status = "ð ÙØ±Ø§ÙØ¨Ø© ÙÙÙØ©"
+        elif action in ["NO_DATA", "ERROR"]:
+            status = "Ø¶Ø¹ÙÙ / ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª"
+        else:
+            status = "Ø¶Ø¹ÙÙ / ÙØ±Ø§ÙØ¨Ø©"
+
+        price_txt = price if price is not None else "-"
+        rr_txt = rr if rr is not None else "-"
+        vol_txt = vol if vol is not None else "-"
+
+        lines.append(
+            f"{i}. <b>{symbol}</b> | {status}\n"
+            f"Action: <b>{action}</b> | Model: {model_action}\n"
+            f"Strength: {strength} | Score: {score} | Rank: {rank_score}\n"
+            f"Price: {price_txt} | RR: {rr_txt} | Vol: {vol_txt}\n"
+            f"{esc(comment)}\n"
+        )
+
+        sent_items.append({
+            "rank": i,
+            "symbol": symbol,
+            "action": action,
+            "model_action": model_action,
+            "strength": strength,
+            "score": score,
+            "rank_score": rank_score,
+            "price": price,
+            "rr": rr,
+        })
+
+    if real_opportunities == 0:
+        lines.append("ð <b>Ø§ÙØ®ÙØ§ØµØ©:</b> ÙØ§ ØªÙØ¬Ø¯ ØµÙÙØ© ÙØ¤ÙØ¯Ø© Ø­Ø§ÙÙØ§Ù. Ø§ÙØ³ÙÙ/Ø§ÙÙØ±Øµ Ø§ÙØ­Ø§ÙÙØ© ØªØ­Øª Ø§ÙÙØ±Ø§ÙØ¨Ø© Ø£Ù Ø¶Ø¹ÙÙØ©.")
+    else:
+        lines.append(f"ð <b>Ø§ÙØ®ÙØ§ØµØ©:</b> Ø¹Ø¯Ø¯ Ø§ÙÙØ±Øµ Ø§ÙÙØ§Ø¨ÙØ© ÙÙÙØªØ§Ø¨Ø¹Ø©: {real_opportunities}")
+
+    lines.append("")
+    lines.append(f"Dashboard:\n{DASHBOARD_URL}")
+
+    msg = "\n".join(lines)
+
+    if not dry_run:
+        tg_main_send(msg)
+
+    return {
+        "mode": get_ai_mode(),
+        "dry_run": dry_run,
+        "sent_count": 1,
+        "items_count": len(sent_items),
+        "real_opportunities": real_opportunities,
+        "sent": sent_items
+    }
 
 @app.get("/api/ai/reset-alerts")
 def reset_alerts():
