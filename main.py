@@ -1,2684 +1,178 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Optional, List
+import os
+import json
+import requests
 import psycopg2
 import psycopg2.extras
-import psycopg2.errors
 from datetime import datetime, timezone, timedelta
-import os
-import csv
-import io
-import json
-import ai_engine
-import requests
-import json
+from typing import Optional, Dict, Any, List
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 
 
-SECRET = os.getenv("SECRET", "abc123")
+# ============================================================
+# UAE MARKET PRO AI V3 - LEARNING MODE
+# Short Swing: 1H, Target 3% - 5%, holding 1-5 days
+# Long Swing: 1D, Target 7% - 15%, holding 1-4 weeks
+# ============================================================
+
+app = FastAPI(title="UAE Market PRO AI V3")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+SECRET = os.getenv("SECRET", "abc123")
 
-app = FastAPI(
-    title="UAE Trading AI System",
-    version="0.3.0-pro"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
+
+BASE_URL = os.getenv("API_BASE", "https://uae-market-production.up.railway.app")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", f"{BASE_URL}/dashboard")
+
+AI_MODE = os.getenv("AI_MODE", "LEARNING").upper().strip()
+LEARNING_DAYS = int(os.getenv("LEARNING_DAYS", "14"))
+
+WATCHLIST = [
+    "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
+    "MANAZEL","PRESIGHT","SALIK","SHUAA","SIB","UPP","TECOM","JULPHAR",
+    "2POINTZERO","INVICTUS","MODON","EMPOWER","SPACE42","ADPORTS",
+    "RAKPROP","ALEFEDT","TALABAT","PUREHEALTH","TAQA","NMDC",
+    "RAKBANK","FAB","ADIB","ADNOCGAS","ADNOCDRILL","ADNOCLS",
+    "ADNOCDIST","BURJEEL","BOROUGE","DEWA","DIB","EMAARDEV",
+    "EMAAR","AIRARABIA","ESG","AGTHIA","AMR","APEX","ARMX",
+    "ALDAR","FERTIGLB","DANA","DFM","AJMANBANK","DIC"
+]
 
 
-@app.get("/api/health")
-def api_health():
-    return {"status": "ok", "version": app.version, "time_utc": now_utc() if 'now_utc' in globals() else datetime.utcnow().isoformat()}
+# ============================================================
+# HELPERS
+# ============================================================
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+def utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
 def db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
+        raise RuntimeError("DATABASE_URL is missing")
     return psycopg2.connect(DATABASE_URL)
 
+def normalize_symbol(symbol: str) -> str:
+    return str(symbol or "").upper().replace(" ", "").strip()
 
-SYMBOL_MAP = {
-    "ARAMEX": "ARMX",
-}
+def safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
 
+def parse_bar_time(value) -> str:
+    if value is None:
+        return utc_now()
+    s = str(value).strip()
+    try:
+        if s.isdigit():
+            n = int(s)
+            if n > 10_000_000_000:
+                return datetime.fromtimestamp(n / 1000, timezone.utc).isoformat()
+            return datetime.fromtimestamp(n, timezone.utc).isoformat()
+        return s
+    except Exception:
+        return s
 
-# =========================
-# PRO WATCHLIST - 53 UAE STOCKS
-# هذه القائمة هي مصدر الحقيقة للداشبورد والـ AI scan
-# =========================
-DEFAULT_WATCHLIST = [
-    "DTC", "DU", "EAND", "EMSTEEL", "ESHRAQ", "GFH", "GHITHA", "GULFNAV",
-    "MANAZEL", "PRESIGHT", "SALIK", "SHUAA", "SIB", "UPP", "TECOM", "JULPHAR",
-    "2POINTZERO", "INVICTUS", "MODON", "EMPOWER", "SPACE42", "ADPORTS", "RAKPROP",
-    "ALEFEDT", "TALABAT", "PUREHEALTH", "TAQA", "NMDC", "RAKBANK", "FAB", "ADIB",
-    "ADNOCGAS", "ADNOCDRILL", "ADNOCLS", "ADNOCDIST", "BURJEEL", "BOROUGE", "DEWA",
-    "DIB", "EMAARDEV", "EMAAR", "AIRARABIA", "ESG", "AGTHIA", "AMR", "APEX",
-    "ARMX", "ALDAR", "FERTIGLB", "DANA", "DFM", "AJMANBANK", "DIC"
-]
-
-# aliases from TradingView / CSV names to your preferred symbols
-SYMBOL_ALIASES = {
-    "ARAMEX": "ARMX",
-    "ARABTEC": "ARMX",
-    "EMAARDEVELOPMENT": "EMAARDEV",
-    "EMAARDEV": "EMAARDEV",
-    "TWOPOINTZERO": "2POINTZERO",
-    "TWO_POINT_ZERO": "2POINTZERO",
-    "TWO POINT ZERO": "2POINTZERO",
-    "2POINTZERO": "2POINTZERO",
-    "2POINTZERO.AE": "2POINTZERO",
-    "ADNOC DISTRIBUTION": "ADNOCDIST",
-    "ADNOCDIST": "ADNOCDIST",
-    "ADNOC DRILLING": "ADNOCDRILL",
-    "ADNOC DRILL": "ADNOCDRILL",
-    "ADNOC LOGISTICS": "ADNOCLS",
-    "ADNOC L&S": "ADNOCLS",
-    "ADNOC GAS": "ADNOCGAS",
-    "DUBAI ISLAMIC BANK": "DIB",
-    "DUBAI FINANCIAL MARKET": "DFM",
-    "RAKPROPERTIES": "RAKPROP",
-    "RAK PROPERTIES": "RAKPROP",
-    "SHARJAH ISLAMIC BANK": "SIB",
-    "ALDAR PROPERTIES": "ALDAR",
-}
-
-
-
-def normalize_symbol(symbol: str):
-    if not symbol:
-        return symbol
-    symbol = str(symbol).upper().strip()
-    if ":" in symbol:
-        symbol = symbol.split(":")[-1]
-    symbol = symbol.replace("-", "").replace("/", "").strip()
-    symbol = SYMBOL_ALIASES.get(symbol, symbol) if "SYMBOL_ALIASES" in globals() else symbol
-    return SYMBOL_MAP.get(symbol, symbol)
-
-
-def now_utc():
-    return datetime.utcnow().isoformat()
-
-
-def uae_now():
-    return datetime.now(timezone(timedelta(hours=4)))
-
-
-def clean_num(x):
-    if x is None:
+def parse_dt(value: str):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
         return None
 
-    s = str(x).replace(",", "").strip().upper()
-
-    if s in ["", "-", "N/A", "NONE", "NULL"]:
-        return None
-
-    multiplier = 1
-
-    if s.endswith("M"):
-        multiplier = 1_000_000
-        s = s[:-1]
-    elif s.endswith("K"):
-        multiplier = 1_000
-        s = s[:-1]
-    elif s.endswith("B"):
-        multiplier = 1_000_000_000
-        s = s[:-1]
-
-    return float(s) * multiplier
+def esc(x) -> str:
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def get_market_phase():
-    n = uae_now()
-
-    if 10 <= n.hour < 15:
-        phase = "MARKET_OPEN"
-    elif n.hour >= 15:
-        phase = "AFTER_CLOSE"
-    else:
-        phase = "PRE_MARKET"
-
-    return n, phase
-
-
-# =========================
+# ============================================================
 # DB INIT
-# =========================
+# ============================================================
 
 def init_db():
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS candles (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        exchange TEXT,
-        timeframe TEXT NOT NULL,
-        bar_time TEXT NOT NULL,
-        open DOUBLE PRECISION,
-        high DOUBLE PRECISION,
-        low DOUBLE PRECISION,
-        close DOUBLE PRECISION,
-        volume DOUBLE PRECISION,
-        received_at TEXT NOT NULL,
-        UNIQUE(symbol, timeframe, bar_time)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS signals (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        exchange TEXT,
-        timeframe TEXT,
-        signal TEXT NOT NULL,
-        price DOUBLE PRECISION,
-        volume DOUBLE PRECISION,
-        bar_time TEXT,
-        received_at TEXT NOT NULL,
-        payload TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        qty DOUBLE PRECISION NOT NULL,
-        entry_price DOUBLE PRECISION,
-        stop_loss DOUBLE PRECISION,
-        target DOUBLE PRECISION,
-        sell_price DOUBLE PRECISION,
-        status TEXT NOT NULL,
-        opened_at TEXT,
-        closed_at TEXT,
-        note TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS daily_recommendations (
-        id SERIAL PRIMARY KEY,
-        report_date TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        last_close DOUBLE PRECISION,
-        change_pct DOUBLE PRECISION,
-        volume DOUBLE PRECISION,
-        score DOUBLE PRECISION,
-        recommendation TEXT,
-        entry DOUBLE PRECISION,
-        stop_loss DOUBLE PRECISION,
-        target DOUBLE PRECISION,
-        risk_reward DOUBLE PRECISION,
-        market_phase TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(report_date, symbol)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS portfolio_settings (
-        id INTEGER PRIMARY KEY,
-        capital DOUBLE PRECISION NOT NULL,
-        cash DOUBLE PRECISION NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ai_decisions (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        decision_time TEXT NOT NULL,
-        source TEXT,
-        action TEXT,
-        probability DOUBLE PRECISION,
-        score DOUBLE PRECISION,
-        entry DOUBLE PRECISION,
-        stop_loss DOUBLE PRECISION,
-        target DOUBLE PRECISION,
-        expected_profit_pct DOUBLE PRECISION,
-        risk_pct DOUBLE PRECISION,
-        rr DOUBLE PRECISION,
-        reaction_score DOUBLE PRECISION,
-        signal_score DOUBLE PRECISION,
-        market_mode TEXT,
-        payload TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ai_training_log (
-        id SERIAL PRIMARY KEY,
-        trained_at TEXT NOT NULL,
-        reason TEXT,
-        result TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS signal_outcomes (
-        id SERIAL PRIMARY KEY,
-        signal_id INTEGER,
-        symbol TEXT NOT NULL,
-        signal TEXT,
-        signal_price DOUBLE PRECISION,
-        signal_time TEXT,
-        close_1d DOUBLE PRECISION,
-        close_3d DOUBLE PRECISION,
-        close_5d DOUBLE PRECISION,
-        return_1d DOUBLE PRECISION,
-        return_3d DOUBLE PRECISION,
-        return_5d DOUBLE PRECISION,
-        evaluated_at TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-# =========================
-# WATCHLIST API + DB PERSISTENCE
-# =========================
-class WatchlistPayload(BaseModel):
-    symbols: List[str]
-
-
-def ensure_watchlist_table():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist_symbols (
-            symbol TEXT PRIMARY KEY,
-            active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
             updated_at TEXT NOT NULL
         )
     """)
-    for sym in DEFAULT_WATCHLIST:
-        ns = normalize_symbol(sym)
-        cur.execute("""
-            INSERT INTO watchlist_symbols (symbol, active, created_at, updated_at)
-            VALUES (%s, TRUE, %s, %s)
-            ON CONFLICT (symbol) DO UPDATE SET active = TRUE, updated_at = EXCLUDED.updated_at
-        """, (ns, now_utc(), now_utc()))
-    conn.commit()
-    conn.close()
-
-
-def get_watchlist_symbols():
-    try:
-        ensure_watchlist_table()
-        conn = db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT symbol FROM watchlist_symbols
-            WHERE active = TRUE
-            ORDER BY symbol
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        symbols = [r["symbol"] for r in rows]
-        return symbols or DEFAULT_WATCHLIST
-    except Exception:
-        return DEFAULT_WATCHLIST
-
-
-@app.get("/api/watchlist")
-def api_get_watchlist():
-    symbols = get_watchlist_symbols()
-    return {"count": len(symbols), "symbols": symbols}
-
-
-@app.post("/api/watchlist/set")
-def api_set_watchlist(payload: WatchlistPayload):
-    ensure_watchlist_table()
-    clean = sorted(set(normalize_symbol(x) for x in payload.symbols if x))
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE watchlist_symbols SET active = FALSE, updated_at = %s", (now_utc(),))
-    for sym in clean:
-        cur.execute("""
-            INSERT INTO watchlist_symbols (symbol, active, created_at, updated_at)
-            VALUES (%s, TRUE, %s, %s)
-            ON CONFLICT (symbol) DO UPDATE SET active = TRUE, updated_at = EXCLUDED.updated_at
-        """, (sym, now_utc(), now_utc()))
-    conn.commit()
-    conn.close()
-    return {"status": "ok", "count": len(clean), "symbols": clean}
-
-
-@app.get("/api/watchlist/reset-default")
-def api_reset_default_watchlist():
-    ensure_watchlist_table()
-    return {"status": "ok", "count": len(get_watchlist_symbols()), "symbols": get_watchlist_symbols()}
-
-
-@app.get("/api/watchlist/coverage")
-def api_watchlist_coverage():
-    symbols = get_watchlist_symbols()
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    results = []
-    for sym in symbols:
-        cur.execute("""
-            SELECT timeframe, COUNT(*) AS candles, MAX(bar_time) AS latest_bar, MAX(received_at) AS latest_received
-            FROM candles
-            WHERE symbol = %s AND timeframe IN ('60','1D')
-            GROUP BY timeframe
-        """, (sym,))
-        rows = cur.fetchall()
-        by_tf = {r["timeframe"]: dict(r) for r in rows}
-        results.append({
-            "symbol": sym,
-            "has_60": "60" in by_tf,
-            "has_1D": "1D" in by_tf,
-            "candles_60": by_tf.get("60", {}).get("candles", 0),
-            "candles_1D": by_tf.get("1D", {}).get("candles", 0),
-            "latest_60": by_tf.get("60", {}).get("latest_bar"),
-            "latest_1D": by_tf.get("1D", {}).get("latest_bar"),
-        })
-    conn.close()
-    return {"count": len(results), "coverage": results}
-
-
-
-# =========================
-# MODELS
-# =========================
-
-class TVPayload(BaseModel):
-    secret: str
-    type: str
-    symbol: str
-    exchange: Optional[str] = None
-    timeframe: Optional[str] = None
-    time: Optional[str] = None
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    close: Optional[float] = None
-    volume: Optional[float] = None
-    signal: Optional[str] = None
-    price: Optional[float] = None
-
-
-class CandleRow(BaseModel):
-    date: str
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    close: float
-    volume: Optional[float] = None
-
-
-class BatchUpload(BaseModel):
-    symbol: str
-    exchange: str = "HISTORICAL"
-    timeframe: str = "1D"
-    rows: List[CandleRow]
-
-
-class PortfolioSetup(BaseModel):
-    capital: float
-
-
-class PortfolioBuyPayload(BaseModel):
-    symbol: str
-    qty: float
-    price: float
-    stop_loss: Optional[float] = None
-    target: Optional[float] = None
-    note: Optional[str] = None
-
-
-class PortfolioSellPayload(BaseModel):
-    price: float
-    note: Optional[str] = None
-
-
-class TradePayload(BaseModel):
-    symbol: str
-    qty: float
-    price: float
-    stop_loss: Optional[float] = None
-    target: Optional[float] = None
-    note: Optional[str] = None
-
-
-# =========================
-# PRICE HELPERS
-# =========================
-
-def get_latest_daily_candle(conn, symbol):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     cur.execute("""
-        SELECT symbol, bar_time, open, high, low, close, volume
-        FROM candles
-        WHERE symbol = %s
-          AND timeframe = '1D'
-          AND close IS NOT NULL
-        ORDER BY bar_time DESC
-        LIMIT 1
-    """, (symbol,))
-
-    return cur.fetchone()
-
-
-def get_latest_daily_price(conn, symbol, fallback=None):
-    row = get_latest_daily_candle(conn, symbol)
-    if not row:
-        return fallback, None
-    return row["close"], row["bar_time"]
-
-
-# =========================
-# WEBHOOK
-# =========================
-
-@app.post("/webhook/tradingview")
-def tradingview_webhook(payload: TVPayload):
-    if payload.secret != SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-
-    conn = db()
-    cur = conn.cursor()
-
-    symbol = normalize_symbol(payload.symbol)
-    current_time = now_utc()
-
-    if payload.type == "CANDLE_UPDATE":
-        timeframe = payload.timeframe or "60"
-
-        cur.execute("""
-            INSERT INTO candles
-            (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (symbol, timeframe, bar_time)
-            DO UPDATE SET
-                exchange = EXCLUDED.exchange,
-                open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                volume = EXCLUDED.volume,
-                received_at = EXCLUDED.received_at
-        """, (
-            symbol,
-            payload.exchange,
-            timeframe,
-            payload.time or current_time,
-            payload.open,
-            payload.high,
-            payload.low,
-            payload.close,
-            payload.volume,
-            current_time
-        ))
-
-        conn.commit()
-        conn.close()
-
-        return {
-            "status": "ok",
-            "stored": "candle",
-            "symbol": symbol,
-            "timeframe": timeframe
-        }
-
-    if payload.type == "SIGNAL":
-        cur.execute("""
-            INSERT INTO signals
-            (symbol, exchange, timeframe, signal, price, volume, bar_time, received_at, payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            symbol,
-            payload.exchange,
-            payload.timeframe,
-            payload.signal or "UNKNOWN",
-            payload.price or payload.close,
-            payload.volume,
-            payload.time,
-            current_time,
-            payload.model_dump_json()
-        ))
-
-        conn.commit()
-        conn.close()
-
-        return {
-            "status": "ok",
-            "stored": "signal",
-            "symbol": symbol
-        }
-
-    conn.close()
-
-    return {
-        "status": "ignored",
-        "reason": "unknown type",
-        "symbol": symbol
-    }
-
-
-# =========================
-# DATA API
-# =========================
-
-@app.get("/api/candles/latest")
-def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    q = """
-        SELECT *
-        FROM candles
-        WHERE close IS NOT NULL
-    """
-    params = []
-
-    if symbol:
-        q += " AND symbol = %s"
-        params.append(normalize_symbol(symbol))
-
-    if timeframe:
-        q += " AND timeframe = %s"
-        params.append(timeframe)
-
-    q += " ORDER BY bar_time DESC LIMIT %s"
-    params.append(limit)
-
-    cur.execute(q, params)
-    rows = cur.fetchall()
-    conn.close()
-
-    return {"count": len(rows), "candles": rows}
-
-
-@app.get("/api/prices/daily-latest")
-def daily_latest_prices():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT DISTINCT ON (symbol)
-            symbol, bar_time, open, high, low, close, volume, received_at
-        FROM candles
-        WHERE timeframe = '1D'
-          AND close IS NOT NULL
-        ORDER BY symbol, bar_time DESC
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return {
-        "count": len(rows),
-        "prices": rows
-    }
-
-
-@app.get("/api/signals/latest")
-def latest_signals(symbol: Optional[str] = None, limit: int = 50):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    q = "SELECT * FROM signals WHERE 1=1"
-    params = []
-
-    if symbol:
-        q += " AND symbol = %s"
-        params.append(normalize_symbol(symbol))
-
-    q += " ORDER BY received_at DESC LIMIT %s"
-    params.append(limit)
-
-    cur.execute(q, params)
-    rows = cur.fetchall()
-    conn.close()
-
-    return {"count": len(rows), "signals": rows}
-
-
-@app.post("/api/upload-csv")
-async def upload_csv(file: UploadFile = File(...), symbol: str = "UNKNOWN"):
-    content = await file.read()
-    decoded = content.decode("utf-8-sig")
-    reader = csv.DictReader(io.StringIO(decoded))
-
-    conn = db()
-    cur = conn.cursor()
-
-    inserted = 0
-    symbol = normalize_symbol(symbol)
-
-    for row in reader:
-        raw_date = row.get("Date") or row.get("date")
-
-        try:
-            date = datetime.strptime(raw_date, "%m/%d/%Y").strftime("%Y-%m-%d")
-        except Exception:
-            date = raw_date
-
-        open_price = row.get("Open") or row.get("open")
-        high = row.get("High") or row.get("high")
-        low = row.get("Low") or row.get("low")
-        close = row.get("Price") or row.get("Close") or row.get("close")
-        volume = row.get("Vol.") or row.get("Volume") or row.get("volume")
-
-        if not date or not close:
-            continue
-
-        cur.execute("""
-            INSERT INTO candles
-            (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (symbol, timeframe, bar_time)
-            DO UPDATE SET
-                open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                volume = EXCLUDED.volume,
-                received_at = EXCLUDED.received_at
-        """, (
-            symbol,
-            "HISTORICAL",
-            "1D",
-            date,
-            clean_num(open_price),
-            clean_num(high),
-            clean_num(low),
-            clean_num(close),
-            clean_num(volume),
-            now_utc()
-        ))
-
-        inserted += 1
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "rows_inserted": inserted
-    }
-
-
-@app.post("/api/upload-batch")
-def upload_batch(payload: BatchUpload):
-    if not payload.rows:
-        return {"status": "empty", "inserted": 0}
-
-    conn = db()
-    cur = conn.cursor()
-
-    symbol = normalize_symbol(payload.symbol)
-    current_time = now_utc()
-
-    values = [
-        (
-            symbol,
-            payload.exchange,
-            payload.timeframe,
-            r.date,
-            r.open,
-            r.high,
-            r.low,
-            r.close,
-            r.volume,
-            current_time
+        CREATE TABLE IF NOT EXISTS candles (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            exchange TEXT,
+            timeframe TEXT NOT NULL,
+            bar_time TEXT NOT NULL,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            volume DOUBLE PRECISION,
+            received_at TEXT NOT NULL
         )
-        for r in payload.rows
-    ]
-
-    psycopg2.extras.execute_values(
-        cur,
-        """
-        INSERT INTO candles
-        (symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at)
-        VALUES %s
-        ON CONFLICT (symbol, timeframe, bar_time)
-        DO UPDATE SET
-            open = EXCLUDED.open,
-            high = EXCLUDED.high,
-            low = EXCLUDED.low,
-            close = EXCLUDED.close,
-            volume = EXCLUDED.volume,
-            received_at = EXCLUDED.received_at
-        """,
-        values
-    )
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "ok",
-        "symbol": symbol,
-        "timeframe": payload.timeframe,
-        "inserted": len(values)
-    }
-
-
-# =========================
-# MARKET REACTION
-# =========================
-
-def get_signal_score(conn, symbol):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT signal, price, volume, bar_time, received_at
-        FROM signals
-        WHERE symbol = %s
-        ORDER BY received_at DESC
-        LIMIT 10
-    """, (symbol,))
-
-    rows = cur.fetchall()
-
-    score = 0
-    last_signal = None
-
-    for r in rows:
-        sig = (r["signal"] or "").upper()
-        last_signal = sig
-
-        if "BUY" in sig:
-            score += 20
-        if "BREAKOUT" in sig:
-            score += 25
-        if "VOLUME" in sig:
-            score += 15
-        if "SELL" in sig or "EXIT" in sig:
-            score -= 30
-
-    return {
-        "signal_score": max(min(score, 100), -100),
-        "last_signal": last_signal
-    }
-
-
-def get_market_reaction_score(conn, symbol):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT bar_time, open, high, low, close, volume
-        FROM candles
-        WHERE symbol = %s
-          AND timeframe = '1D'
-          AND close IS NOT NULL
-        ORDER BY bar_time DESC
-        LIMIT 25
-    """, (symbol,))
-
-    rows = cur.fetchall()
-    signal_data = get_signal_score(conn, symbol)
-
-    if len(rows) < 10:
-        return {
-            "reaction_score": 0,
-            "reaction_label": "NO_DATA",
-            "today_change_pct": 0,
-            "intraday_strength": 0,
-            "volume_ratio": 0,
-            "breakout": False,
-            "signal_score": signal_data["signal_score"],
-            "last_signal": signal_data["last_signal"]
-        }
-
-    latest = rows[0]
-    prev = rows[1]
-
-    close = latest["close"]
-    open_price = latest["open"] or prev["close"]
-    prev_close = prev["close"]
-
-    today_change_pct = ((close - prev_close) / prev_close) * 100 if prev_close else 0
-    intraday_strength = ((close - open_price) / open_price) * 100 if open_price else 0
-
-    volumes = [r["volume"] for r in rows[1:21] if r["volume"]]
-    avg_volume = sum(volumes) / len(volumes) if volumes else 0
-    volume_ratio = (latest["volume"] or 0) / avg_volume if avg_volume else 0
-
-    highs_20 = [r["high"] for r in rows[1:21] if r["high"]]
-    recent_high = max(highs_20) if highs_20 else close
-    breakout = close > recent_high
-
-    score = 0
-
-    if today_change_pct > 0.5:
-        score += 10
-    if today_change_pct > 1:
-        score += 15
-    if today_change_pct > 2:
-        score += 20
-    if intraday_strength > 0.5:
-        score += 10
-    if volume_ratio > 1.2:
-        score += 15
-    if volume_ratio > 1.5:
-        score += 20
-    if breakout:
-        score += 25
-
-    score = min(score, 100)
-
-    label = "QUIET"
-    if score >= 75:
-        label = "HOT_MOMENTUM"
-    elif score >= 55:
-        label = "ACTIVE"
-    elif score >= 35:
-        label = "WATCHING"
-
-    return {
-        "reaction_score": round(score, 2),
-        "reaction_label": label,
-        "today_change_pct": round(today_change_pct, 2),
-        "intraday_strength": round(intraday_strength, 2),
-        "volume_ratio": round(volume_ratio, 2),
-        "breakout": breakout,
-        "signal_score": signal_data["signal_score"],
-        "last_signal": signal_data["last_signal"]
-    }
-
-
-@app.get("/api/market/reaction")
-def market_reaction():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT DISTINCT symbol
-        FROM candles
-        WHERE timeframe = '1D'
     """)
 
-    symbols = [r["symbol"] for r in cur.fetchall()]
-    results = []
-
-    for symbol in symbols:
-        reaction = get_market_reaction_score(conn, symbol)
-        reaction["symbol"] = symbol
-        reaction["total_score"] = reaction["reaction_score"] + reaction["signal_score"]
-        results.append(reaction)
-
-    conn.close()
-
-    results = sorted(results, key=lambda x: x["total_score"], reverse=True)
-
-    return {
-        "count": len(results),
-        "hot_stocks": results[:10],
-        "all": results
-    }
-
-
-# =========================
-# DAILY DASHBOARD
-# =========================
-
-@app.get("/api/dashboard/daily")
-def daily_dashboard():
-    n, market_phase = get_market_phase()
-    report_date = n.strftime("%Y-%m-%d")
-
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    symbols = get_watchlist_symbols()
-    results = []
-    dead_stocks = []
-    no_data_stocks = []
-
-    for symbol in symbols:
-        cur.execute("""
-            SELECT symbol, bar_time, open, high, low, close, volume, received_at
-            FROM candles
-            WHERE symbol = %s
-              AND timeframe = '1D'
-              AND close IS NOT NULL
-            ORDER BY bar_time DESC
-            LIMIT 80
-        """, (symbol,))
-        candles = cur.fetchall()
-
-        if not candles:
-            no_data_stocks.append({
-                "symbol": symbol,
-                "last_close": None,
-                "data_date": None,
-                "change_pct": None,
-                "volume": None,
-                "score": 0,
-                "recommendation": "NO_DATA",
-                "trend": "NO_DATA",
-                "bar_time": None,
-            })
-            continue
-
-        latest = candles[0]
-        prev = candles[1] if len(candles) > 1 else latest
-        last_close = latest["close"]
-        prev_close = prev["close"] or last_close
-        change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0
-
-        closes = [c["close"] for c in candles if c["close"] is not None]
-        highs_20 = [c["high"] for c in candles[1:21] if c["high"] is not None]
-        lows_10 = [c["low"] for c in candles[1:11] if c["low"] is not None]
-        volumes_20 = [c["volume"] for c in candles[1:21] if c["volume"] is not None]
-
-        recent_high = max(highs_20) if highs_20 else latest["high"] or last_close
-        recent_low = min(lows_10) if lows_10 else latest["low"] or last_close
-        avg_volume = sum(volumes_20) / len(volumes_20) if volumes_20 else latest["volume"] or 0
-        volume_ratio_local = (latest["volume"] or 0) / avg_volume if avg_volume else 1
-
-        ema20 = sum(closes[:20]) / 20 if len(closes) >= 20 else sum(closes) / len(closes)
-        ema50 = sum(closes[:50]) / 50 if len(closes) >= 50 else ema20
-        trend_up = last_close > ema20 and ema20 >= ema50 * 0.995
-        trend_down = last_close < ema20 and ema20 < ema50
-        breakout = last_close > recent_high if recent_high else False
-        volume_confirmed = volume_ratio_local >= 1.2
-        quiet_volume = volume_ratio_local < 0.7
-
-        reaction = get_market_reaction_score(conn, symbol)
-        score = 0
-        if trend_up: score += 25
-        if breakout: score += 25
-        if volume_confirmed: score += 20
-        if change_pct > 0.3: score += 8
-        if change_pct > 1.0: score += 12
-        if volume_ratio_local >= 1.5: score += 10
-        score += reaction["reaction_score"] * 0.20
-        score += reaction["signal_score"] * 0.10
-        if trend_down: score -= 18
-        if change_pct < -1: score -= 8
-        if quiet_volume: score -= 6
-        score = max(round(score, 2), 0)
-
-        recommendation = "AVOID"
-        if score >= 75 and not trend_down:
-            recommendation = "BUY"
-        elif score >= 55:
-            recommendation = "WATCH"
-        elif score >= 35:
-            recommendation = "HOLD"
-
-        dead = False
-        if score <= 15 and quiet_volume and not breakout:
-            dead = True
-        if trend_down and score <= 25:
-            dead = True
-
-        entry = last_close
-        stop_loss = recent_low if recent_low and recent_low < entry else entry * 0.96
-        risk = entry - stop_loss if entry and stop_loss else None
-        target = entry + (risk * 2) if risk and risk > 0 else entry * 1.07
-        rr = round((target - entry) / risk, 2) if risk and risk > 0 else None
-
-        item = {
-            "symbol": symbol,
-            "last_close": round(last_close, 3) if last_close is not None else None,
-            "data_date": latest["bar_time"],
-            "change_pct": round(change_pct, 2),
-            "volume": latest["volume"] or 0,
-            "avg_volume_20": round(avg_volume, 2) if avg_volume else None,
-            "volume_ratio": round(volume_ratio_local, 2),
-            "volume_confirmed": volume_confirmed,
-            "quiet_volume": quiet_volume,
-            "breakout": breakout,
-            "trend": "UP" if trend_up else "DOWN" if trend_down else "SIDEWAYS",
-            "recent_high_20": round(recent_high, 3) if recent_high else None,
-            "recent_low_10": round(recent_low, 3) if recent_low else None,
-            "reaction_score": reaction["reaction_score"],
-            "reaction_label": reaction["reaction_label"],
-            "signal_score": reaction["signal_score"],
-            "last_signal": reaction["last_signal"],
-            "score": score,
-            "recommendation": "DEAD" if dead else recommendation,
-            "entry": round(entry, 3),
-            "stop_loss": round(stop_loss, 3) if stop_loss else None,
-            "target": round(target, 3) if target else None,
-            "risk_reward": rr,
-            "bar_time": latest["bar_time"],
-        }
-
-        if dead:
-            dead_stocks.append(item)
-        else:
-            results.append(item)
-
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-    dead_stocks = sorted(dead_stocks, key=lambda x: x["score"])
-    top_recommendations = [x for x in results if x["recommendation"] in ["BUY", "WATCH"]][:10]
-    top_symbols = set(x["symbol"] for x in top_recommendations)
-    other_stocks = [x for x in results if x["symbol"] not in top_symbols]
-
-    buy_list = [x for x in top_recommendations if x["recommendation"] == "BUY"]
-    watch_list = [x for x in top_recommendations if x["recommendation"] == "WATCH"]
-
-    market_mode = "Defensive"
-    if len(buy_list) >= 5:
-        market_mode = "Aggressive"
-    elif len(buy_list) >= 2 or len(watch_list) >= 5:
-        market_mode = "Neutral"
-
-    conn.close()
-
-    return {
-        "report_date": report_date,
-        "report_time_uae": n.strftime("%Y-%m-%d %H:%M"),
-        "market_phase": market_phase,
-        "report_status": "FINAL_AFTER_15:00" if market_phase == "AFTER_CLOSE" else "LIVE_NOT_FINAL",
-        "market_mode": market_mode,
-        "watchlist_count": len(symbols),
-        "stocks_with_data": len(results) + len(dead_stocks),
-        "no_data_count": len(no_data_stocks),
-        "buy_count": len(buy_list),
-        "watch_count": len(watch_list),
-        "dead_count": len(dead_stocks),
-        "top_recommendations": top_recommendations,
-        "other_stocks": other_stocks,
-        "dead_stocks": dead_stocks,
-        "no_data_stocks": no_data_stocks,
-    }
-
-
-# =========================
-# PORTFOLIO
-# =========================
-
-def get_portfolio_settings(conn):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("SELECT * FROM portfolio_settings WHERE id = 1")
-    row = cur.fetchone()
-
-    if not row:
-        current_time = now_utc()
-        cur.execute("""
-            INSERT INTO portfolio_settings (id, capital, cash, updated_at)
-            VALUES (1, 100000, 100000, %s)
-        """, (current_time,))
-        conn.commit()
-
-        return {
-            "capital": 100000,
-            "cash": 100000,
-            "updated_at": current_time
-        }
-
-    return row
-
-
-@app.post("/api/portfolio/setup")
-def setup_portfolio(payload: PortfolioSetup):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
-    open_count = cur.fetchone()[0]
-
-    if open_count > 0:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot reset portfolio while open trades exist"
-        )
-
     cur.execute("""
-        INSERT INTO portfolio_settings (id, capital, cash, updated_at)
-        VALUES (1, %s, %s, %s)
-        ON CONFLICT (id)
-        DO UPDATE SET
-            capital = EXCLUDED.capital,
-            cash = EXCLUDED.cash,
-            updated_at = EXCLUDED.updated_at
-    """, (payload.capital, payload.capital, now_utc()))
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "ok",
-        "capital": payload.capital,
-        "cash": payload.capital
-    }
-
-
-@app.post("/api/portfolio/buy")
-def portfolio_buy(payload: PortfolioBuyPayload):
-    conn = db()
-    cur = conn.cursor()
-
-    settings = get_portfolio_settings(conn)
-    cost = payload.qty * payload.price
-
-    if cost > settings["cash"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Not enough cash")
-
-    symbol = normalize_symbol(payload.symbol)
-
-    cur.execute("""
-        INSERT INTO trades
-        (symbol, qty, entry_price, stop_loss, target, status, opened_at, note)
-        VALUES (%s,%s,%s,%s,%s,'OPEN',%s,%s)
-        RETURNING id
-    """, (
-        symbol,
-        payload.qty,
-        payload.price,
-        payload.stop_loss,
-        payload.target,
-        now_utc(),
-        payload.note
-    ))
-
-    trade_id = cur.fetchone()[0]
-
-    cur.execute("""
-        UPDATE portfolio_settings
-        SET cash = cash - %s,
-            updated_at = %s
-        WHERE id = 1
-    """, (cost, now_utc()))
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "BOUGHT",
-        "trade_id": trade_id,
-        "symbol": symbol,
-        "qty": payload.qty,
-        "price": payload.price,
-        "cost": round(cost, 2)
-    }
-
-
-@app.post("/api/portfolio/sell/{trade_id}")
-def portfolio_sell(trade_id: int, payload: PortfolioSellPayload):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *
-        FROM trades
-        WHERE id = %s AND status = 'OPEN'
-    """, (trade_id,))
-
-    trade = cur.fetchone()
-
-    if not trade:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Open trade not found")
-
-    entry_price = trade["entry_price"]
-    qty = trade["qty"]
-    symbol = trade["symbol"]
-
-    sell_value = qty * payload.price
-    pnl = (payload.price - entry_price) * qty
-    pnl_pct = ((payload.price - entry_price) / entry_price) * 100 if entry_price else 0
-
-    cur.execute("""
-        UPDATE trades
-        SET sell_price = %s,
-            status = 'CLOSED',
-            closed_at = %s,
-            note = COALESCE(note, '') || %s
-        WHERE id = %s
-    """, (
-        payload.price,
-        now_utc(),
-        f" | SELL NOTE: {payload.note}" if payload.note else "",
-        trade_id
-    ))
-
-    cur.execute("""
-        UPDATE portfolio_settings
-        SET cash = cash + %s,
-            updated_at = %s
-        WHERE id = 1
-    """, (sell_value, now_utc()))
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "status": "SOLD",
-        "trade_id": trade_id,
-        "symbol": symbol,
-        "sell_value": round(sell_value, 2),
-        "pnl": round(pnl, 2),
-        "pnl_pct": round(pnl_pct, 2)
-    }
-
-
-def portfolio_summary_data():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    settings = get_portfolio_settings(conn)
-
-    cur.execute("""
-        SELECT *
-        FROM trades
-        WHERE status = 'OPEN'
-        ORDER BY opened_at DESC
+        CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_id
+        ON candles(symbol, timeframe, id DESC)
     """)
-
-    trades = cur.fetchall()
-
-    holdings = []
-    invested = 0
-    market_value = 0
-
-    for t in trades:
-        symbol = t["symbol"]
-        current_price, price_date = get_latest_daily_price(conn, symbol, t["entry_price"])
-
-        cost = t["qty"] * t["entry_price"]
-        value = t["qty"] * current_price
-        pnl = value - cost
-        pnl_pct = (pnl / cost) * 100 if cost else 0
-
-        invested += cost
-        market_value += value
-
-        holdings.append({
-            "trade_id": t["id"],
-            "symbol": symbol,
-            "qty": t["qty"],
-            "entry": round(t["entry_price"], 3),
-            "current_price": round(current_price, 3),
-            "price_date": price_date,
-            "cost": round(cost, 2),
-            "market_value": round(value, 2),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "stop_loss": t["stop_loss"],
-            "target": t["target"]
-        })
-
-    total_equity = settings["cash"] + market_value
-    exposure_pct = (market_value / total_equity) * 100 if total_equity else 0
-
-    conn.close()
-
-    return {
-        "capital": round(settings["capital"], 2),
-        "cash": round(settings["cash"], 2),
-        "invested_cost": round(invested, 2),
-        "market_value": round(market_value, 2),
-        "total_equity": round(total_equity, 2),
-        "total_pnl": round(total_equity - settings["capital"], 2),
-        "total_pnl_pct": round(((total_equity - settings["capital"]) / settings["capital"]) * 100, 2) if settings["capital"] else 0,
-        "exposure_pct": round(exposure_pct, 2),
-        "holdings": holdings
-    }
-
-
-@app.get("/api/portfolio/summary")
-def portfolio_summary():
-    return portfolio_summary_data()
-
-
-@app.post("/api/trades/buy")
-def buy_trade(payload: TradePayload):
-    return portfolio_buy(
-        PortfolioBuyPayload(
-            symbol=payload.symbol,
-            qty=payload.qty,
-            price=payload.price,
-            stop_loss=payload.stop_loss,
-            target=payload.target,
-            note=payload.note
-        )
-    )
-
-
-@app.post("/api/trades/sell/{trade_id}")
-def sell_trade(trade_id: int, payload: TradePayload):
-    return portfolio_sell(
-        trade_id,
-        PortfolioSellPayload(
-            price=payload.price,
-            note=payload.note
-        )
-    )
-
-
-@app.get("/api/trades/open")
-def open_trades():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *,
-        (target - entry_price) AS reward,
-        (entry_price - stop_loss) AS risk,
-        (target - entry_price) / NULLIF((entry_price - stop_loss),0) AS rr
-        FROM trades
-        WHERE status = 'OPEN'
-        ORDER BY opened_at DESC
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return {"count": len(rows), "trades": rows}
-
-
-@app.get("/api/trades/all")
-def all_trades():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *,
-        (sell_price - entry_price) * qty AS pnl
-        FROM trades
-        ORDER BY id DESC
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return {"count": len(rows), "trades": rows}
-
-
-# =========================
-# AI
-# =========================
-
-AUTO_TRAIN_HOURS = 12
-LAST_AUTO_TRAIN_AT = None
-
-
-def smart_auto_train(conn, force: bool = False):
-    global LAST_AUTO_TRAIN_AT
-
-    current = datetime.utcnow()
-    status = ai_engine.ai_status(conn)
-
-    trained_models = status.get("trained_models", {})
-    all_ready = all(trained_models.values()) if trained_models else False
-
-    should_train = False
-    reason = "TRAIN_NOT_NEEDED"
-
-    if force:
-        should_train = True
-        reason = "FORCED_TRAIN"
-    elif not all_ready:
-        should_train = True
-        reason = "MODELS_NOT_READY"
-    elif LAST_AUTO_TRAIN_AT is None:
-        should_train = True
-        reason = "FIRST_AUTO_TRAIN"
-    elif (current - LAST_AUTO_TRAIN_AT).total_seconds() >= AUTO_TRAIN_HOURS * 3600:
-        should_train = True
-        reason = "SCHEDULED_REFRESH"
-
-    if should_train:
-        result = ai_engine.train_models(conn)
-
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO ai_training_log (trained_at, reason, result)
-            VALUES (%s,%s,%s)
-        """, (
-            current.isoformat(),
-            reason,
-            json.dumps(result, default=str)
-        ))
-
-        conn.commit()
-
-        LAST_AUTO_TRAIN_AT = current
-
-        return {
-            "trained": True,
-            "reason": reason,
-            "trained_at": current.isoformat(),
-            "result": result
-        }
-
-    return {
-        "trained": False,
-        "reason": reason,
-        "last_train_at": LAST_AUTO_TRAIN_AT.isoformat() if LAST_AUTO_TRAIN_AT else None
-    }
-
-
-@app.get("/api/ai/status")
-def api_ai_status():
-    conn = db()
-    result = ai_engine.ai_status(conn)
-    conn.close()
-    return result
-
-
-@app.post("/api/ai/train")
-def api_ai_train():
-    conn = db()
-    result = smart_auto_train(conn, force=True)
-    conn.close()
-    return result
-
-
-@app.get("/api/ai/predict")
-def api_ai_predict():
-    conn = db()
-    train_info = smart_auto_train(conn)
-    result = ai_engine.predict_latest(conn)
-    conn.close()
-
-    return {
-        "auto_train": train_info,
-        "count": len(result),
-        "predictions": result
-    }
-
-
-@app.get("/api/ai/top-trades")
-def ai_top_trades(limit: int = 5):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    train_info = smart_auto_train(conn)
-    predictions = ai_engine.predict_latest(conn)
-    daily = daily_dashboard()
-    market_mode = daily["market_mode"]
-
-    final_trades = []
-
-    for p in predictions:
-        prob = p.get("best_probability", 0) or 0
-        symbol = p.get("symbol")
-        horizon = p.get("best_horizon", "5d")
-        features = p.get("features", {})
-
-        reaction = get_market_reaction_score(conn, symbol)
-
-        last_close = p.get("last_close", 0) or 0
-        if last_close <= 0:
-            continue
-
-        cur.execute("""
-            SELECT high, low
-            FROM candles
-            WHERE symbol = %s
-              AND timeframe = '1D'
-            ORDER BY bar_time DESC
-            LIMIT 20
-        """, (symbol,))
-
-        rows = cur.fetchall()
-
-        highs = [r["high"] for r in rows if r["high"] is not None]
-        lows = [r["low"] for r in rows if r["low"] is not None]
-
-        recent_high = max(highs) if highs else last_close * 1.05
-        recent_low = min(lows) if lows else last_close * 0.97
-
-        entry = last_close
-        stop = recent_low
-        risk = (entry - stop) / entry if entry > stop else 0
-
-        base_target = entry * 1.05
-        breakout_target = recent_high * 1.02
-        target = max(base_target, breakout_target)
-
-        profit = (target - entry) / entry
-        rr = profit / risk if risk > 0 else 0
-        rr = min(rr, 5)
-
-        if profit < 0.03:
-            continue
-
-        if rr < 1.2:
-            continue
-
-        volume_ratio = features.get("volume_ratio", 1) or 1
-        breakout = bool(features.get("breakout", 0))
-        trend_up = bool(features.get("trend_up", 0))
-        trend_down = bool(features.get("trend_down", 0))
-
-        action = "WATCH"
-
-        if prob >= 0.65 and reaction["breakout"] and reaction["volume_ratio"] > 1.3:
-            action = "BREAKOUT ATTACK"
-        elif prob >= 0.72 and profit >= 0.05 and rr >= 1.8 and trend_up:
-            action = "STRONG BUY"
-        elif prob >= 0.58 and profit >= 0.06 and rr >= 2 and not trend_down:
-            action = "SMART BUY"
-        elif prob >= 0.75 and profit >= 0.03 and not trend_down:
-            action = "SAFE BUY"
-        elif prob >= 0.5 and profit >= 0.08 and rr >= 2.5:
-            action = "HIGH RISK HIGH REWARD"
-        elif prob >= 0.7:
-            action = "AI GOOD"
-
-        if trend_down and not reaction["breakout"]:
-            action = "REVERSAL WATCH"
-
-        if market_mode == "Defensive" and not reaction["breakout"] and reaction["reaction_score"] < 60:
-            action = "WATCH"
-
-        score = (
-            prob * 100
-            + profit * 120
-            + rr * 8
-            + reaction["reaction_score"] * 1.5
-            + reaction["signal_score"] * 1.2
-        )
-
-        if market_mode == "Defensive":
-            score -= 20
-
-        if reaction["reaction_label"] == "HOT_MOMENTUM":
-            score += 25
-
-        if reaction["breakout"]:
-            score += 20
-
-        decision = {
-            "symbol": symbol,
-            "action": action,
-            "probability": round(prob, 2),
-            "entry": round(entry, 3),
-            "stop_loss": round(stop, 3),
-            "target": round(target, 3),
-            "expected_profit_pct": round(profit * 100, 2),
-            "risk_pct": round(risk * 100, 2),
-            "rr": round(rr, 2),
-            "holding": horizon,
-            "score": round(score, 2),
-            "volume_ratio": volume_ratio,
-            "breakout": breakout,
-            "trend_up": trend_up,
-            "trend_down": trend_down,
-            "reaction_score": reaction["reaction_score"],
-            "reaction_label": reaction["reaction_label"],
-            "today_change_pct": reaction["today_change_pct"],
-            "intraday_strength": reaction["intraday_strength"],
-            "market_volume_ratio": reaction["volume_ratio"],
-            "signal_score": reaction["signal_score"],
-            "last_signal": reaction["last_signal"],
-            "market_mode": market_mode
-        }
-
-        final_trades.append(decision)
-
-        cur.execute("""
-            INSERT INTO ai_decisions
-            (symbol, decision_time, source, action, probability, score,
-             entry, stop_loss, target, expected_profit_pct, risk_pct, rr,
-             reaction_score, signal_score, market_mode, payload)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            symbol,
-            now_utc(),
-            "AI_TOP_TRADES",
-            action,
-            decision["probability"],
-            decision["score"],
-            decision["entry"],
-            decision["stop_loss"],
-            decision["target"],
-            decision["expected_profit_pct"],
-            decision["risk_pct"],
-            decision["rr"],
-            reaction["reaction_score"],
-            reaction["signal_score"],
-            market_mode,
-            json.dumps(decision, default=str)
-        ))
-
-    conn.commit()
-    conn.close()
-
-    final_trades = sorted(final_trades, key=lambda x: x["score"], reverse=True)
-
-    top_actions = [
-        "BUY",
-        "AI GOOD",
-        "SAFE BUY",
-        "STRONG BUY",
-        "SMART BUY",
-        "BREAKOUT ATTACK"
-    ]
-
-    top = [x for x in final_trades if x["action"] in top_actions][:limit]
-    aggressive = [x for x in final_trades if x["action"] == "HIGH RISK HIGH REWARD"][:5]
-    watch = [x for x in final_trades if x["action"] in ["WATCH", "REVERSAL WATCH", "AI WEAK"]][:10]
-
-    return {
-        "auto_train": train_info,
-        "market_mode": market_mode,
-        "top_trades": top,
-        "aggressive_opportunities": aggressive,
-        "watchlist": watch
-    }
-
-
-@app.get("/api/ai/monitor")
-def ai_monitor_trades():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *
-        FROM trades
-        WHERE status = 'OPEN'
-    """)
-
-    trades = cur.fetchall()
-    results = []
-
-    for t in trades:
-        symbol = t["symbol"]
-        entry = t["entry_price"]
-        stop = t["stop_loss"]
-        target = t["target"]
-
-        price, price_date = get_latest_daily_price(conn, symbol, entry)
-
-        action = "HOLD"
-
-        if target and price >= target:
-            action = "TAKE PROFIT"
-        elif stop and price <= stop:
-            action = "EXIT NOW"
-        elif stop and price <= stop * 1.02:
-            action = "STOP WARNING"
-        elif target and price > entry * 1.05 and price < target:
-            action = "TRAIL PROFIT"
-
-        results.append({
-            "symbol": symbol,
-            "entry": entry,
-            "current_price": price,
-            "price_date": price_date,
-            "pnl_pct": round(((price - entry) / entry) * 100, 2),
-            "action": action,
-            "target": target,
-            "stop": stop
-        })
-
-    conn.close()
-
-    return {
-        "count": len(results),
-        "trades": results
-    }
-
-
-@app.get("/api/ai/risk-manager")
-def ai_risk_manager():
-    portfolio = portfolio_summary_data()
-    daily = daily_dashboard()
-
-    market_mode = daily["market_mode"]
-    buy_count = daily["buy_count"]
-    watch_count = daily["watch_count"]
-    exposure = portfolio["exposure_pct"]
-
-    max_exposure = 25
-
-    if market_mode == "Aggressive":
-        max_exposure = 80
-    elif market_mode == "Neutral":
-        max_exposure = 55
-    elif market_mode == "Defensive":
-        max_exposure = 25
-
-    decision = "HOLD"
-    advice = "Keep current positions and monitor."
-
-    if market_mode == "Defensive" and exposure > 40:
-        decision = "REDUCE RISK"
-        advice = "Market is weak. Reduce exposure and avoid new buying."
-    elif market_mode == "Defensive" and buy_count == 0:
-        decision = "NO NEW BUY"
-        advice = "No new trades. Wait for real market strength."
-    elif market_mode == "Neutral" and exposure < max_exposure:
-        decision = "SELECTIVE BUY"
-        advice = "Only buy the strongest setups."
-    elif market_mode == "Aggressive" and exposure < max_exposure:
-        decision = "BUY ALLOWED"
-        advice = "Buying allowed but position sizing must be controlled."
-
-    position_actions = []
-
-    for h in portfolio["holdings"]:
-        action = "HOLD"
-
-        if h["target"] and h["current_price"] >= h["target"]:
-            action = "TAKE PROFIT"
-        elif h["stop_loss"] and h["current_price"] <= h["stop_loss"]:
-            action = "EXIT NOW"
-        elif market_mode == "Defensive" and h["pnl_pct"] < -2:
-            action = "SELL / CUT LOSS"
-        elif h["pnl_pct"] > 5:
-            action = "TRAIL PROFIT"
-
-        position_actions.append({
-            "trade_id": h["trade_id"],
-            "symbol": h["symbol"],
-            "pnl_pct": h["pnl_pct"],
-            "action": action
-        })
-
-    suggested_cash = portfolio["total_equity"] * (1 - max_exposure / 100)
-    suggested_invested = portfolio["total_equity"] * (max_exposure / 100)
-
-    return {
-        "market_mode": market_mode,
-        "decision": decision,
-        "advice": advice,
-        "buy_count": buy_count,
-        "watch_count": watch_count,
-        "current_exposure_pct": exposure,
-        "max_allowed_exposure_pct": max_exposure,
-        "suggested_cash": round(suggested_cash, 2),
-        "suggested_invested": round(suggested_invested, 2),
-        "portfolio": portfolio,
-        "position_actions": position_actions
-    }
-
-
-@app.get("/api/ai/learning-report")
-def learning_report():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT action, COUNT(*) AS count, AVG(score) AS avg_score
-        FROM ai_decisions
-        GROUP BY action
-        ORDER BY avg_score DESC
-    """)
-
-    stats = cur.fetchall()
-
-    cur.execute("""
-        SELECT *
-        FROM ai_training_log
-        ORDER BY trained_at DESC
-        LIMIT 10
-    """)
-
-    logs = cur.fetchall()
-
-    conn.close()
-
-    return {
-        "ai_action_stats": stats,
-        "training_log": logs
-    }
-
-
-# =========================
-# HTML DASHBOARD
-# =========================
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard_page():
-    data = daily_dashboard()
-    portfolio = portfolio_summary_data()
-
-    def badge_class(rec):
-        if rec == "BUY":
-            return "buy"
-        if rec == "WATCH":
-            return "watch"
-        if rec == "HOLD":
-            return "hold"
-        if rec == "DEAD":
-            return "dead"
-        return "avoid"
-
-    def change_class(change):
-        return "green" if change > 0 else "red" if change < 0 else "neutral"
-
-    def build_rows(items):
-        rows = ""
-        for item in items:
-            rows += f"""
-            <tr>
-                <td>{item['symbol']}</td>
-                <td>{item['last_close']}</td>
-                <td>{item.get('data_date', '-')}</td>
-                <td class="{change_class(item['change_pct'])}">{item['change_pct']}%</td>
-                <td>{item['score']}</td>
-                <td><span class="badge {badge_class(item['recommendation'])}">{item['recommendation']}</span></td>
-            </tr>
-            """
-        return rows
-
-    def build_holdings(items):
-        rows = ""
-        for h in items:
-            rows += f"""
-            <tr>
-                <td>{h['trade_id']}</td>
-                <td>{h['symbol']}</td>
-                <td>{h['qty']}</td>
-                <td>{h['entry']}</td>
-                <td>{h['current_price']}</td>
-                <td>{h.get('price_date', '-')}</td>
-                <td>{h['market_value']}</td>
-                <td>{h['pnl']}</td>
-                <td>{h['pnl_pct']}%</td>
-            </tr>
-            """
-        return rows
-
-    html = f"""
-    <html>
-    <head>
-        <title>UAE Trading AI Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0f172a;
-                color: #e5e7eb;
-                padding: 20px;
-            }}
-            .card {{
-                background: #111827;
-                border-radius: 14px;
-                padding: 18px;
-                margin-bottom: 18px;
-                overflow-x: auto;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-                gap: 12px;
-            }}
-            .metric {{
-                background: #1f2937;
-                padding: 14px;
-                border-radius: 12px;
-            }}
-            .metric small {{ color: #9ca3af; }}
-            .metric strong {{
-                display: block;
-                font-size: 24px;
-                margin-top: 6px;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-            }}
-            th, td {{
-                padding: 12px;
-                border-bottom: 1px solid #374151;
-                white-space: nowrap;
-                text-align: left;
-            }}
-            th {{ color: #9ca3af; }}
-            .badge {{
-                padding: 6px 12px;
-                border-radius: 999px;
-                font-weight: bold;
-            }}
-            .buy {{ background: #16a34a; }}
-            .watch {{ background: #f59e0b; color: #111827; }}
-            .hold {{ background: #3b82f6; }}
-            .avoid {{ background: #6b7280; }}
-            .dead {{ background: #991b1b; }}
-            .green {{ color: #22c55e; font-weight: bold; }}
-            .red {{ color: #ef4444; font-weight: bold; }}
-            .neutral {{ color: #e5e7eb; }}
-        </style>
-    </head>
-    <body>
-        <h1>UAE Trading AI Dashboard</h1>
-
-        <div class="card grid">
-            <div class="metric"><small>Report Time UAE</small><strong>{data['report_time_uae']}</strong></div>
-            <div class="metric"><small>Market Mode</small><strong>{data['market_mode']}</strong></div>
-            <div class="metric"><small>BUY / WATCH / DEAD</small><strong>{data['buy_count']} / {data['watch_count']} / {data['dead_count']}</strong></div>
-            <div class="metric"><small>Cash</small><strong>{portfolio['cash']}</strong></div>
-            <div class="metric"><small>Market Value</small><strong>{portfolio['market_value']}</strong></div>
-            <div class="metric"><small>Total Equity</small><strong>{portfolio['total_equity']}</strong></div>
-            <div class="metric"><small>Total PnL</small><strong>{portfolio['total_pnl']} ({portfolio['total_pnl_pct']}%)</strong></div>
-            <div class="metric"><small>Exposure</small><strong>{portfolio['exposure_pct']}%</strong></div>
-        </div>
-
-        <div class="card">
-            <h2>Holdings / Owned</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th><th>Symbol</th><th>Qty</th><th>Entry</th>
-                        <th>Current</th><th>Price Date</th><th>Value</th><th>PnL</th><th>PnL %</th>
-                    </tr>
-                </thead>
-                <tbody>{build_holdings(portfolio['holdings'])}</tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Top Recommendations</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{build_rows(data['top_recommendations'])}</tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Other Stocks</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{build_rows(data['other_stocks'])}</tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Dead / Weak Stocks</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Symbol</th><th>Close</th><th>Data Date</th><th>Change</th><th>Score</th><th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{build_rows(data['dead_stocks'])}</tbody>
-            </table>
-        </div>
-    </body>
-    </html>
-    """
-
-    return html
-
-# =========================
-# DUAL AI SIGNALS + TELEGRAM - MEDIUM MODE
-# =========================
-
-import json
-import requests
-import psycopg2.errors
-
-DASHBOARD_URL = os.getenv(
-    "DASHBOARD_URL",
-    "https://uae-market-production.up.railway.app/dashboard"
-)
-
-SYSTEM_MODE = "MEDIUM"
-
-
-def ensure_alert_tables():
-    conn = db()
-    cur = conn.cursor()
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_alerts_log (
             id SERIAL PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            signal_type TEXT NOT NULL,
-            trigger_key TEXT NOT NULL,
-            sent_at TEXT NOT NULL,
-            price DOUBLE PRECISION,
-            message TEXT,
-            payload TEXT,
-            UNIQUE(symbol, signal_type, trigger_key)
+            alert_key TEXT UNIQUE NOT NULL,
+            symbol TEXT,
+            signal_type TEXT,
+            created_at TEXT NOT NULL,
+            payload TEXT
         )
     """)
 
-    conn.commit()
-    conn.close()
-
-
-def send_telegram_message(message: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-        return {"ok": False, "error": "Missing Telegram variables"}
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    r = requests.post(
-        url,
-        json={
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        },
-        timeout=15
-    )
-
-    return {
-        "ok": r.ok,
-        "status_code": r.status_code,
-        "response": r.text[:500]
-    }
-
-
-def get_symbol_candles(symbol: str, timeframe: str, limit: int = 250):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     cur.execute("""
-        SELECT symbol, exchange, timeframe, bar_time, open, high, low, close, volume, received_at
-        FROM candles
-        WHERE symbol = %s
-          AND timeframe = %s
-          AND close IS NOT NULL
-        ORDER BY bar_time DESC
-        LIMIT %s
-    """, (normalize_symbol(symbol), timeframe, limit))
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return list(reversed(rows))
-
-
-def get_all_symbols():
-    # PRO: scan the full 53-stock watchlist, not only symbols that already have candles.
-    symbols = set(get_watchlist_symbols())
-    try:
-        conn = db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT DISTINCT symbol
-            FROM candles
-            WHERE close IS NOT NULL
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        symbols.update(r["symbol"] for r in rows)
-    except Exception:
-        pass
-    return sorted(symbols)
-
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    k = 2 / (period + 1)
-    e = values[0]
-
-    for price in values[1:]:
-        e = price * k + e * (1 - k)
-
-    return e
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
-
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def macd(values):
-    if len(values) < 35:
-        return None
-
-    ema12 = ema(values[-60:], 12)
-    ema26 = ema(values[-60:], 26)
-
-    if ema12 is None or ema26 is None:
-        return None
-
-    line = ema12 - ema26
-    return line
-
-
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-
-    trs = []
-
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-
-        if high is None or low is None or prev_close is None:
-            continue
-
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
+        CREATE TABLE IF NOT EXISTS ai_virtual_signals (
+            id SERIAL PRIMARY KEY,
+            signal_key TEXT UNIQUE NOT NULL,
+            mode TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_type TEXT,
+            timeframe TEXT,
+            action TEXT,
+            price DOUBLE PRECISION,
+            entry_low DOUBLE PRECISION,
+            entry_high DOUBLE PRECISION,
+            stop_loss DOUBLE PRECISION,
+            target1 DOUBLE PRECISION,
+            target2 DOUBLE PRECISION,
+            target3 DOUBLE PRECISION,
+            score DOUBLE PRECISION,
+            strength TEXT,
+            rr DOUBLE PRECISION,
+            risk_pct DOUBLE PRECISION,
+            target_pct DOUBLE PRECISION,
+            max_hold_days INTEGER,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            outcome TEXT,
+            outcome_at TEXT,
+            max_high DOUBLE PRECISION,
+            min_low DOUBLE PRECISION,
+            bars_checked INTEGER DEFAULT 0,
+            payload TEXT
         )
-
-        trs.append(tr)
-
-    if len(trs) < period:
-        return None
-
-    return sum(trs[-period:]) / period
-
-
-def support_resistance(candles, lookback=40):
-    recent = candles[-lookback:] if len(candles) >= lookback else candles
-
-    lows = [x["low"] for x in recent if x["low"] is not None]
-    highs = [x["high"] for x in recent if x["high"] is not None]
-
-    support = min(lows) if lows else None
-    resistance = max(highs) if highs else None
-
-    return support, resistance
-
-
-def volume_ratio(candles, lookback=20):
-    if len(candles) < lookback + 1:
-        return 1
-
-    latest_volume = candles[-1]["volume"] or 0
-    volumes = [x["volume"] for x in candles[-lookback - 1:-1] if x["volume"]]
-
-    if not volumes:
-        return 1
-
-    avg_volume = sum(volumes) / len(volumes)
-    return latest_volume / avg_volume if avg_volume else 1
-
-
-def classify_strength(score):
-    if score >= 80:
-        return "VERY STRONG"
-    if score >= 65:
-        return "STRONG"
-    if score >= 50:
-        return "MEDIUM"
-    return "WEAK"
-
-
-def _smart_stop_for_buy(entry, entry_low, support=None, atr_value=None, min_stop_pct=0.018, max_stop_pct=0.045, atr_mult=2.0, support_buffer=0.006):
-    """Hybrid Smart Stop: structure + ATR + min/max risk guard."""
-    candidates = []
-    if support and support < entry_low:
-        candidates.append(support * (1 - support_buffer))
-    if atr_value and atr_value > 0:
-        candidates.append(entry - atr_value * atr_mult)
-    raw_stop = min(candidates) if candidates else entry * (1 - min_stop_pct)
-    max_allowed_stop = entry_low * (1 - min_stop_pct)
-    min_allowed_stop = entry * (1 - max_stop_pct)
-    stop = raw_stop
-    if stop >= entry_low:
-        stop = max_allowed_stop
-    if stop > max_allowed_stop:
-        stop = max_allowed_stop
-    if stop < min_allowed_stop:
-        stop = min_allowed_stop
-    return stop
-
-
-def _signal_dict(symbol, signal_type, action, timeframe, entry, entry_low, entry_high, stop, targets, score, trend_label, support, resistance, rsi14, vr, holding, reason, bar_time):
-    target1 = targets[0]
-    risk_pct = ((entry - stop) / entry) * 100 if entry else 0
-    expected_pct = ((target1 - entry) / entry) * 100 if entry else 0
-    rr = expected_pct / risk_pct if risk_pct > 0 else 0
-    d = {
-        "symbol": symbol,
-        "type": signal_type,
-        "action": action,
-        "timeframe": timeframe,
-        "price": round(entry, 3),
-        "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
-        "stop_loss": round(stop, 3),
-        "target1": round(targets[0], 3),
-        "target2": round(targets[1], 3) if len(targets) > 1 else None,
-        "target3": round(targets[2], 3) if len(targets) > 2 else None,
-        "expected_move_pct": round(expected_pct, 2),
-        "risk_pct": round(risk_pct, 2),
-        "rr": round(rr, 2),
-        "score": round(score, 2),
-        "strength": classify_strength(score),
-        "trend": trend_label,
-        "support": round(support, 3) if support else None,
-        "resistance": round(resistance, 3) if resistance else None,
-        "rsi": round(rsi14, 2) if rsi14 else None,
-        "volume_ratio": round(vr, 2) if vr is not None else None,
-        "holding": holding,
-        "reason": reason,
-        "trigger_key": f"{signal_type}-{bar_time}-{round(entry,3)}-{round(score,1)}"
-    }
-    return d
-
-
-def analyze_dual_symbol(symbol: str):
-    """PRO AI scan. Uses 1H for short swing and 1D for swing only. Scans all 53 watchlist symbols."""
-    symbol = normalize_symbol(symbol)
-    daily = get_symbol_candles(symbol, "1D", 260)
-    h1 = get_symbol_candles(symbol, "60", 220)
-    signals = []
-
-    # -------------------------
-    # 1D SWING SYSTEM
-    # -------------------------
-    if len(daily) >= 25:
-        closes = [float(x["close"]) for x in daily if x["close"] is not None]
-        latest = daily[-1]
-        entry = float(latest["close"])
-        ema20_d = ema(closes[-80:], 20) if len(closes) >= 20 else None
-        ema50_d = ema(closes[-120:], 50) if len(closes) >= 50 else None
-        rsi14 = rsi(closes, 14)
-        macd_line = macd(closes)
-        support, resistance = support_resistance(daily, min(60, len(daily)))
-        day_atr = atr(daily, 14)
-        vr = volume_ratio(daily, min(20, max(len(daily)-1, 1)))
-
-        trend_score = 0
-        momentum_score = 0
-        structure_score = 0
-        volume_score = 0
-
-        if ema20_d and entry >= ema20_d * 0.995:
-            trend_score += 20
-        if ema20_d and ema50_d and ema20_d >= ema50_d * 0.985:
-            trend_score += 20
-        if len(closes) >= 5 and closes[-1] > closes[-5]:
-            trend_score += 10
-        if rsi14 and 42 <= rsi14 <= 72:
-            momentum_score += 15
-        if macd_line is not None and macd_line >= 0:
-            momentum_score += 10
-        if support and entry <= support * 1.06:
-            structure_score += 18
-        if resistance and entry >= resistance * 0.99:
-            structure_score += 22
-        if vr >= 0.8:
-            volume_score += 8
-        if vr >= 1.2:
-            volume_score += 15
-
-        score = trend_score + momentum_score + structure_score + volume_score
-        entry_low = entry * 0.99
-        entry_high = entry * 1.01
-        stop = _smart_stop_for_buy(entry, entry_low, support=support, atr_value=day_atr, min_stop_pct=0.035, max_stop_pct=0.085, atr_mult=2.2, support_buffer=0.008)
-        targets = [entry * 1.07, entry * 1.12, entry * 1.15]
-        risk_pct = ((entry - stop) / entry) * 100 if entry else 0
-        rr = 7 / risk_pct if risk_pct > 0 else 0
-        trend_label = "UP" if trend_score >= 30 else "MIXED"
-        if score >= 55 and rr >= 0.75 and stop < entry_low:
-            signals.append(_signal_dict(
-                symbol, "SWING", "SWING BUY WATCH", "1D", entry, entry_low, entry_high,
-                stop, targets, score, trend_label, support, resistance, rsi14, vr,
-                "1 week to 1 month", "Daily structure + momentum + volume + Hybrid Smart Stop", latest["bar_time"]
-            ))
-
-    # -------------------------
-    # 1H SHORT SWING SYSTEM
-    # -------------------------
-    if len(h1) >= 20:
-        closes = [float(x["close"]) for x in h1 if x["close"] is not None]
-        latest = h1[-1]
-        entry = float(latest["close"])
-        ema20_h = ema(closes[-80:], 20) if len(closes) >= 20 else None
-        ema50_h = ema(closes[-120:], 50) if len(closes) >= 50 else None
-        rsi14 = rsi(closes, 14)
-        macd_line = macd(closes)
-        support, resistance = support_resistance(h1, min(50, len(h1)))
-        short_atr = atr(h1, 14)
-        vr = volume_ratio(h1, min(20, max(len(h1)-1, 1)))
-
-        trend_score = 0
-        momentum_score = 0
-        structure_score = 0
-        volume_score = 0
-
-        if ema20_h and entry >= ema20_h * 0.995:
-            trend_score += 20
-        if ema20_h and ema50_h and ema20_h >= ema50_h * 0.99:
-            trend_score += 18
-        if len(closes) >= 4 and closes[-1] >= closes[-4] * 0.998:
-            trend_score += 8
-        if rsi14 and 43 <= rsi14 <= 76:
-            momentum_score += 14
-        if macd_line is not None and macd_line >= -0.01:
-            momentum_score += 8
-        breakout = resistance and entry >= resistance * 0.995
-        near_support = support and entry <= support * 1.04
-        if breakout:
-            structure_score += 25
-        if near_support:
-            structure_score += 15
-        if vr >= 0.75:
-            volume_score += 8
-        if vr >= 1.15:
-            volume_score += 14
-
-        score = trend_score + momentum_score + structure_score + volume_score
-        entry_low = entry * 0.995
-        entry_high = entry * 1.005
-        stop = _smart_stop_for_buy(entry, entry_low, support=support, atr_value=short_atr, min_stop_pct=0.018, max_stop_pct=0.045, atr_mult=2.0, support_buffer=0.006)
-        targets = [entry * 1.03, entry * 1.05]
-        risk_pct = ((entry - stop) / entry) * 100 if entry else 0
-        rr = 3 / risk_pct if risk_pct > 0 else 0
-        trend_label = "UP" if trend_score >= 28 else "MIXED"
-
-        # Medium mode: allow clean 1H signals, but avoid weak/noisy setups.
-        if score >= 50 and rr >= 0.65 and stop < entry_low:
-            signals.append(_signal_dict(
-                symbol, "SHORT_SWING", "SHORT SWING BUY", "60", entry, entry_low, entry_high,
-                stop, targets, score, trend_label, support, resistance, rsi14, vr,
-                "1 to 5 days", "1H trend + structure + volume/momentum + Hybrid Smart Stop", latest["bar_time"]
-            ))
-
-    return sorted(signals, key=lambda x: (x.get("score", 0), x.get("rr", 0)), reverse=True)
-
-
-def build_alert_message(signal):
-    t2 = signal.get("target2")
-    t3 = signal.get("target3")
-
-    targets = f"""
-<b>Target 1:</b> {signal['target1']}
-<b>Target 2:</b> {t2}
-""".strip()
-
-    if t3:
-        targets += f"\n<b>Target 3:</b> {t3}"
-
-    return f"""
-🚨 <b>UAE Trading AI Alert</b>
-
-<b>Symbol:</b> {signal['symbol']}
-<b>Type:</b> {signal['type']}
-<b>Action:</b> {signal['action']}
-<b>Strength:</b> {signal['strength']}
-<b>Score:</b> {signal['score']}
-
-<b>Price:</b> {signal['price']}
-<b>Entry Zone:</b> {signal['entry_zone'][0]} - {signal['entry_zone'][1]}
-<b>Stop Loss:</b> {signal['stop_loss']}
-
-{targets}
-
-<b>Expected Move:</b> +{signal['expected_move_pct']}%
-<b>Risk:</b> {signal['risk_pct']}%
-<b>R/R:</b> {signal['rr']}
-
-<b>Timeframe:</b> {signal['timeframe']}
-<b>Holding:</b> {signal['holding']}
-<b>RSI:</b> {signal.get('rsi')}
-<b>Volume Ratio:</b> {signal['volume_ratio']}
-
-<b>Reason:</b> {signal['reason']}
-
-Dashboard:
-{DASHBOARD_URL}
-""".strip()
-
-
-@app.get("/api/ai/dual-signals")
-def api_dual_signals(symbol: Optional[str] = None):
-    ensure_alert_tables()
-
-    if symbol:
-        signals = analyze_dual_symbol(symbol)
-    else:
-        signals = []
-        for s in get_all_symbols():
-            signals.extend(analyze_dual_symbol(s))
-
-    signals = sorted(
-        signals,
-        key=lambda x: (x["score"], x["expected_move_pct"], x["rr"]),
-        reverse=True
-    )
-
-    return {
-        "mode": SYSTEM_MODE,
-        "count": len(signals),
-        "signals": signals
-    }
-
-
-
-
-@app.get("/api/ai/pro-scan")
-def api_ai_pro_scan(limit: int = 20):
-    signals = []
-    no_data = []
-    for s in get_watchlist_symbols():
-        sigs = analyze_dual_symbol(s)
-        if sigs:
-            signals.extend(sigs)
-        else:
-            p = latest_price(s) if 'latest_price' in globals() else None
-            no_data.append({"symbol": s, "has_price": bool(p), "price": p})
-    signals = sorted(signals, key=lambda x: (x.get("score", 0), x.get("rr", 0)), reverse=True)
-    return {"mode": SYSTEM_MODE, "watchlist_count": len(get_watchlist_symbols()), "signals_count": len(signals), "signals": signals[:limit], "no_signal_count": len(no_data), "no_signal": no_data[:100]}
-
-
-@app.get("/api/ai/test-telegram")
-def api_test_telegram():
-    result = send_telegram_message(
-        f"✅ UAE Trading AI Telegram is connected.\n\nDashboard:\n{DASHBOARD_URL}"
-    )
-    return result
-
-
-@app.get("/api/ai/send-alerts")
-def api_send_alerts(symbol: Optional[str] = None, dry_run: bool = True, force: bool = False):
-    ensure_alert_tables()
-
-    conn = db()
-    cur = conn.cursor()
-
-    if symbol:
-        all_signals = analyze_dual_symbol(symbol)
-    else:
-        all_signals = []
-        for s in get_all_symbols():
-            all_signals.extend(analyze_dual_symbol(s))
-
-    sent = []
-    skipped = []
-
-    for sig in all_signals:
-        message = build_alert_message(sig)
-
-        try:
-            if force:
-                cur.execute("DELETE FROM ai_alerts_log WHERE symbol = %s AND signal_type = %s AND trigger_key = %s", (sig["symbol"], sig["type"], sig["trigger_key"]))
-                conn.commit()
-            cur.execute("""
-                INSERT INTO ai_alerts_log
-                (symbol, signal_type, trigger_key, sent_at, price, message, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                sig["symbol"],
-                sig["type"],
-                sig["trigger_key"],
-                datetime.utcnow().isoformat(),
-                sig["price"],
-                message,
-                json.dumps(sig)
-            ))
-
-            if not dry_run:
-                tg = send_telegram_message(message)
-            else:
-                tg = {"ok": True, "dry_run": True}
-
-            sent.append({
-                "symbol": sig["symbol"],
-                "type": sig["type"],
-                "telegram": tg
-            })
-
-            conn.commit()
-
-        except psycopg2.errors.UniqueViolation:
-            conn.rollback()
-            skipped.append({
-                "symbol": sig["symbol"],
-                "type": sig["type"],
-                "reason": "duplicate_alert"
-            })
-
-    conn.close()
-
-    return {
-        "mode": SYSTEM_MODE,
-        "dry_run": dry_run,
-        "force": force,
-        "signals_found": len(all_signals),
-        "sent_count": len(sent),
-        "skipped_count": len(skipped),
-        "sent": sent,
-        "skipped": skipped
-    }
-
-
-
-
-@app.post("/api/ai/send-alerts")
-def api_send_alerts_post(symbol: Optional[str] = None, dry_run: bool = True, force: bool = False):
-    return api_send_alerts(symbol=symbol, dry_run=dry_run, force=force)
-
-
-
-
-@app.get("/api/ai/reset-alerts")
-def api_reset_alerts(symbol: Optional[str] = None):
-    ensure_alert_tables()
-    conn = db()
-    cur = conn.cursor()
-    if symbol:
-        cur.execute("DELETE FROM ai_alerts_log WHERE symbol = %s", (normalize_symbol(symbol),))
-    else:
-        cur.execute("DELETE FROM ai_alerts_log")
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    return {"status": "ok", "deleted": deleted}
-
-
-@app.get("/api/ai/alerts-log")
-def api_alerts_log(limit: int = 50):
-    ensure_alert_tables()
-
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *
-        FROM ai_alerts_log
-        ORDER BY id DESC
-        LIMIT %s
-    """, (limit,))
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return {
-        "count": len(rows),
-        "alerts": rows
-    }
-
-from fastapi import Request
-import requests
-import os
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-
-# =========================
-# PROFESSIONAL TELEGRAM AI BOT
-# Interactive Trading Assistant + Postgres Learning
-# =========================
-
-from fastapi import Request
-from datetime import datetime
-import os
-import json
-import requests
-import psycopg2.extras
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://uae-market-production.up.railway.app/dashboard")
-
-
-def tg_api(method: str, payload: dict):
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
-
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": r.ok, "text": r.text}
-
-
-def tg_send_message(chat_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    return tg_api("sendMessage", payload)
-
-
-def tg_answer_callback(callback_query_id, text=""):
-    return tg_api("answerCallbackQuery", {
-        "callback_query_id": callback_query_id,
-        "text": text
-    })
-
-
-def ensure_telegram_tables():
-    conn = db()
-    cur = conn.cursor()
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS telegram_sessions (
@@ -2687,6 +181,7 @@ def ensure_telegram_tables():
             symbol TEXT,
             amount DOUBLE PRECISION,
             entry_price DOUBLE PRECISION,
+            trade_id INTEGER,
             payload TEXT,
             updated_at TEXT NOT NULL
         )
@@ -2719,20 +214,6 @@ def ensure_telegram_tables():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_trade_events (
-            id SERIAL PRIMARY KEY,
-            trade_id INTEGER,
-            chat_id TEXT NOT NULL,
-            symbol TEXT,
-            event_type TEXT NOT NULL,
-            event_time TEXT NOT NULL,
-            price DOUBLE PRECISION,
-            note TEXT,
-            payload TEXT
-        )
-    """)
-
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_trade_feedback (
             id SERIAL PRIMARY KEY,
             trade_id INTEGER,
@@ -2741,6 +222,7 @@ def ensure_telegram_tables():
             predicted_entry DOUBLE PRECISION,
             predicted_stop DOUBLE PRECISION,
             predicted_target1 DOUBLE PRECISION,
+            predicted_target2 DOUBLE PRECISION,
             actual_entry DOUBLE PRECISION,
             actual_exit DOUBLE PRECISION,
             actual_return_pct DOUBLE PRECISION,
@@ -2751,729 +233,933 @@ def ensure_telegram_tables():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_learning_stats (
+            symbol TEXT PRIMARY KEY,
+            trades_count INTEGER DEFAULT 0,
+            wins_count INTEGER DEFAULT 0,
+            losses_count INTEGER DEFAULT 0,
+            virtual_short_count INTEGER DEFAULT 0,
+            virtual_short_wins INTEGER DEFAULT 0,
+            virtual_short_losses INTEGER DEFAULT 0,
+            virtual_long_count INTEGER DEFAULT 0,
+            virtual_long_wins INTEGER DEFAULT 0,
+            virtual_long_losses INTEGER DEFAULT 0,
+            avg_return_pct DOUBLE PRECISION DEFAULT 0,
+            score_adjustment DOUBLE PRECISION DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def get_setting(key: str, default=None):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT value FROM system_settings WHERE key=%s", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+def set_setting(key: str, value: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO system_settings(key,value,updated_at)
+        VALUES(%s,%s,%s)
+        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
+    """, (key, value, utc_now()))
+    conn.commit()
+    conn.close()
+
+def ensure_learning_start():
+    if not get_setting("learning_started_at"):
+        set_setting("learning_started_at", utc_now())
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    ensure_learning_start()
+
+
+# ============================================================
+# MODE
+# ============================================================
+
+def get_ai_mode():
+    return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "LEARNING").upper().strip()
+
+def learning_age_days():
+    start = parse_dt(get_setting("learning_started_at"))
+    if not start:
+        return 0
+    return max(0, (utc_now_dt() - start).total_seconds() / 86400)
+
+def learning_remaining_days():
+    return max(0, LEARNING_DAYS - learning_age_days())
+
+
+# ============================================================
+# BASIC API
+# ============================================================
+
+@app.get("/")
+def home():
+    return {
+        "status": "UAE PRO AI V3 Running",
+        "mode": get_ai_mode(),
+        "learning_age_days": round(learning_age_days(), 2),
+        "learning_remaining_days": round(learning_remaining_days(), 2),
+        "watchlist_count": len(WATCHLIST)
+    }
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "mode": get_ai_mode()}
+
+@app.get("/api/watchlist")
+def watchlist():
+    return {"count": len(WATCHLIST), "stocks": WATCHLIST}
+
+@app.get("/api/system/mode")
+def api_mode():
+    return {
+        "mode": get_ai_mode(),
+        "learning_days": LEARNING_DAYS,
+        "learning_age_days": round(learning_age_days(), 2),
+        "learning_remaining_days": round(learning_remaining_days(), 2)
+    }
+
+@app.get("/api/system/set-mode")
+def api_set_mode(mode: str):
+    mode = mode.upper().strip()
+    if mode not in ["LEARNING", "PAPER", "LIVE"]:
+        return {"ok": False, "error": "mode must be LEARNING, PAPER, LIVE"}
+    set_setting("ai_mode", mode)
+    return {"ok": True, "mode": mode}
+
+
+# ============================================================
+# TRADINGVIEW WEBHOOK
+# ============================================================
+
+@app.post("/webhook/tradingview")
+async def tradingview_webhook(request: Request):
+    data = await request.json()
+
+    if data.get("secret") != SECRET:
+        return {"ok": False, "error": "bad_secret"}
+
+    symbol = normalize_symbol(data.get("symbol"))
+    tf = str(data.get("timeframe", "")).strip()
+
+    if tf in ["1h", "1H", "60m", "H1"]:
+        tf = "60"
+    elif tf in ["D", "1d", "daily"]:
+        tf = "1D"
+
+    o = safe_float(data.get("open"))
+    h = safe_float(data.get("high"))
+    l = safe_float(data.get("low"))
+    c = safe_float(data.get("close"))
+    v = safe_float(data.get("volume"), 0)
+
+    if not symbol or tf not in ["60", "1D"]:
+        return {"ok": False, "error": "bad_symbol_or_timeframe", "symbol": symbol, "timeframe": tf}
+
+    if None in [o, h, l, c]:
+        return {"ok": False, "error": "bad_ohlc"}
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        symbol,
+        data.get("exchange"),
+        tf,
+        parse_bar_time(data.get("time")),
+        o, h, l, c, v,
+        utc_now()
+    ))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "symbol": symbol, "timeframe": tf, "close": c}
+
+
+# ============================================================
+# CANDLES
+# ============================================================
+
+def get_candles(symbol: str, timeframe: str, limit: int = 220):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM candles
+        WHERE symbol=%s AND timeframe=%s
+        ORDER BY id DESC
+        LIMIT %s
+    """, (normalize_symbol(symbol), timeframe, limit))
+    rows = list(reversed(cur.fetchall()))
+    conn.close()
+    return rows
+
+@app.get("/api/candles/latest")
+def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    q = "SELECT * FROM candles WHERE 1=1"
+    params = []
+
+    if symbol:
+        q += " AND symbol=%s"
+        params.append(normalize_symbol(symbol))
+    if timeframe:
+        q += " AND timeframe=%s"
+        params.append(timeframe)
+
+    q += " ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+
+    cur.execute(q, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+    return {"count": len(rows), "candles": rows}
+
+@app.get("/api/watchlist/coverage")
+def coverage():
+    out = []
+    for s in WATCHLIST:
+        h1 = len(get_candles(s, "60", 5))
+        d1 = len(get_candles(s, "1D", 5))
+        out.append({"symbol": s, "has_1h": h1 > 0, "has_1d": d1 > 0, "ready": h1 > 0 and d1 > 0})
+    return {"count": len(out), "coverage": out}
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def sma(values, n):
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
+
+def ema(values, n):
+    if len(values) < n:
+        return None
+    k = 2 / (n + 1)
+    e = sum(values[:n]) / n
+    for price in values[n:]:
+        e = price * k + e * (1 - k)
+    return e
+
+def rsi(values, n=14):
+    if len(values) < n + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0))
+        losses.append(abs(min(d, 0)))
+    ag = sum(gains[-n:]) / n
+    al = sum(losses[-n:]) / n
+    if al == 0:
+        return 100
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
+
+def atr(candles, n=14):
+    if len(candles) < n + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h = float(candles[i]["high"])
+        l = float(candles[i]["low"])
+        pc = float(candles[i - 1]["close"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-n:]) / n
+
+def support_resistance(candles, lookback=30):
+    if not candles:
+        return None, None
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+    return min(float(x["low"]) for x in recent), max(float(x["high"]) for x in recent)
+
+def recent_momentum(candles, lookback=8):
+    if len(candles) < lookback + 1:
+        return 0
+    start = float(candles[-lookback]["close"])
+    end = float(candles[-1]["close"])
+    return ((end - start) / start) * 100 if start else 0
+
+
+# ============================================================
+# LEARNING
+# ============================================================
+
+def get_learning_adjustment(symbol: str):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT score_adjustment FROM ai_learning_stats WHERE symbol=%s", (normalize_symbol(symbol),))
+    row = cur.fetchone()
+    conn.close()
+    return float(row["score_adjustment"] or 0) if row else 0
+
+def update_learning(symbol: str, ret_pct: float, signal_type: str, is_virtual: bool):
+    symbol = normalize_symbol(symbol)
+    signal_type = str(signal_type or "").upper()
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM ai_learning_stats WHERE symbol=%s", (symbol,))
+    row = cur.fetchone()
+
+    if row:
+        trades = int(row["trades_count"] or 0)
+        wins = int(row["wins_count"] or 0)
+        losses = int(row["losses_count"] or 0)
+        vs = int(row["virtual_short_count"] or 0)
+        vsw = int(row["virtual_short_wins"] or 0)
+        vsl = int(row["virtual_short_losses"] or 0)
+        vl = int(row["virtual_long_count"] or 0)
+        vlw = int(row["virtual_long_wins"] or 0)
+        vll = int(row["virtual_long_losses"] or 0)
+
+        if is_virtual and signal_type == "SHORT_SWING":
+            vs += 1
+            vsw += 1 if ret_pct > 0 else 0
+            vsl += 1 if ret_pct <= 0 else 0
+        elif is_virtual and signal_type == "LONG_SWING":
+            vl += 1
+            vlw += 1 if ret_pct > 0 else 0
+            vll += 1 if ret_pct <= 0 else 0
+        else:
+            trades += 1
+            wins += 1 if ret_pct > 0 else 0
+            losses += 1 if ret_pct <= 0 else 0
+
+        total_events = trades + vs + vl
+        old_avg = float(row["avg_return_pct"] or 0)
+        avg_return = ((old_avg * max(total_events - 1, 0)) + ret_pct) / total_events if total_events else ret_pct
+
+        total_wins = wins + vsw + vlw
+        total_losses = losses + vsl + vll
+        closed = total_wins + total_losses
+        win_rate = total_wins / closed if closed else 0
+
+        score_adj = max(-15, min(15, (win_rate - 0.5) * 30 + avg_return))
+
+        cur.execute("""
+            UPDATE ai_learning_stats
+            SET trades_count=%s,wins_count=%s,losses_count=%s,
+                virtual_short_count=%s,virtual_short_wins=%s,virtual_short_losses=%s,
+                virtual_long_count=%s,virtual_long_wins=%s,virtual_long_losses=%s,
+                avg_return_pct=%s,score_adjustment=%s,updated_at=%s
+            WHERE symbol=%s
+        """, (trades,wins,losses,vs,vsw,vsl,vl,vlw,vll,avg_return,score_adj,utc_now(),symbol))
+    else:
+        trades=wins=losses=vs=vsw=vsl=vl=vlw=vll=0
+        if is_virtual and signal_type == "SHORT_SWING":
+            vs = 1; vsw = 1 if ret_pct > 0 else 0; vsl = 1 if ret_pct <= 0 else 0
+        elif is_virtual and signal_type == "LONG_SWING":
+            vl = 1; vlw = 1 if ret_pct > 0 else 0; vll = 1 if ret_pct <= 0 else 0
+        else:
+            trades = 1; wins = 1 if ret_pct > 0 else 0; losses = 1 if ret_pct <= 0 else 0
+
+        score_adj = 5 if ret_pct > 0 else -5
+
+        cur.execute("""
+            INSERT INTO ai_learning_stats
+            (symbol,trades_count,wins_count,losses_count,
+             virtual_short_count,virtual_short_wins,virtual_short_losses,
+             virtual_long_count,virtual_long_wins,virtual_long_losses,
+             avg_return_pct,score_adjustment,updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (symbol,trades,wins,losses,vs,vsw,vsl,vl,vlw,vll,ret_pct,score_adj,utc_now()))
+
     conn.commit()
     conn.close()
 
 
-def latest_price(symbol: str):
+# ============================================================
+# SMART STOPS
+# ============================================================
+
+def smart_stop(entry, entry_low, support, atr_value, kind):
+    if kind == "SHORT_SWING":
+        min_stop_pct = 0.018
+        max_stop_pct = 0.045
+        atr_mult = 2.0
+    else:
+        min_stop_pct = 0.045
+        max_stop_pct = 0.11
+        atr_mult = 2.5
+
+    buffer_pct = 0.006
+    candidates = []
+
+    if support and support < entry_low:
+        candidates.append(support * (1 - buffer_pct))
+
+    if atr_value:
+        atr_stop = entry - (atr_value * atr_mult)
+        if atr_stop < entry_low:
+            candidates.append(atr_stop)
+
+    stop = min(candidates) if candidates else entry * (1 - min_stop_pct)
+
+    max_allowed = entry_low * (1 - min_stop_pct)
+    min_allowed = entry * (1 - max_stop_pct)
+
+    if stop >= entry_low:
+        stop = max_allowed
+    if stop > max_allowed:
+        stop = max_allowed
+    if stop < min_allowed:
+        stop = min_allowed
+
+    return stop
+
+
+# ============================================================
+# ANALYSIS: SHORT + LONG
+# ============================================================
+
+def daily_trend_score(d1):
+    if len(d1) < 30:
+        return "UNKNOWN", 0
+    closes = [float(x["close"]) for x in d1]
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
+    score = 0
+    if ma20 and closes[-1] > ma20:
+        score += 12
+    if ma50 and closes[-1] > ma50:
+        score += 12
+    if ma20 and ma50 and ma20 >= ma50:
+        score += 8
+    trend = "UP" if score >= 20 else "MIXED" if score >= 10 else "DOWN"
+    return trend, score
+
+def build_signal(symbol, kind, candles, d1):
     symbol = normalize_symbol(symbol)
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT close, bar_time, timeframe
-        FROM candles
-        WHERE symbol = %s
-          AND close IS NOT NULL
-          AND timeframe IN ('60', '1D')
-        ORDER BY
-          CASE WHEN timeframe = '60' THEN 1 ELSE 2 END,
-          bar_time DESC
-        LIMIT 1
-    """, (symbol,))
-
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
+    if len(candles) < 30:
         return None
 
-    return {
-        "price": float(row["close"]),
-        "bar_time": row["bar_time"],
-        "timeframe": row["timeframe"]
-    }
+    closes = [float(x["close"]) for x in candles]
+    volumes = [float(x["volume"] or 0) for x in candles]
+    price = closes[-1]
 
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
+    ema20_v = ema(closes, 20)
+    r = rsi(closes, 14)
+    a = atr(candles, 14)
+    support, resistance = support_resistance(candles, 30 if kind == "SHORT_SWING" else 60)
+    avg_vol = sma(volumes, 20) or 1
+    volume_ratio = volumes[-1] / avg_vol if avg_vol else 1
+    momentum = recent_momentum(candles, 8 if kind == "SHORT_SWING" else 15)
 
-def ai_symbol_analysis(symbol: str):
-    symbol = normalize_symbol(symbol)
+    trend, dscore = daily_trend_score(d1)
 
-    try:
-        signals = analyze_dual_symbol(symbol)
-    except Exception:
-        signals = []
+    score = 0
+    reasons = []
 
-    signals = sorted(
-        signals,
-        key=lambda x: (x.get("score", 0), x.get("rr", 0)),
-        reverse=True
-    )
+    if ma20 and price > ma20:
+        score += 16 if kind == "SHORT_SWING" else 12
+        reasons.append("Price above MA20")
+    if ma50 and price > ma50:
+        score += 14
+        reasons.append("Price above MA50")
+    if ema20_v and price > ema20_v:
+        score += 8
+        reasons.append("Price above EMA20")
 
-    if signals:
-        return signals[0]
+    if trend == "UP":
+        score += 22 if kind == "SHORT_SWING" else 28
+        reasons.append("Daily trend positive")
+    elif trend == "MIXED":
+        score += 8
+        reasons.append("Daily trend mixed")
 
-    price_data = latest_price(symbol)
-    if not price_data:
-        return None
+    if r is not None and 45 <= r <= 68:
+        score += 14
+        reasons.append("RSI healthy")
+    elif r is not None and 68 < r <= 75:
+        score += 5
+        reasons.append("RSI extended")
 
-    price = price_data["price"]
+    if volume_ratio >= 1.4:
+        score += 15
+        reasons.append("Strong volume")
+    elif volume_ratio >= 1.15:
+        score += 8
+        reasons.append("Volume improving")
+
+    if resistance and price >= resistance * 0.985:
+        score += 8
+        reasons.append("Near breakout zone")
+
+    if momentum > (1.0 if kind == "SHORT_SWING" else 2.5):
+        score += 8
+        reasons.append("Positive momentum")
+
+    score += get_learning_adjustment(symbol)
+
+    entry = price
+    entry_low = entry * 0.995
+    entry_high = entry * 1.005
+    stop = smart_stop(entry, entry_low, support, a, kind)
+
+    if kind == "SHORT_SWING":
+        target_pct = 3.0
+        t1 = entry * 1.03
+        t2 = entry * 1.05
+        t3 = entry * 1.055
+        max_hold_days = 5
+        timeframe = "60"
+    else:
+        target_pct = 7.0
+        t1 = entry * 1.07
+        t2 = entry * 1.12
+        t3 = entry * 1.15
+        max_hold_days = 25
+        timeframe = "1D"
+
+    risk_pct = ((entry - stop) / entry) * 100 if entry else 0
+    rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
+
+    strength = "VERY STRONG" if score >= 85 else "STRONG" if score >= 70 else "MEDIUM" if score >= 55 else "WEAK"
+
+    model_action = "BUY" if score >= 70 and rr >= 0.9 and (risk_pct <= (4.5 if kind == "SHORT_SWING" else 11)) else "WATCH"
+
+    if get_ai_mode() == "LEARNING":
+        action = "LEARN_SIGNAL" if model_action == "BUY" else "WATCH"
+    elif get_ai_mode() == "PAPER":
+        action = "PAPER_BUY" if model_action == "BUY" else "WATCH"
+    else:
+        action = "BUY" if model_action == "BUY" else "WATCH"
 
     return {
         "symbol": symbol,
-        "type": "NO_SIGNAL",
-        "action": "WATCH",
-        "timeframe": price_data["timeframe"],
-        "price": round(price, 3),
-        "entry_zone": [round(price * 0.99, 3), round(price * 1.01, 3)],
-        "stop_loss": round(price * 0.97, 3),
-        "target1": round(price * 1.03, 3),
-        "target2": round(price * 1.05, 3),
-        "target3": None,
-        "expected_move_pct": 3,
-        "risk_pct": 3,
-        "rr": 1,
-        "score": 40,
-        "strength": "WEAK",
-        "trend": "MIXED",
-        "support": None,
-        "resistance": None,
-        "rsi": None,
-        "volume_ratio": None,
-        "holding": "Watch only",
-        "reason": "No confirmed AI signal. مراقبة فقط."
+        "type": kind,
+        "mode": get_ai_mode(),
+        "action": action,
+        "model_action": model_action,
+        "timeframe": timeframe,
+        "price": round(entry, 3),
+        "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
+        "stop_loss": round(stop, 3),
+        "target1": round(t1, 3),
+        "target2": round(t2, 3),
+        "target3": round(t3, 3),
+        "target_pct": target_pct,
+        "expected_move_pct": target_pct,
+        "risk_pct": round(risk_pct, 2),
+        "rr": round(rr, 2),
+        "score": round(score, 2),
+        "strength": strength,
+        "trend": trend,
+        "support": round(support, 3) if support else None,
+        "resistance": round(resistance, 3) if resistance else None,
+        "rsi": round(r, 2) if r else None,
+        "volume_ratio": round(volume_ratio, 2),
+        "momentum_pct": round(momentum, 2),
+        "max_hold_days": max_hold_days,
+        "holding": "1 to 5 days" if kind == "SHORT_SWING" else "1 to 4 weeks",
+        "reason": " + ".join(reasons) if reasons else "No strong setup"
+    }
+
+def analyze_symbol(symbol: str):
+    h1 = get_candles(symbol, "60", 220)
+    d1 = get_candles(symbol, "1D", 220)
+    signals = []
+
+    short_sig = build_signal(symbol, "SHORT_SWING", h1, d1)
+    if short_sig:
+        signals.append(short_sig)
+
+    long_sig = build_signal(symbol, "LONG_SWING", d1, d1)
+    if long_sig:
+        signals.append(long_sig)
+
+    return signals
+
+@app.get("/api/ai/analyze")
+def api_analyze(symbol: str):
+    sigs = analyze_symbol(symbol)
+    return {"ok": bool(sigs), "symbol": normalize_symbol(symbol), "signals": sigs}
+
+@app.get("/api/ai/pro-scan")
+def pro_scan(symbol: Optional[str] = None):
+    symbols = [normalize_symbol(symbol)] if symbol else WATCHLIST
+    all_signals = []
+    coverage = []
+
+    for s in symbols:
+        sigs = analyze_symbol(s)
+        has_data = bool(sigs)
+
+        buy_sigs = [x for x in sigs if x["model_action"] == "BUY"]
+        best = max(sigs, key=lambda x: x["score"], default=None)
+
+        coverage.append({
+            "symbol": s,
+            "has_data": has_data,
+            "action": best["action"] if best else "NO_DATA",
+            "model_action": best["model_action"] if best else "NO_DATA",
+            "score": best["score"] if best else None,
+            "strength": best["strength"] if best else None
+        })
+
+        all_signals.extend(buy_sigs)
+
+    all_signals = sorted(all_signals, key=lambda x: (x["score"], x["rr"]), reverse=True)
+
+    return {
+        "mode": get_ai_mode(),
+        "learning_age_days": round(learning_age_days(), 2),
+        "learning_remaining_days": round(learning_remaining_days(), 2),
+        "watchlist_count": len(WATCHLIST),
+        "signals_count": len(all_signals),
+        "signals": all_signals[:15],
+        "coverage": coverage
     }
 
 
-def format_analysis(signal: dict):
-    if not signal:
-        return "❌ لا توجد بيانات كافية لهذا السهم."
+# ============================================================
+# VIRTUAL LEARNING
+# ============================================================
 
-    t3 = signal.get("target3")
-    t3_line = f"\n🎯 Target 3: <b>{t3}</b>" if t3 else ""
+def sig_key(sig):
+    return f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['stop_loss']}"
+
+def record_virtual_signal(sig):
+    key = sig_key(sig)
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO ai_virtual_signals
+            (signal_key,mode,symbol,signal_type,timeframe,action,price,entry_low,entry_high,
+             stop_loss,target1,target2,target3,score,strength,rr,risk_pct,target_pct,max_hold_days,
+             created_at,status,payload)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+        """, (
+            key,sig["mode"],sig["symbol"],sig["type"],sig["timeframe"],sig["action"],
+            sig["price"],sig["entry_zone"][0],sig["entry_zone"][1],sig["stop_loss"],
+            sig["target1"],sig["target2"],sig["target3"],sig["score"],sig["strength"],
+            sig["rr"],sig["risk_pct"],sig["target_pct"],sig["max_hold_days"],utc_now(),json.dumps(sig)
+        ))
+        conn.commit()
+        ok = True
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        ok = False
+    finally:
+        conn.close()
+    return ok
+
+def evaluate_virtual_signals():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
+    rows = cur.fetchall()
+    evaluated = []
+
+    for sig in rows:
+        symbol = sig["symbol"]
+        tf = sig["timeframe"]
+        created = parse_dt(sig["created_at"])
+        candles = get_candles(symbol, tf, 400)
+
+        relevant = []
+        for c in candles:
+            t = parse_dt(c["bar_time"]) or parse_dt(c["received_at"])
+            if created and t and t >= created:
+                relevant.append(c)
+
+        if not relevant:
+            continue
+
+        max_high = max(float(x["high"]) for x in relevant)
+        min_low = min(float(x["low"]) for x in relevant)
+        latest_close = float(relevant[-1]["close"])
+
+        price = float(sig["price"])
+        target1 = float(sig["target1"])
+        stop = float(sig["stop_loss"])
+        max_hold_days = int(sig["max_hold_days"] or 5)
+
+        target_hit = max_high >= target1
+        stop_hit = min_low <= stop
+
+        status = "OPEN"
+        outcome = None
+        ret_pct = ((latest_close - price) / price) * 100
+
+        if target_hit and not stop_hit:
+            status = "CLOSED"; outcome = "TARGET1_HIT"; ret_pct = ((target1 - price) / price) * 100
+        elif stop_hit and not target_hit:
+            status = "CLOSED"; outcome = "STOP_HIT"; ret_pct = ((stop - price) / price) * 100
+        elif target_hit and stop_hit:
+            status = "CLOSED"; outcome = "BOTH_TOUCHED_CONSERVATIVE_STOP"; ret_pct = ((stop - price) / price) * 100
+        elif created and (utc_now_dt() - created) > timedelta(days=max_hold_days):
+            status = "CLOSED"; outcome = "TIME_EXIT"; ret_pct = ((latest_close - price) / price) * 100
+
+        cur.execute("""
+            UPDATE ai_virtual_signals
+            SET max_high=%s,min_low=%s,bars_checked=%s,status=%s,outcome=%s,outcome_at=%s
+            WHERE id=%s
+        """, (max_high,min_low,len(relevant),status,outcome,utc_now() if status=="CLOSED" else None,sig["id"]))
+
+        if status == "CLOSED":
+            update_learning(symbol, ret_pct, sig["signal_type"], is_virtual=True)
+            evaluated.append({"id": sig["id"], "symbol": symbol, "type": sig["signal_type"], "outcome": outcome, "return_pct": round(ret_pct, 2)})
+
+    conn.commit()
+    conn.close()
+    return evaluated
+
+@app.get("/api/ai/learning-scan")
+def learning_scan():
+    scan = pro_scan()
+    created = []
+    for sig in scan["signals"]:
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
+    evaluated = evaluate_virtual_signals()
+    return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
+
+@app.get("/api/ai/readiness")
+def readiness_report(save: bool = False):
+    evaluate_virtual_signals()
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals")
+    total = int(cur.fetchone()["c"])
+
+    cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='CLOSED'")
+    evaluated = int(cur.fetchone()["c"])
+
+    cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE 'TARGET%'")
+    target_hits = int(cur.fetchone()["c"])
+
+    cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'")
+    stop_hits = int(cur.fetchone()["c"])
+
+    cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='OPEN'")
+    open_signals = int(cur.fetchone()["c"])
+
+    cur.execute("""
+        SELECT * FROM ai_learning_stats
+        ORDER BY (virtual_short_wins + virtual_long_wins) DESC, avg_return_pct DESC
+        LIMIT 10
+    """)
+    best = cur.fetchall()
+
+    win_rate = (target_hits / evaluated * 100) if evaluated else 0
+
+    cur.execute("""
+        SELECT avg_return_pct,
+               (virtual_short_count + virtual_long_count + trades_count) AS cnt
+        FROM ai_learning_stats
+        WHERE (virtual_short_count + virtual_long_count + trades_count) > 0
+    """)
+    rows = cur.fetchall()
+
+    total_weight = sum(int(x["cnt"] or 0) for x in rows)
+    avg_return = 0
+    if total_weight:
+        avg_return = sum(float(x["avg_return_pct"] or 0) * int(x["cnt"] or 0) for x in rows) / total_weight
+
+    status = "NEED_MORE_DATA"
+    reasons = []
+    age = learning_age_days()
+
+    if age < LEARNING_DAYS:
+        reasons.append(f"Learning period not completed. Remaining {round(LEARNING_DAYS-age,1)} days.")
+    if evaluated < 20:
+        reasons.append("Not enough evaluated signals. Need at least 20.")
+    if win_rate < 55:
+        reasons.append("Win rate below 55%.")
+    if avg_return <= 0:
+        reasons.append("Average return is not positive yet.")
+
+    if age >= LEARNING_DAYS and evaluated >= 20 and win_rate >= 55 and avg_return > 0:
+        status = "READY_FOR_PAPER"
+        reasons.append("Ready for PAPER mode, not full live size yet.")
+
+    conn.close()
+
+    return {
+        "mode": get_ai_mode(),
+        "status": status,
+        "learning_age_days": round(age, 2),
+        "learning_days_required": LEARNING_DAYS,
+        "total_signals": total,
+        "evaluated_signals": evaluated,
+        "target_hits": target_hits,
+        "stop_hits": stop_hits,
+        "open_signals": open_signals,
+        "win_rate": round(win_rate, 2),
+        "avg_return_pct": round(avg_return, 2),
+        "best_stats": best,
+        "reasons": reasons
+    }
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def tg_api(method, payload):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}
+    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", json=payload, timeout=20)
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": r.ok, "text": r.text}
+
+def tg_send(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_api("sendMessage", payload)
+
+def tg_main_send(text, reply_markup=None):
+    if not TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "TELEGRAM_CHAT_ID missing"}
+    return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
+
+def signal_keyboard(symbol):
+    buttons = [[{"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}, {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}]]
+    if get_ai_mode() != "LEARNING":
+        buttons.insert(0, [{"text": "â Ø¯Ø®ÙØª Ø§ÙØµÙÙØ©", "callback_data": f"enter:{symbol}"}])
+    return {"inline_keyboard": buttons}
+
+def format_signal(sig):
+    mode_note = ""
+    if sig["mode"] == "LEARNING":
+        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
+    elif sig["mode"] == "PAPER":
+        mode_note = "\nð§ª <b>PAPER MODE:</b> ØªÙØµÙØ© ØªØ¬Ø±ÙØ¨ÙØ©."
 
     return f"""
-📊 <b>{signal['symbol']} AI Analysis</b>
+ð <b>{sig['symbol']} PRO AI V3</b>
 
-<b>Action:</b> {signal.get('action')}
-<b>Type:</b> {signal.get('type')}
-<b>Strength:</b> {signal.get('strength')}
-<b>Score:</b> {signal.get('score')}
+<b>Type:</b> {sig['type']}
+<b>Mode:</b> {sig['mode']}
+<b>Action:</b> {sig['action']}
+<b>Model:</b> {sig['model_action']}
+<b>Strength:</b> {sig['strength']}
+<b>Score:</b> {sig['score']}
 
-💰 <b>Price:</b> {signal.get('price')}
-📍 <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
-🛑 <b>Stop:</b> {signal.get('stop_loss')}
+ð° Price: <b>{sig['price']}</b>
+ð Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
+ð Stop: <b>{sig['stop_loss']}</b>
 
-🎯 Target 1: <b>{signal.get('target1')}</b>
-🎯 Target 2: <b>{signal.get('target2')}</b>{t3_line}
+ð¯ Target 1: <b>{sig['target1']}</b>
+ð¯ Target 2: <b>{sig['target2']}</b>
+ð¯ Target 3: <b>{sig['target3']}</b>
 
-📈 Expected Move: <b>{signal.get('expected_move_pct')}%</b>
-⚖️ Risk: <b>{signal.get('risk_pct')}%</b>
-📐 R/R: <b>{signal.get('rr')}</b>
+ð Expected: <b>{sig['expected_move_pct']}%</b>
+âï¸ Risk: <b>{sig['risk_pct']}%</b>
+ð RR: <b>{sig['rr']}</b>
 
-⏱ Timeframe: <b>{signal.get('timeframe')}</b>
-🕒 Holding: <b>{signal.get('holding')}</b>
+RSI: {sig['rsi']}
+Volume Ratio: {sig['volume_ratio']}
+Trend: {sig['trend']}
 
-📌 Reason:
-{signal.get('reason')}
+ð {esc(sig['reason'])}
+{mode_note}
 
 Dashboard:
 {DASHBOARD_URL}
 """.strip()
 
+def format_readiness(rep):
+    return f"""
+ð§  <b>AI Readiness Report</b>
 
-def analysis_keyboard(symbol: str):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ دخلت الصفقة", "callback_data": f"enter:{symbol}"},
-                {"text": "📊 تحليل أكثر", "callback_data": f"more:{symbol}"}
-            ],
-            [
-                {"text": "👀 تجاهل", "callback_data": f"ignore:{symbol}"}
-            ]
-        ]
-    }
+Mode: <b>{rep['mode']}</b>
+Status: <b>{rep['status']}</b>
 
+Learning Age: {rep['learning_age_days']} days
+Required: {rep['learning_days_required']} days
 
-def amount_keyboard(symbol: str):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "20,000", "callback_data": f"amt:{symbol}:20000"},
-                {"text": "40,000", "callback_data": f"amt:{symbol}:40000"}
-            ],
-            [
-                {"text": "80,000", "callback_data": f"amt:{symbol}:80000"},
-                {"text": "مبلغ يدوي", "callback_data": f"amtmanual:{symbol}"}
-            ]
-        ]
-    }
+Total Signals: {rep['total_signals']}
+Evaluated: {rep['evaluated_signals']}
+Open: {rep['open_signals']}
 
+Target Hits: {rep['target_hits']}
+Stop Hits: {rep['stop_hits']}
+Win Rate: {rep['win_rate']}%
+Avg Return: {rep['avg_return_pct']}%
 
-def price_keyboard(symbol: str):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "سعر السوق", "callback_data": f"price:{symbol}:market"},
-                {"text": "منتصف الدخول", "callback_data": f"price:{symbol}:mid"}
-            ],
-            [
-                {"text": "سعر يدوي", "callback_data": f"pricemanual:{symbol}"}
-            ]
-        ]
-    }
+Reasons:
+- {"; ".join(rep['reasons']) if rep['reasons'] else "No issues"}
+""".strip()
 
-
-def trade_keyboard(trade_id: int):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "💰 بيع كامل", "callback_data": f"sell:{trade_id}:full"},
-                {"text": "🟡 استمرار", "callback_data": f"hold:{trade_id}"}
-            ]
-        ]
-    }
-
-
-def set_session(chat_id, state, symbol=None, amount=None, entry_price=None, payload=None):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO telegram_sessions
-        (chat_id, state, symbol, amount, entry_price, payload, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (chat_id)
-        DO UPDATE SET
-            state = EXCLUDED.state,
-            symbol = EXCLUDED.symbol,
-            amount = EXCLUDED.amount,
-            entry_price = EXCLUDED.entry_price,
-            payload = EXCLUDED.payload,
-            updated_at = EXCLUDED.updated_at
-    """, (
-        str(chat_id),
-        state,
-        symbol,
-        amount,
-        entry_price,
-        json.dumps(payload) if payload else None,
-        datetime.utcnow().isoformat()
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_session(chat_id):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *
-        FROM telegram_sessions
-        WHERE chat_id = %s
-    """, (str(chat_id),))
-
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def clear_session(chat_id):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM telegram_sessions WHERE chat_id = %s", (str(chat_id),))
-    conn.commit()
-    conn.close()
-
-
-def open_telegram_trade(chat_id, symbol, entry_price, amount):
-    symbol = normalize_symbol(symbol)
-    signal = ai_symbol_analysis(symbol)
-
-    qty = amount / entry_price if entry_price else 0
+@app.get("/api/ai/send-alerts")
+def send_alerts(force: bool = False, dry_run: bool = False):
+    scan = pro_scan()
+    sent, skipped = [], []
 
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO telegram_trades
-        (chat_id, symbol, status, entry_price, amount, qty,
-         stop_loss, target1, target2, target3,
-         signal_score, signal_strength, signal_type, signal_payload,
-         opened_at)
-        VALUES (%s, %s, 'OPEN', %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s)
-        RETURNING id
-    """, (
-        str(chat_id),
-        symbol,
-        entry_price,
-        amount,
-        qty,
-        signal.get("stop_loss") if signal else None,
-        signal.get("target1") if signal else None,
-        signal.get("target2") if signal else None,
-        signal.get("target3") if signal else None,
-        signal.get("score") if signal else None,
-        signal.get("strength") if signal else None,
-        signal.get("type") if signal else None,
-        json.dumps(signal) if signal else None,
-        datetime.utcnow().isoformat()
-    ))
+    for sig in scan["signals"][:5]:
+        key = f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['mode']}"
 
-    trade_id = cur.fetchone()[0]
+        if not force:
+            cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
+            if cur.fetchone():
+                skipped.append({"symbol": sig["symbol"], "type": sig["type"], "reason": "duplicate_alert"})
+                continue
 
-    cur.execute("""
-        INSERT INTO telegram_trade_events
-        (trade_id, chat_id, symbol, event_type, event_time, price, note, payload)
-        VALUES (%s, %s, %s, 'BUY', %s, %s, %s, %s)
-    """, (
-        trade_id,
-        str(chat_id),
-        symbol,
-        datetime.utcnow().isoformat(),
-        entry_price,
-        f"Opened via Telegram amount={amount}",
-        json.dumps(signal) if signal else None
-    ))
+        if not dry_run:
+            tg_main_send(format_signal(sig), signal_keyboard(sig["symbol"]))
 
-    conn.commit()
-    conn.close()
-
-    return trade_id, qty, signal
-
-
-def close_telegram_trade(chat_id, symbol=None, exit_price=None, trade_id=None):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    if trade_id:
         cur.execute("""
-            SELECT *
-            FROM telegram_trades
-            WHERE id = %s AND chat_id = %s AND status = 'OPEN'
-        """, (trade_id, str(chat_id)))
-    else:
-        cur.execute("""
-            SELECT *
-            FROM telegram_trades
-            WHERE chat_id = %s
-              AND symbol = %s
-              AND status = 'OPEN'
-            ORDER BY id DESC
-            LIMIT 1
-        """, (str(chat_id), normalize_symbol(symbol)))
+            INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
+            VALUES(%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+        """, (key, sig["symbol"], sig["type"], utc_now(), json.dumps(sig)))
 
-    trade = cur.fetchone()
-
-    if not trade:
-        conn.close()
-        return None
-
-    if exit_price is None:
-        p = latest_price(trade["symbol"])
-        exit_price = p["price"] if p else trade["entry_price"]
-
-    pnl = (exit_price - trade["entry_price"]) * trade["qty"]
-    pnl_pct = ((exit_price - trade["entry_price"]) / trade["entry_price"]) * 100 if trade["entry_price"] else 0
-
-    closed_at = datetime.utcnow().isoformat()
-
-    cur.execute("""
-        UPDATE telegram_trades
-        SET status = 'CLOSED',
-            exit_price = %s,
-            closed_at = %s,
-            pnl = %s,
-            pnl_pct = %s,
-            close_note = %s
-        WHERE id = %s
-    """, (
-        exit_price,
-        closed_at,
-        pnl,
-        pnl_pct,
-        "Closed via Telegram",
-        trade["id"]
-    ))
-
-    cur.execute("""
-        INSERT INTO telegram_trade_events
-        (trade_id, chat_id, symbol, event_type, event_time, price, note)
-        VALUES (%s, %s, %s, 'SELL', %s, %s, %s)
-    """, (
-        trade["id"],
-        str(chat_id),
-        trade["symbol"],
-        closed_at,
-        exit_price,
-        "Closed via Telegram"
-    ))
-
-    result_label = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "FLAT"
-
-    cur.execute("""
-        INSERT INTO ai_trade_feedback
-        (trade_id, symbol, signal_type,
-         predicted_entry, predicted_stop, predicted_target1,
-         actual_entry, actual_exit, actual_return_pct,
-         result_label, opened_at, closed_at, payload)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        trade["id"],
-        trade["symbol"],
-        trade["signal_type"],
-        trade["entry_price"],
-        trade["stop_loss"],
-        trade["target1"],
-        trade["entry_price"],
-        exit_price,
-        pnl_pct,
-        result_label,
-        trade["opened_at"],
-        closed_at,
-        json.dumps(dict(trade))
-    ))
+        sent.append({"symbol": sig["symbol"], "type": sig["type"]})
 
     conn.commit()
     conn.close()
 
-    return {
-        "trade_id": trade["id"],
-        "symbol": trade["symbol"],
-        "entry": trade["entry_price"],
-        "exit": exit_price,
-        "amount": trade["amount"],
-        "qty": trade["qty"],
-        "pnl": pnl,
-        "pnl_pct": pnl_pct,
-        "result": result_label
-    }
+    return {"mode": get_ai_mode(), "dry_run": dry_run, "sent_count": len(sent), "skipped_count": len(skipped), "sent": sent, "skipped": skipped}
 
-
-def open_trades_report(chat_id):
+@app.get("/api/ai/reset-alerts")
+def reset_alerts():
     conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    cur.execute("""
-        SELECT *
-        FROM telegram_trades
-        WHERE chat_id = %s
-          AND status = 'OPEN'
-        ORDER BY id DESC
-    """, (str(chat_id),))
-
-    trades = cur.fetchall()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ai_alerts_log")
+    conn.commit()
     conn.close()
-
-    if not trades:
-        return "لا توجد صفقات مفتوحة حالياً."
-
-    messages = []
-
-    for t in trades:
-        p = latest_price(t["symbol"])
-        current = p["price"] if p else t["entry_price"]
-
-        pnl = (current - t["entry_price"]) * t["qty"]
-        pnl_pct = ((current - t["entry_price"]) / t["entry_price"]) * 100 if t["entry_price"] else 0
-
-        status = "HOLD"
-        if t["target1"] and current >= t["target1"]:
-            status = "🎯 Target 1 reached"
-        elif t["stop_loss"] and current <= t["stop_loss"]:
-            status = "⚠️ Stop touched"
-        elif pnl_pct > 2:
-            status = "🟢 Profit running"
-        elif pnl_pct < -1.5:
-            status = "🔴 Risk warning"
-
-        messages.append(f"""
-📌 <b>{t['symbol']}</b>
-Entry: {round(t['entry_price'], 3)}
-Current: {round(current, 3)}
-Amount: {round(t['amount'], 2)}
-PnL: {round(pnl, 2)} AED ({round(pnl_pct, 2)}%)
-Status: {status}
-Stop: {t['stop_loss']}
-Target1: {t['target1']}
-""".strip())
-
-    return "\n\n".join(messages)
-
-
-def parse_buy_text(text):
-    parts = text.replace("،", " ").split()
-    if len(parts) < 4:
-        return None
-
-    # دخلت EMAAR 11.22 40000
-    symbol = parts[1].upper()
-    price = float(parts[2])
-    amount = float(parts[3])
-
-    return symbol, price, amount
-
-
-def parse_sell_text(text):
-    parts = text.replace("،", " ").split()
-    if len(parts) < 4:
-        return None
-
-    # بعت EMAAR على 11.40
-    symbol = parts[1].upper()
-    price = float(parts[-1])
-
-    return symbol, price
-
-
-def looks_like_symbol(text):
-    t = text.strip().upper()
-    return t.isalnum() and 2 <= len(t) <= 15
-
-
-def handle_text_message(chat_id, text):
-    ensure_telegram_tables()
-
-    raw = text.strip()
-    upper = raw.upper()
-
-    session = get_session(chat_id)
-
-    if raw in ["/start", "start", "Hello", "hello", "هلا", "مرحبا"]:
-        return tg_send_message(
-            chat_id,
-            "أهلاً 👋\nاكتب رمز السهم مثل EMAAR أو استخدم:\n\nدخلت EMAAR 11.22 40000\nبعت EMAAR 11.40\nصفقاتي\nمراقبة"
-        )
-
-    if upper in ["صفقاتي", "مراقبة", "TRADES", "MONITOR"]:
-        return tg_send_message(chat_id, open_trades_report(chat_id))
-
-    if session and session["state"] == "WAIT_AMOUNT":
-        try:
-            amount = float(raw.replace(",", ""))
-            symbol = session["symbol"]
-            set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-            return tg_send_message(chat_id, f"تمام. المبلغ {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
-        except Exception:
-            return tg_send_message(chat_id, "اكتب المبلغ بالأرقام فقط، مثال: 40000")
-
-    if session and session["state"] == "WAIT_PRICE":
-        try:
-            price = float(raw.replace(",", ""))
-            symbol = session["symbol"]
-            amount = float(session["amount"])
-            trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
-            clear_session(chat_id)
-
-            return tg_send_message(
-                chat_id,
-                f"""
-✅ تم تسجيل الصفقة
-
-Trade ID: {trade_id}
-Symbol: {symbol}
-Entry: {price}
-Amount: {amount}
-Qty: {round(qty, 2)}
-
-Stop: {signal.get('stop_loss') if signal else '-'}
-Target1: {signal.get('target1') if signal else '-'}
-Target2: {signal.get('target2') if signal else '-'}
-
-سأتابع الصفقة معك.
-""".strip()
-            )
-        except Exception:
-            return tg_send_message(chat_id, "اكتب سعر الدخول بالأرقام فقط، مثال: 11.22")
-
-    if upper.startswith("دخلت"):
-        try:
-            parsed = parse_buy_text(raw)
-            if not parsed:
-                return tg_send_message(chat_id, "الصيغة:\nدخلت EMAAR 11.22 40000")
-
-            symbol, price, amount = parsed
-            trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
-
-            return tg_send_message(
-                chat_id,
-                f"""
-✅ تم تسجيل الصفقة
-
-Trade ID: {trade_id}
-Symbol: {symbol}
-Entry: {price}
-Amount: {amount}
-Qty: {round(qty, 2)}
-
-Stop: {signal.get('stop_loss') if signal else '-'}
-Target1: {signal.get('target1') if signal else '-'}
-Target2: {signal.get('target2') if signal else '-'}
-
-سأتابع الصفقة معك.
-""".strip()
-            )
-        except Exception as e:
-            return tg_send_message(chat_id, f"لم أستطع تسجيل الصفقة.\nالصيغة:\nدخلت EMAAR 11.22 40000")
-
-    if upper.startswith("بعت"):
-        try:
-            parsed = parse_sell_text(raw)
-            if not parsed:
-                return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
-
-            symbol, price = parsed
-            result = close_telegram_trade(chat_id, symbol=symbol, exit_price=price)
-
-            if not result:
-                return tg_send_message(chat_id, "ما حصلت صفقة مفتوحة لهذا السهم.")
-
-            return tg_send_message(
-                chat_id,
-                f"""
-📉 تم إغلاق الصفقة
-
-Symbol: {result['symbol']}
-Entry: {round(result['entry'], 3)}
-Exit: {round(result['exit'], 3)}
-
-PnL: {round(result['pnl'], 2)} AED
-Return: {round(result['pnl_pct'], 2)}%
-Result: {result['result']}
-
-تم حفظ النتيجة للتعلم.
-""".strip()
-            )
-        except Exception:
-            return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
-
-    if upper.startswith("حلل"):
-        parts = upper.split()
-        if len(parts) >= 2:
-            symbol = normalize_symbol(parts[1])
-            signal = ai_symbol_analysis(symbol)
-            return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
-
-    if looks_like_symbol(upper):
-        symbol = normalize_symbol(upper)
-        signal = ai_symbol_analysis(symbol)
-        return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
-
-    return tg_send_message(chat_id, "اكتب رمز سهم مثل EMAAR أو:\nصفقاتي\nمراقبة\nدخلت EMAAR 11.22 40000")
-
-
-def handle_callback(chat_id, callback_id, data):
-    ensure_telegram_tables()
-
-    parts = data.split(":")
-    action = parts[0]
-
-    tg_answer_callback(callback_id)
-
-    if action == "more":
-        symbol = parts[1]
-        signal = ai_symbol_analysis(symbol)
-        return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
-
-    if action == "ignore":
-        return tg_send_message(chat_id, "تم تجاهل الإشارة 👀")
-
-    if action == "enter":
-        symbol = parts[1]
-        set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, f"اختر مبلغ الدخول لـ {symbol}:", amount_keyboard(symbol))
-
-    if action == "amt":
-        symbol = parts[1]
-        amount = float(parts[2])
-        set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
-        return tg_send_message(chat_id, f"المبلغ: {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
-
-    if action == "amtmanual":
-        symbol = parts[1]
-        set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
-        return tg_send_message(chat_id, "اكتب المبلغ بالأرقام، مثال: 40000")
-
-    if action == "price":
-        symbol = parts[1]
-        mode = parts[2]
-        session = get_session(chat_id)
-
-        if not session or not session["amount"]:
-            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
-
-        amount = float(session["amount"])
-        signal = ai_symbol_analysis(symbol)
-
-        if mode == "market":
-            p = latest_price(symbol)
-            entry = p["price"] if p else signal.get("price")
-        else:
-            zone = signal.get("entry_zone")
-            entry = (zone[0] + zone[1]) / 2 if zone else signal.get("price")
-
-        trade_id, qty, signal = open_telegram_trade(chat_id, symbol, float(entry), amount)
-        clear_session(chat_id)
-
-        return tg_send_message(
-            chat_id,
-            f"""
-✅ تم تسجيل الصفقة
-
-Trade ID: {trade_id}
-Symbol: {symbol}
-Entry: {round(entry, 3)}
-Amount: {amount}
-Qty: {round(qty, 2)}
-
-Stop: {signal.get('stop_loss')}
-Target1: {signal.get('target1')}
-Target2: {signal.get('target2')}
-
-سأتابع الصفقة معك.
-""".strip()
-        )
-
-    if action == "pricemanual":
-        symbol = parts[1]
-        session = get_session(chat_id)
-
-        if not session or not session["amount"]:
-            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
-
-        set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=session["amount"])
-        return tg_send_message(chat_id, "اكتب سعر الدخول، مثال: 11.22")
-
-    if action == "sell":
-        trade_id = int(parts[1])
-        result = close_telegram_trade(chat_id, trade_id=trade_id)
-
-        if not result:
-            return tg_send_message(chat_id, "ما حصلت الصفقة أو تم إغلاقها سابقاً.")
-
-        return tg_send_message(
-            chat_id,
-            f"""
-💰 تم البيع
-
-Symbol: {result['symbol']}
-Entry: {round(result['entry'], 3)}
-Exit: {round(result['exit'], 3)}
-
-PnL: {round(result['pnl'], 2)} AED
-Return: {round(result['pnl_pct'], 2)}%
-Result: {result['result']}
-
-تم حفظ النتيجة للتعلم.
-""".strip()
-        )
-
-    if action == "hold":
-        return tg_send_message(chat_id, "تمام، بنستمر في مراقبة الصفقة.")
-
-    return tg_send_message(chat_id, "أمر غير معروف.")
-
+    return {"ok": True}
+
+@app.get("/api/ai/send-readiness")
+def send_readiness():
+    rep = readiness_report()
+    return tg_main_send(format_readiness(rep))
 
 @app.get("/api/telegram/set-webhook")
-def set_telegram_webhook():
-    webhook_url = f"https://uae-market-production.up.railway.app/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+def set_webhook():
+    webhook_url = f"{BASE_URL}/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
     return tg_api("setWebhook", {"url": webhook_url})
-
 
 @app.post("/api/telegram/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
@@ -3483,94 +1169,120 @@ async def telegram_webhook(secret: str, request: Request):
     data = await request.json()
 
     try:
-        if "callback_query" in data:
-            cq = data["callback_query"]
-            chat_id = cq["message"]["chat"]["id"]
-            callback_id = cq["id"]
-            callback_data = cq["data"]
-            handle_callback(chat_id, callback_id, callback_data)
-
-        elif "message" in data:
+        if "message" in data:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
-            text = msg.get("text", "")
-            handle_text_message(chat_id, text)
+            text = msg.get("text", "").strip()
+            upper = text.upper()
+
+            if upper in ["Ø¬Ø§ÙØ²ÙØ©", "READINESS"]:
+                return tg_send(chat_id, format_readiness(readiness_report()))
+
+            if upper.startswith("Ø­ÙÙ"):
+                parts = upper.split()
+                if len(parts) >= 2:
+                    sigs = analyze_symbol(parts[1])
+                    if sigs:
+                        best = max(sigs, key=lambda x: x["score"])
+                        return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
+                    return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+
+            if upper in WATCHLIST:
+                sigs = analyze_symbol(upper)
+                if sigs:
+                    best = max(sigs, key=lambda x: x["score"])
+                    return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
+                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ.")
+
+            return tg_send(chat_id, "Ø§ÙØªØ¨ Ø±ÙØ² Ø³ÙÙ ÙØ«Ù EMAAR Ø£Ù:\nØ­ÙÙ EMAAR\nØ¬Ø§ÙØ²ÙØ©")
+
+        if "callback_query" in data:
+            cq = data["callback_query"]
+            callback_id = cq["id"]
+            chat_id = cq["message"]["chat"]["id"]
+            callback_data = cq["data"]
+            tg_api("answerCallbackQuery", {"callback_query_id": callback_id})
+
+            parts = callback_data.split(":")
+            action = parts[0]
+
+            if action == "more":
+                sigs = analyze_symbol(parts[1])
+                if sigs:
+                    best = max(sigs, key=lambda x: x["score"])
+                    return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
+                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+
+            if action == "ignore":
+                return tg_send(chat_id, "ØªÙ ØªØ¬Ø§ÙÙ Ø§ÙØ¥Ø´Ø§Ø±Ø© ð")
 
     except Exception as e:
-        print("Telegram webhook error:", str(e))
+        print("Telegram error:", str(e))
 
     return {"ok": True}
 
 
-@app.get("/api/telegram/trades")
-def api_telegram_trades(chat_id: str, status: str = "OPEN"):
-    ensure_telegram_tables()
+# ============================================================
+# DASHBOARD
+# ============================================================
 
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    scan = pro_scan()
+    rep = readiness_report()
 
-    cur.execute("""
-        SELECT *
-        FROM telegram_trades
-        WHERE chat_id = %s
-          AND status = %s
-        ORDER BY id DESC
-    """, (str(chat_id), status))
+    signal_rows = ""
+    for s in scan["signals"]:
+        signal_rows += f"""
+        <tr>
+            <td>{s['symbol']}</td><td>{s['type']}</td><td>{s['action']}</td><td>{s['strength']}</td>
+            <td>{s['score']}</td><td>{s['price']}</td><td>{s['entry_zone'][0]} - {s['entry_zone'][1]}</td>
+            <td>{s['stop_loss']}</td><td>{s['target1']} / {s['target2']}</td><td>{s['rr']}</td>
+        </tr>
+        """
 
-    rows = cur.fetchall()
-    conn.close()
+    coverage_rows = ""
+    for x in scan["coverage"]:
+        coverage_rows += f"""
+        <tr>
+            <td>{x['symbol']}</td><td>{'â' if x['has_data'] else 'â'}</td>
+            <td>{x['action']}</td><td>{x['model_action']}</td><td>{x['score']}</td><td>{x['strength']}</td>
+        </tr>
+        """
 
-    return {
-        "count": len(rows),
-        "trades": rows
-    }
+    return f"""
+    <html>
+    <head>
+        <title>UAE PRO AI V3</title>
+        <style>
+            body {{ font-family: Arial; background:#111827; color:#e5e7eb; padding:20px; }}
+            .card {{ background:#1f2937; padding:16px; border-radius:12px; margin-bottom:18px; }}
+            table {{ width:100%; border-collapse:collapse; margin-bottom:25px; }}
+            th,td {{ border-bottom:1px solid #374151; padding:10px; text-align:left; white-space:nowrap; }}
+            h1,h2 {{ color:#a78bfa; }}
+        </style>
+    </head>
+    <body>
+        <h1>UAE PRO AI V3 - Learning Mode</h1>
+        <div class="card">
+            Mode: <b>{scan['mode']}</b><br>
+            Readiness: <b>{rep['status']}</b><br>
+            Learning Age: {rep['learning_age_days']} days / {rep['learning_days_required']} days<br>
+            Signals: {scan['signals_count']}<br>
+            Win Rate: {rep['win_rate']}% | Avg Return: {rep['avg_return_pct']}%
+        </div>
 
-from fastapi import FastAPI
+        <h2>Top Signals</h2>
+        <table>
+            <tr><th>Symbol</th><th>Type</th><th>Action</th><th>Strength</th><th>Score</th><th>Price</th><th>Entry</th><th>Stop</th><th>Targets</th><th>RR</th></tr>
+            {signal_rows}
+        </table>
 
-app = FastAPI()
-
-@app.get("/")
-
-def home():
-
-    return {"status": "UAE AI Running 🚀"}
-
-@app.get("/api/health")
-
-def health():
-
-    return {"ok": True}
-
-@app.get("/api/watchlist")
-
-def watchlist():
-
-    return {
-
-        "count": 53,
-
-        "stocks": ["EMAAR", "DEWA", "SALIK"]  # مثال
-
-    }
-
-@app.get("/api/ai/pro-scan")
-
-def pro_scan():
-
-    return {
-
-        "mode": "PRO",
-
-        "signals": [
-
-            {"symbol": "EMAAR", "action": "BUY"}
-
-        ]
-
-    }
-
-@app.get("/api/ai/send-alerts")
-
-def send_alerts():
-
-    return {"sent": True}
+        <h2>Coverage</h2>
+        <table>
+            <tr><th>Symbol</th><th>Data</th><th>Action</th><th>Model</th><th>Score</th><th>Strength</th></tr>
+            {coverage_rows}
+        </table>
+    </body>
+    </html>
+    """
