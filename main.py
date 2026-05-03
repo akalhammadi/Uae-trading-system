@@ -10,16 +10,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
 
-# ============================================================
-# UAE MARKET PRO AI V3 - LEARNING MODE
-# Short Swing: 1H, Target 3% - 5%, holding 1-5 days
-# Long Swing: 1D, Target 7% - 15%, holding 1-4 weeks
-# ============================================================
-
-app = FastAPI(title="UAE Market PRO AI V3")
+app = FastAPI(title="UAE Market PRO AI V3 Complete")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET = os.getenv("SECRET", "abc123")
+CRON_SECRET = os.getenv("CRON_SECRET", "cron123")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -30,6 +25,7 @@ DASHBOARD_URL = os.getenv("DASHBOARD_URL", f"{BASE_URL}/dashboard")
 
 AI_MODE = os.getenv("AI_MODE", "LEARNING").upper().strip()
 LEARNING_DAYS = int(os.getenv("LEARNING_DAYS", "14"))
+CAPITAL = float(os.getenv("CAPITAL", "200000"))
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
@@ -94,7 +90,7 @@ def esc(x) -> str:
 
 
 # ============================================================
-# DB INIT
+# DATABASE
 # ============================================================
 
 def init_db():
@@ -125,10 +121,22 @@ def init_db():
         )
     """)
 
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_id ON candles(symbol, timeframe, id DESC)")
+
     cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_id
-        ON candles(symbol, timeframe, id DESC)
+        CREATE TABLE IF NOT EXISTS ai_scan_results (
+            id SERIAL PRIMARY KEY,
+            scan_type TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            watchlist_count INTEGER,
+            scanned_count INTEGER,
+            signals_count INTEGER,
+            payload TEXT
+        )
     """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_scan_results_type_id ON ai_scan_results(scan_type, id DESC)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_alerts_log (
@@ -214,26 +222,6 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS ai_trade_feedback (
-            id SERIAL PRIMARY KEY,
-            trade_id INTEGER,
-            symbol TEXT NOT NULL,
-            signal_type TEXT,
-            predicted_entry DOUBLE PRECISION,
-            predicted_stop DOUBLE PRECISION,
-            predicted_target1 DOUBLE PRECISION,
-            predicted_target2 DOUBLE PRECISION,
-            actual_entry DOUBLE PRECISION,
-            actual_exit DOUBLE PRECISION,
-            actual_return_pct DOUBLE PRECISION,
-            result_label TEXT,
-            opened_at TEXT,
-            closed_at TEXT,
-            payload TEXT
-        )
-    """)
-
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_learning_stats (
             symbol TEXT PRIMARY KEY,
             trades_count INTEGER DEFAULT 0,
@@ -301,17 +289,19 @@ def learning_remaining_days():
 
 
 # ============================================================
-# BASIC API
+# BASIC ROUTES
 # ============================================================
 
 @app.get("/")
 def home():
     return {
-        "status": "UAE PRO AI V3 Running",
+        "status": "UAE PRO AI V3 Complete Running",
         "mode": get_ai_mode(),
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST)
+        "watchlist_count": len(WATCHLIST),
+        "scan_policy": "hourly + daily only",
+        "capital": CAPITAL,
     }
 
 @app.get("/api/health")
@@ -328,7 +318,7 @@ def api_mode():
         "mode": get_ai_mode(),
         "learning_days": LEARNING_DAYS,
         "learning_age_days": round(learning_age_days(), 2),
-        "learning_remaining_days": round(learning_remaining_days(), 2)
+        "learning_remaining_days": round(learning_remaining_days(), 2),
     }
 
 @app.get("/api/system/set-mode")
@@ -551,7 +541,6 @@ def update_learning(symbol: str, ret_pct: float, signal_type: str, is_virtual: b
         total_losses = losses + vsl + vll
         closed = total_wins + total_losses
         win_rate = total_wins / closed if closed else 0
-
         score_adj = max(-15, min(15, (win_rate - 0.5) * 30 + avg_return))
 
         cur.execute("""
@@ -587,7 +576,7 @@ def update_learning(symbol: str, ret_pct: float, signal_type: str, is_virtual: b
 
 
 # ============================================================
-# SMART STOPS
+# POSITION SIZING + STOPS
 # ============================================================
 
 def smart_stop(entry, entry_low, support, atr_value, kind):
@@ -625,9 +614,33 @@ def smart_stop(entry, entry_low, support, atr_value, kind):
 
     return stop
 
+def position_sizing(entry, stop, kind):
+    risk_pct_per_trade = 0.01 if kind == "SHORT_SWING" else 0.015
+    max_position_pct = 0.18 if kind == "SHORT_SWING" else 0.25
+
+    risk_per_share = max(entry - stop, 0)
+    max_risk_aed = CAPITAL * risk_pct_per_trade
+
+    if risk_per_share <= 0:
+        return {"qty": 0, "position_value": 0, "max_risk_aed": round(max_risk_aed, 2)}
+
+    qty_by_risk = max_risk_aed / risk_per_share
+    max_position_value = CAPITAL * max_position_pct
+    qty_by_cap = max_position_value / entry
+
+    qty = max(0, min(qty_by_risk, qty_by_cap))
+    position_value = qty * entry
+
+    return {
+        "qty": round(qty, 2),
+        "position_value": round(position_value, 2),
+        "max_risk_aed": round(max_risk_aed, 2),
+        "max_position_value": round(max_position_value, 2)
+    }
+
 
 # ============================================================
-# ANALYSIS: SHORT + LONG
+# ANALYSIS SHORT/LONG
 # ============================================================
 
 def daily_trend_score(d1):
@@ -665,8 +678,7 @@ def build_signal(symbol, kind, candles, d1):
     volume_ratio = volumes[-1] / avg_vol if avg_vol else 1
     momentum = recent_momentum(candles, 8 if kind == "SHORT_SWING" else 15)
 
-    trend, dscore = daily_trend_score(d1)
-
+    trend, _ = daily_trend_score(d1)
     score = 0
     reasons = []
 
@@ -679,32 +691,27 @@ def build_signal(symbol, kind, candles, d1):
     if ema20_v and price > ema20_v:
         score += 8
         reasons.append("Price above EMA20")
-
     if trend == "UP":
         score += 22 if kind == "SHORT_SWING" else 28
         reasons.append("Daily trend positive")
     elif trend == "MIXED":
         score += 8
         reasons.append("Daily trend mixed")
-
     if r is not None and 45 <= r <= 68:
         score += 14
         reasons.append("RSI healthy")
     elif r is not None and 68 < r <= 75:
         score += 5
         reasons.append("RSI extended")
-
     if volume_ratio >= 1.4:
         score += 15
         reasons.append("Strong volume")
     elif volume_ratio >= 1.15:
         score += 8
         reasons.append("Volume improving")
-
     if resistance and price >= resistance * 0.985:
         score += 8
         reasons.append("Near breakout zone")
-
     if momentum > (1.0 if kind == "SHORT_SWING" else 2.5):
         score += 8
         reasons.append("Positive momentum")
@@ -735,20 +742,22 @@ def build_signal(symbol, kind, candles, d1):
     rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
 
     strength = "VERY STRONG" if score >= 85 else "STRONG" if score >= 70 else "MEDIUM" if score >= 55 else "WEAK"
-
     model_action = "BUY" if score >= 70 and rr >= 0.9 and (risk_pct <= (4.5 if kind == "SHORT_SWING" else 11)) else "WATCH"
 
-    if get_ai_mode() == "LEARNING":
+    mode = get_ai_mode()
+    if mode == "LEARNING":
         action = "LEARN_SIGNAL" if model_action == "BUY" else "WATCH"
-    elif get_ai_mode() == "PAPER":
+    elif mode == "PAPER":
         action = "PAPER_BUY" if model_action == "BUY" else "WATCH"
     else:
         action = "BUY" if model_action == "BUY" else "WATCH"
 
+    sizing = position_sizing(entry, stop, kind)
+
     return {
         "symbol": symbol,
         "type": kind,
-        "mode": get_ai_mode(),
+        "mode": mode,
         "action": action,
         "model_action": model_action,
         "timeframe": timeframe,
@@ -772,64 +781,116 @@ def build_signal(symbol, kind, candles, d1):
         "momentum_pct": round(momentum, 2),
         "max_hold_days": max_hold_days,
         "holding": "1 to 5 days" if kind == "SHORT_SWING" else "1 to 4 weeks",
+        "position_sizing": sizing,
         "reason": " + ".join(reasons) if reasons else "No strong setup"
     }
 
-def analyze_symbol(symbol: str):
+def analyze_symbol(symbol: str, scan_type: str = "ALL"):
     h1 = get_candles(symbol, "60", 220)
     d1 = get_candles(symbol, "1D", 220)
     signals = []
-
-    short_sig = build_signal(symbol, "SHORT_SWING", h1, d1)
-    if short_sig:
-        signals.append(short_sig)
-
-    long_sig = build_signal(symbol, "LONG_SWING", d1, d1)
-    if long_sig:
-        signals.append(long_sig)
-
+    if scan_type in ["ALL", "HOURLY"]:
+        short_sig = build_signal(symbol, "SHORT_SWING", h1, d1)
+        if short_sig:
+            signals.append(short_sig)
+    if scan_type in ["ALL", "DAILY"]:
+        long_sig = build_signal(symbol, "LONG_SWING", d1, d1)
+        if long_sig:
+            signals.append(long_sig)
     return signals
 
-@app.get("/api/ai/analyze")
-def api_analyze(symbol: str):
-    sigs = analyze_symbol(symbol)
-    return {"ok": bool(sigs), "symbol": normalize_symbol(symbol), "signals": sigs}
 
-@app.get("/api/ai/pro-scan")
-def pro_scan(symbol: Optional[str] = None):
-    symbols = [normalize_symbol(symbol)] if symbol else WATCHLIST
+# ============================================================
+# SCAN STORAGE
+# ============================================================
+
+def save_scan_result(scan_type: str, payload: Dict[str, Any]):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ai_scan_results(scan_type,mode,created_at,watchlist_count,scanned_count,signals_count,payload)
+        VALUES(%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        scan_type,
+        get_ai_mode(),
+        utc_now(),
+        len(WATCHLIST),
+        payload.get("scanned_count", 0),
+        payload.get("signals_count", 0),
+        json.dumps(payload)
+    ))
+    conn.commit()
+    conn.close()
+
+def latest_scan_result(scan_type: str = "COMBINED"):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM ai_scan_results
+        WHERE scan_type=%s
+        ORDER BY id DESC
+        LIMIT 1
+    """, (scan_type,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return json.loads(row["payload"])
+
+def run_scan(scan_type: str):
     all_signals = []
     coverage = []
 
-    for s in symbols:
-        sigs = analyze_symbol(s)
-        has_data = bool(sigs)
+    for s in WATCHLIST:
+        try:
+            sigs = analyze_symbol(s, scan_type)
+            has_data = bool(sigs)
+            buy_sigs = [x for x in sigs if x["model_action"] == "BUY"]
+            best = max(sigs, key=lambda x: x["score"], default=None)
 
-        buy_sigs = [x for x in sigs if x["model_action"] == "BUY"]
-        best = max(sigs, key=lambda x: x["score"], default=None)
-
-        coverage.append({
-            "symbol": s,
-            "has_data": has_data,
-            "action": best["action"] if best else "NO_DATA",
-            "model_action": best["model_action"] if best else "NO_DATA",
-            "score": best["score"] if best else None,
-            "strength": best["strength"] if best else None
-        })
-
-        all_signals.extend(buy_sigs)
+            coverage.append({
+                "symbol": s,
+                "has_data": has_data,
+                "action": best["action"] if best else "NO_DATA",
+                "model_action": best["model_action"] if best else "NO_DATA",
+                "score": best["score"] if best else None,
+                "strength": best["strength"] if best else None
+            })
+            all_signals.extend(buy_sigs)
+        except Exception as e:
+            coverage.append({"symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR", "score": None, "strength": str(e)})
 
     all_signals = sorted(all_signals, key=lambda x: (x["score"], x["rr"]), reverse=True)
 
     return {
         "mode": get_ai_mode(),
+        "scan_type": scan_type,
+        "created_at": utc_now(),
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
         "watchlist_count": len(WATCHLIST),
+        "scanned_count": len(WATCHLIST),
         "signals_count": len(all_signals),
-        "signals": all_signals[:15],
+        "signals": all_signals[:20],
         "coverage": coverage
     }
+
+@app.get("/api/ai/pro-scan")
+def pro_scan(scan_type: str = "COMBINED"):
+    data = latest_scan_result(scan_type.upper())
+    if not data:
+        return {
+            "mode": get_ai_mode(),
+            "message": "No saved scan yet. Run hourly/daily cron first.",
+            "signals": [],
+            "coverage": []
+        }
+    return data
+
+@app.get("/api/ai/analyze")
+def api_analyze(symbol: str):
+    sigs = analyze_symbol(symbol, "ALL")
+    return {"ok": bool(sigs), "symbol": normalize_symbol(symbol), "signals": sigs}
 
 
 # ============================================================
@@ -928,16 +989,113 @@ def evaluate_virtual_signals():
 
 @app.get("/api/ai/learning-scan")
 def learning_scan():
-    scan = pro_scan()
+    hourly = latest_scan_result("HOURLY")
+    daily = latest_scan_result("DAILY")
+    signals = []
+    if hourly:
+        signals.extend(hourly.get("signals", []))
+    if daily:
+        signals.extend(daily.get("signals", []))
+
+    created = []
+    for sig in signals:
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
+    evaluated = evaluate_virtual_signals()
+    return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
+
+
+# ============================================================
+# CRON ENDPOINTS
+# ============================================================
+
+def cron_ok(secret: Optional[str]):
+    return secret == CRON_SECRET
+
+@app.get("/api/cron/hourly-scan")
+def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    scan = run_scan("HOURLY")
+    save_scan_result("HOURLY", scan)
+
     created = []
     for sig in scan["signals"]:
         if record_virtual_signal(sig):
             created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
     evaluated = evaluate_virtual_signals()
-    return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
+
+    if send and scan["signals"]:
+        tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
+
+    save_combined_scan()
+
+    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated)}
+
+@app.get("/api/cron/daily-scan")
+def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    scan = run_scan("DAILY")
+    save_scan_result("DAILY", scan)
+
+    created = []
+    for sig in scan["signals"]:
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
+    evaluated = evaluate_virtual_signals()
+
+    if send and scan["signals"]:
+        tg_main_send(format_scan_summary(scan, "Daily 1D Long Swing"))
+
+    save_combined_scan()
+
+    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated)}
+
+def save_combined_scan():
+    hourly = latest_scan_result("HOURLY") or {}
+    daily = latest_scan_result("DAILY") or {}
+
+    signals = []
+    signals.extend(hourly.get("signals", []))
+    signals.extend(daily.get("signals", []))
+    signals = sorted(signals, key=lambda x: (x["score"], x["rr"]), reverse=True)[:20]
+
+    coverage = []
+    hcov = {x["symbol"]: x for x in hourly.get("coverage", [])}
+    dcov = {x["symbol"]: x for x in daily.get("coverage", [])}
+    for s in WATCHLIST:
+        h = hcov.get(s)
+        d = dcov.get(s)
+        best = h if (h and (not d or (h.get("score") or 0) >= (d.get("score") or 0))) else d
+        coverage.append(best or {"symbol": s, "has_data": False, "action": "NO_DATA", "model_action": "NO_DATA", "score": None, "strength": None})
+
+    combined = {
+        "mode": get_ai_mode(),
+        "scan_type": "COMBINED",
+        "created_at": utc_now(),
+        "learning_age_days": round(learning_age_days(), 2),
+        "learning_remaining_days": round(learning_remaining_days(), 2),
+        "watchlist_count": len(WATCHLIST),
+        "scanned_count": len(WATCHLIST),
+        "signals_count": len(signals),
+        "signals": signals,
+        "coverage": coverage
+    }
+    save_scan_result("COMBINED", combined)
+
+
+# ============================================================
+# READINESS
+# ============================================================
 
 @app.get("/api/ai/readiness")
-def readiness_report(save: bool = False):
+def readiness_report():
     evaluate_virtual_signals()
 
     conn = db()
@@ -965,8 +1123,6 @@ def readiness_report(save: bool = False):
     """)
     best = cur.fetchall()
 
-    win_rate = (target_hits / evaluated * 100) if evaluated else 0
-
     cur.execute("""
         SELECT avg_return_pct,
                (virtual_short_count + virtual_long_count + trades_count) AS cnt
@@ -974,7 +1130,9 @@ def readiness_report(save: bool = False):
         WHERE (virtual_short_count + virtual_long_count + trades_count) > 0
     """)
     rows = cur.fetchall()
+    conn.close()
 
+    win_rate = (target_hits / evaluated * 100) if evaluated else 0
     total_weight = sum(int(x["cnt"] or 0) for x in rows)
     avg_return = 0
     if total_weight:
@@ -996,8 +1154,6 @@ def readiness_report(save: bool = False):
     if age >= LEARNING_DAYS and evaluated >= 20 and win_rate >= 55 and avg_return > 0:
         status = "READY_FOR_PAPER"
         reasons.append("Ready for PAPER mode, not full live size yet.")
-
-    conn.close()
 
     return {
         "mode": get_ai_mode(),
@@ -1042,17 +1198,11 @@ def tg_main_send(text, reply_markup=None):
 
 def signal_keyboard(symbol):
     buttons = [[{"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}, {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}]]
-    if get_ai_mode() != "LEARNING":
-        buttons.insert(0, [{"text": "â Ø¯Ø®ÙØª Ø§ÙØµÙÙØ©", "callback_data": f"enter:{symbol}"}])
     return {"inline_keyboard": buttons}
 
 def format_signal(sig):
-    mode_note = ""
-    if sig["mode"] == "LEARNING":
-        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
-    elif sig["mode"] == "PAPER":
-        mode_note = "\nð§ª <b>PAPER MODE:</b> ØªÙØµÙØ© ØªØ¬Ø±ÙØ¨ÙØ©."
-
+    mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·." if sig["mode"] == "LEARNING" else ""
+    size = sig.get("position_sizing", {})
     return f"""
 ð <b>{sig['symbol']} PRO AI V3</b>
 
@@ -1075,6 +1225,11 @@ def format_signal(sig):
 âï¸ Risk: <b>{sig['risk_pct']}%</b>
 ð RR: <b>{sig['rr']}</b>
 
+Position Size:
+Qty: {size.get('qty')}
+Value: {size.get('position_value')} AED
+Risk: {size.get('max_risk_aed')} AED
+
 RSI: {sig['rsi']}
 Volume Ratio: {sig['volume_ratio']}
 Trend: {sig['trend']}
@@ -1085,6 +1240,14 @@ Trend: {sig['trend']}
 Dashboard:
 {DASHBOARD_URL}
 """.strip()
+
+def format_scan_summary(scan, title):
+    lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
+    for s in scan["signals"][:5]:
+        lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
+    lines.append("")
+    lines.append(DASHBOARD_URL)
+    return "\n".join(lines)
 
 def format_readiness(rep):
     return f"""
@@ -1111,7 +1274,10 @@ Reasons:
 
 @app.get("/api/ai/send-alerts")
 def send_alerts(force: bool = False, dry_run: bool = False):
-    scan = pro_scan()
+    scan = latest_scan_result("COMBINED")
+    if not scan:
+        return {"ok": False, "message": "No saved scan yet. Run hourly/daily cron first."}
+
     sent, skipped = [], []
 
     conn = db()
@@ -1181,14 +1347,14 @@ async def telegram_webhook(secret: str, request: Request):
             if upper.startswith("Ø­ÙÙ"):
                 parts = upper.split()
                 if len(parts) >= 2:
-                    sigs = analyze_symbol(parts[1])
+                    sigs = analyze_symbol(parts[1], "ALL")
                     if sigs:
                         best = max(sigs, key=lambda x: x["score"])
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
                     return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
             if upper in WATCHLIST:
-                sigs = analyze_symbol(upper)
+                sigs = analyze_symbol(upper, "ALL")
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
@@ -1207,7 +1373,7 @@ async def telegram_webhook(secret: str, request: Request):
             action = parts[0]
 
             if action == "more":
-                sigs = analyze_symbol(parts[1])
+                sigs = analyze_symbol(parts[1], "ALL")
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
@@ -1228,7 +1394,7 @@ async def telegram_webhook(secret: str, request: Request):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    scan = pro_scan()
+    scan = latest_scan_result("COMBINED") or {"signals": [], "coverage": [], "signals_count": 0, "mode": get_ai_mode(), "created_at": "No scan yet"}
     rep = readiness_report()
 
     signal_rows = ""
@@ -1263,13 +1429,14 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h1>UAE PRO AI V3 - Learning Mode</h1>
+        <h1>UAE PRO AI V3 - Complete Program</h1>
         <div class="card">
-            Mode: <b>{scan['mode']}</b><br>
+            Mode: <b>{scan.get('mode')}</b><br>
             Readiness: <b>{rep['status']}</b><br>
             Learning Age: {rep['learning_age_days']} days / {rep['learning_days_required']} days<br>
-            Signals: {scan['signals_count']}<br>
-            Win Rate: {rep['win_rate']}% | Avg Return: {rep['avg_return_pct']}%
+            Signals: {scan.get('signals_count', 0)}<br>
+            Win Rate: {rep['win_rate']}% | Avg Return: {rep['avg_return_pct']}%<br>
+            Last Scan: {scan.get('created_at', 'No scan yet')}
         </div>
 
         <h2>Top Signals</h2>
