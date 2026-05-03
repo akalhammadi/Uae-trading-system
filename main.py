@@ -3524,3 +3524,53 @@ def api_telegram_trades(chat_id: str, status: str = "OPEN"):
         "count": len(rows),
         "trades": rows
     }
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+
+def home():
+
+    return {"status": "UAE AI Running 🚀"}
+
+@app.get("/api/health")
+
+def health():
+
+    return {"ok": True}
+
+@app.get("/api/watchlist")
+
+def watchlist():
+
+    return {
+
+        "count": 53,
+
+        "stocks": ["EMAAR", "DEWA", "SALIK"]  # مثال
+
+    }
+
+@app.get("/api/ai/pro-scan")
+
+def pro_scan():
+
+    return {
+
+        "mode": "PRO",
+
+        "signals": [
+
+            {"symbol": "EMAAR", "action": "BUY"}
+
+        ]
+
+    }
+
+@app.get("/api/ai/send-alerts")
+
+def send_alerts():
+
+    return {"sent": True}
