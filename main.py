@@ -39,6 +39,20 @@ OBSERVATION_TARGET_PCT = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
 OBSERVATION_DROP_PCT = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
 TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "10"))
 
+# V5 Live-trading guardrails
+# LIVE trading is disabled by default. It only activates with AI_MODE=LIVE and LIVE_TRADING_ENABLED=true.
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+LIVE_REQUIRES_CONFIRMATION = os.getenv("LIVE_REQUIRES_CONFIRMATION", "true").lower() == "true"
+BROKER_WEBHOOK_URL = os.getenv("BROKER_WEBHOOK_URL", "")
+BROKER_API_KEY = os.getenv("BROKER_API_KEY", "")
+MAX_LIVE_ORDER_AED = float(os.getenv("MAX_LIVE_ORDER_AED", "10000"))
+MAX_DAILY_LIVE_ORDERS = int(os.getenv("MAX_DAILY_LIVE_ORDERS", "3"))
+
+# Learning from losing trades
+LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
+LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
+WIN_SCORE_REWARD = float(os.getenv("WIN_SCORE_REWARD", "3"))
+
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
     "MANAZEL","PRESIGHT","SALIK","SHUAA","SIB","UPP","TECOM","JULPHAR",
@@ -1385,6 +1399,128 @@ def readiness_report():
     }
 
 
+
+# ============================================================
+# V5 LIVE ORDER ENGINE + LOSS LEARNING
+# ============================================================
+
+def count_live_orders_today() -> int:
+    conn = db()
+    cur = conn.cursor()
+    today = datetime.now(timezone.utc).date().isoformat()
+    cur.execute("""
+        SELECT COUNT(*) FROM telegram_trades
+        WHERE opened_at >= %s AND status IN ('LIVE_OPEN','LIVE_SENT','OPEN')
+    """, (today,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return int(n or 0)
+
+def send_broker_order(symbol: str, side: str, amount: float, price: float, stop_loss=None, target1=None, payload=None):
+    """
+    Generic broker webhook integration.
+    You must connect this to your licensed broker/order-management API.
+    """
+    if not LIVE_TRADING_ENABLED:
+        return {"ok": False, "reason": "LIVE_TRADING_ENABLED=false"}
+    if get_ai_mode() != "LIVE":
+        return {"ok": False, "reason": "AI_MODE is not LIVE"}
+    if LIVE_REQUIRES_CONFIRMATION:
+        return {"ok": False, "reason": "LIVE_REQUIRES_CONFIRMATION=true"}
+    if not BROKER_WEBHOOK_URL:
+        return {"ok": False, "reason": "BROKER_WEBHOOK_URL missing"}
+    if amount > MAX_LIVE_ORDER_AED:
+        return {"ok": False, "reason": "amount exceeds MAX_LIVE_ORDER_AED"}
+    if count_live_orders_today() >= MAX_DAILY_LIVE_ORDERS:
+        return {"ok": False, "reason": "daily live order limit reached"}
+
+    order = {
+        "symbol": normalize_symbol(symbol),
+        "side": side.upper(),
+        "amount_aed": amount,
+        "price_hint": price,
+        "stop_loss": stop_loss,
+        "target1": target1,
+        "source": "UAE_PRO_AI_V5",
+        "created_at": utc_now(),
+        "payload": payload or {},
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if BROKER_API_KEY:
+        headers["Authorization"] = f"Bearer {BROKER_API_KEY}"
+
+    try:
+        r = requests.post(BROKER_WEBHOOK_URL, json=order, headers=headers, timeout=20)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"text": r.text}
+        return {"ok": r.ok, "status_code": r.status_code, "broker_response": body, "order": order}
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "order": order}
+
+def apply_loss_learning(symbol: str, pnl_pct: float, signal_type: str = "TRADE"):
+    if not LOSS_LEARNING_ENABLED:
+        return
+    update_learning(symbol, pnl_pct, signal_type, is_virtual=False)
+
+@app.get("/api/live/status")
+def live_status():
+    return {
+        "mode": get_ai_mode(),
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "live_requires_confirmation": LIVE_REQUIRES_CONFIRMATION,
+        "broker_webhook_configured": bool(BROKER_WEBHOOK_URL),
+        "max_live_order_aed": MAX_LIVE_ORDER_AED,
+        "max_daily_live_orders": MAX_DAILY_LIVE_ORDERS,
+        "live_orders_today": count_live_orders_today()
+    }
+
+@app.post("/api/live/order")
+async def live_order(request: Request):
+    data = await request.json()
+    symbol = normalize_symbol(data.get("symbol"))
+    amount = safe_float(data.get("amount_aed"), 0)
+    price = safe_float(data.get("price"), 0)
+    side = data.get("side", "BUY")
+    stop_loss = safe_float(data.get("stop_loss"))
+    target1 = safe_float(data.get("target1"))
+
+    if not symbol or amount <= 0 or price <= 0:
+        return {"ok": False, "error": "symbol, amount_aed and price are required"}
+
+    result = send_broker_order(symbol, side, amount, price, stop_loss, target1, data)
+    return result
+
+@app.get("/api/trades/close")
+def close_trade(trade_id: int, exit_price: float, note: str = ""):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM telegram_trades WHERE id=%s", (trade_id,))
+    trade = cur.fetchone()
+    if not trade:
+        conn.close()
+        return {"ok": False, "error": "trade not found"}
+
+    entry = float(trade["entry_price"])
+    qty = float(trade["qty"])
+    pnl = (exit_price - entry) * qty
+    pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
+
+    cur.execute("""
+        UPDATE telegram_trades
+        SET status='CLOSED', exit_price=%s, closed_at=%s, pnl=%s, pnl_pct=%s, close_note=%s
+        WHERE id=%s
+    """, (exit_price, utc_now(), pnl, pnl_pct, note, trade_id))
+
+    conn.commit()
+    conn.close()
+
+    apply_loss_learning(trade["symbol"], pnl_pct, trade.get("signal_type") or "TRADE")
+
+    return {"ok": True, "trade_id": trade_id, "symbol": trade["symbol"], "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2)}
+
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -1410,7 +1546,10 @@ def tg_main_send(text, reply_markup=None):
     return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
 
 def signal_keyboard(symbol):
-    buttons = [[{"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}, {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}]]
+    buttons = [
+        [{"text": "More Analysis", "callback_data": f"more:{symbol}"}, {"text": "Ignore", "callback_data": f"ignore:{symbol}"}],
+        [{"text": "I Entered This Trade", "callback_data": f"entered:{symbol}"}]
+    ]
     return {"inline_keyboard": buttons}
 
 def format_signal(sig):
@@ -1493,16 +1632,16 @@ Reasons:
 @app.get("/api/ai/send-alerts")
 def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
     """
-    V4 PRO Light Filter:
+    V5 English Telegram ranked alerts.
     Sends ranked opportunities from strongest to weakest.
-    If no trade setup exists, it still sends the ranked watchlist and states market is WEAK.
+    If no confirmed trade exists, it still sends the ranked watchlist and states market is WEAK.
     """
     if top is None:
         top = TELEGRAM_TOP_N
 
     scan = latest_scan_result("COMBINED")
     if not scan:
-        msg = "ð ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ­Øµ ÙØ­ÙÙØ¸Ø© Ø­Ø§ÙÙØ§Ù.\nØ´ØºÙ hourly scan Ø£ÙÙØ§Ù."
+        msg = "ð UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
         if not dry_run:
             tg_main_send(msg)
         return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
@@ -1511,24 +1650,20 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
     coverage = scan.get("coverage", []) or []
 
     items = ranked if ranked else coverage
-    items = sorted(
-        items,
-        key=lambda x: (x.get("rank_score") or x.get("score") or 0),
-        reverse=True
-    )
+    items = sorted(items, key=lambda x: (x.get("rank_score") or x.get("score") or 0), reverse=True)
 
     if not items:
-        msg = "ð <b>UAE PRO AI</b>\nÙØ§ ØªÙØ¬Ø¯ ÙØ±Øµ Ø­Ø§ÙÙØ§Ù.\nMarket status: <b>WEAK / NO DATA</b>"
+        msg = "ð <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
         if not dry_run:
             tg_main_send(msg)
         return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
 
     lines = []
-    lines.append("ð <b>UAE PRO AI V4 - Ranked Opportunities</b>")
+    lines.append("ð <b>UAE PRO AI V5 - Ranked Opportunities</b>")
     lines.append(f"Mode: <b>{get_ai_mode()}</b>")
     lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
     lines.append("")
-    lines.append("Ø§ÙØªØ±ØªÙØ¨ ÙÙ Ø§ÙØ£ÙÙÙ Ø¥ÙÙ Ø§ÙØ£Ø¶Ø¹Ù:")
+    lines.append("Ranking from strongest to weakest:")
     lines.append("")
 
     sent_items = []
@@ -1547,14 +1682,14 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         comment = x.get("ai_comment") or ""
 
         if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
-            status = "ð¥ ÙØ±ØµØ©"
+            status = "ð¥ TRADE CANDIDATE"
             real_opportunities += 1
         elif strength in ["VERY STRONG", "STRONG"]:
-            status = "ð ÙØ±Ø§ÙØ¨Ø© ÙÙÙØ©"
+            status = "ð STRONG WATCH"
         elif action in ["NO_DATA", "ERROR"]:
-            status = "Ø¶Ø¹ÙÙ / ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª"
+            status = "WEAK / NO DATA"
         else:
-            status = "Ø¶Ø¹ÙÙ / ÙØ±Ø§ÙØ¨Ø©"
+            status = "WEAK / WATCH"
 
         price_txt = price if price is not None else "-"
         rr_txt = rr if rr is not None else "-"
@@ -1565,7 +1700,7 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
             f"Action: <b>{action}</b> | Model: {model_action}\n"
             f"Strength: {strength} | Score: {score} | Rank: {rank_score}\n"
             f"Price: {price_txt} | RR: {rr_txt} | Vol: {vol_txt}\n"
-            f"{esc(comment)}\n"
+            f"{comment}\n"
         )
 
         sent_items.append({
@@ -1581,9 +1716,18 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         })
 
     if real_opportunities == 0:
-        lines.append("ð <b>Ø§ÙØ®ÙØ§ØµØ©:</b> ÙØ§ ØªÙØ¬Ø¯ ØµÙÙØ© ÙØ¤ÙØ¯Ø© Ø­Ø§ÙÙØ§Ù. Ø§ÙØ³ÙÙ/Ø§ÙÙØ±Øµ Ø§ÙØ­Ø§ÙÙØ© ØªØ­Øª Ø§ÙÙØ±Ø§ÙØ¨Ø© Ø£Ù Ø¶Ø¹ÙÙØ©.")
+        lines.append("ð Summary: No confirmed trade setup now. Current market list is watch/weak.")
     else:
-        lines.append(f"ð <b>Ø§ÙØ®ÙØ§ØµØ©:</b> Ø¹Ø¯Ø¯ Ø§ÙÙØ±Øµ Ø§ÙÙØ§Ø¨ÙØ© ÙÙÙØªØ§Ø¨Ø¹Ø©: {real_opportunities}")
+        lines.append(f"ð Summary: {real_opportunities} trade candidate(s) for review.")
+
+    lines.append("")
+    if get_ai_mode() == "LIVE" and LIVE_TRADING_ENABLED:
+        if LIVE_REQUIRES_CONFIRMATION:
+            lines.append("â ï¸ Live trading is enabled, but confirmation is required before any order.")
+        else:
+            lines.append("â ï¸ Live auto-order mode is enabled. Check broker and risk settings.")
+    else:
+        lines.append("Mode note: No real broker order will be placed unless LIVE_TRADING_ENABLED=true and broker webhook is configured.")
 
     lines.append("")
     lines.append(f"Dashboard:\n{DASHBOARD_URL}")
@@ -1647,14 +1791,47 @@ async def telegram_webhook(secret: str, request: Request):
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
                     return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
+            if upper.startswith("ENTERED"):
+                parts = text.split()
+                if len(parts) >= 4:
+                    symbol = normalize_symbol(parts[1])
+                    price = safe_float(parts[2], 0)
+                    amount = safe_float(parts[3], 0)
+                    if symbol and price > 0 and amount > 0:
+                        qty = amount / price
+                        conn = db()
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT INTO telegram_trades
+                            (chat_id,symbol,status,entry_price,amount,qty,opened_at,signal_type)
+                            VALUES(%s,%s,'OPEN',%s,%s,%s,%s,'MANUAL')
+                            RETURNING id
+                        """, (str(chat_id), symbol, price, amount, qty, utc_now()))
+                        trade_id = cur.fetchone()[0]
+                        conn.commit()
+                        conn.close()
+                        return tg_send(chat_id, f"â Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
+                return tg_send(chat_id, "Use: ENTERED SYMBOL PRICE AMOUNT\nExample: ENTERED EMAAR 11.22 40000")
+
+            if upper.startswith("SOLD"):
+                parts = text.split()
+                if len(parts) >= 3:
+                    trade_id = int(parts[1])
+                    exit_price = float(parts[2])
+                    result = close_trade(trade_id, exit_price, "Telegram close")
+                    if result.get("ok"):
+                        return tg_send(chat_id, f"â Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
+                    return tg_send(chat_id, f"Could not close trade: {result}")
+                return tg_send(chat_id, "Use: SOLD TRADE_ID EXIT_PRICE\nExample: SOLD 12 11.40")
+
             if upper in WATCHLIST:
                 sigs = analyze_symbol(upper, "ALL")
                 if sigs:
-                    best = max(sigs, key=lambda x: x["score"])
+                    best = max(sigs, key=lambda x: x.get("rank_score", x["score"]))
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ.")
+                return tg_send(chat_id, "Not enough data for this symbol.")
 
-            return tg_send(chat_id, "Ø§ÙØªØ¨ Ø±ÙØ² Ø³ÙÙ ÙØ«Ù EMAAR Ø£Ù:\nØ­ÙÙ EMAAR\nØ¬Ø§ÙØ²ÙØ©")
+            return tg_send(chat_id, "Send a symbol like EMAAR, or:\nANALYZE EMAAR\nREADINESS\nENTERED EMAAR 11.22 40000\nSOLD 1 11.40")
 
         if "callback_query" in data:
             cq = data["callback_query"]
@@ -1673,8 +1850,12 @@ async def telegram_webhook(secret: str, request: Request):
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
                 return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
+            if action == "entered":
+                symbol = parts[1]
+                return tg_send(chat_id, f"Manual trade tracking started for {symbol}. Send: ENTERED {symbol} price amount\nExample: ENTERED EMAAR 11.22 40000")
+
             if action == "ignore":
-                return tg_send(chat_id, "ØªÙ ØªØ¬Ø§ÙÙ Ø§ÙØ¥Ø´Ø§Ø±Ø© ð")
+                return tg_send(chat_id, "Ignored.")
 
     except Exception as e:
         print("Telegram error:", str(e))
