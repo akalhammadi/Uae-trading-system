@@ -27,6 +27,12 @@ AI_MODE = os.getenv("AI_MODE", "LEARNING").upper().strip()
 LEARNING_DAYS = int(os.getenv("LEARNING_DAYS", "14"))
 CAPITAL = float(os.getenv("CAPITAL", "200000"))
 
+# Hybrid Learning Alerts:
+# Keep AI_MODE=LEARNING but send alerts only for the strongest setups.
+HYBRID_STRONG_ALERTS = os.getenv("HYBRID_STRONG_ALERTS", "true").lower() == "true"
+STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "90"))
+STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.9"))
+
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
     "MANAZEL","PRESIGHT","SALIK","SHUAA","SIB","UPP","TECOM","JULPHAR",
@@ -278,6 +284,15 @@ def startup():
 def get_ai_mode():
     return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "LEARNING").upper().strip()
 
+def is_hybrid_strong_signal(sig: Dict[str, Any]) -> bool:
+    return (
+        get_ai_mode() == "LEARNING"
+        and HYBRID_STRONG_ALERTS
+        and sig.get("strength") == "VERY STRONG"
+        and float(sig.get("score") or 0) >= STRONG_ALERT_SCORE
+        and float(sig.get("rr") or 0) >= STRONG_ALERT_MIN_RR
+    )
+
 def learning_age_days():
     start = parse_dt(get_setting("learning_started_at"))
     if not start:
@@ -302,6 +317,9 @@ def home():
         "watchlist_count": len(WATCHLIST),
         "scan_policy": "hourly + daily only",
         "capital": CAPITAL,
+        "hybrid_strong_alerts": HYBRID_STRONG_ALERTS,
+        "strong_alert_score": STRONG_ALERT_SCORE,
+        "strong_alert_min_rr": STRONG_ALERT_MIN_RR,
     }
 
 @app.get("/api/health")
@@ -754,12 +772,24 @@ def build_signal(symbol, kind, candles, d1):
 
     sizing = position_sizing(entry, stop, kind)
 
+    # Hybrid Learning: alert only the strongest setups while still learning.
+    hybrid_alert = (
+        mode == "LEARNING"
+        and HYBRID_STRONG_ALERTS
+        and strength == "VERY STRONG"
+        and score >= STRONG_ALERT_SCORE
+        and rr >= STRONG_ALERT_MIN_RR
+    )
+    if hybrid_alert:
+        action = "STRONG_LEARNING_ALERT"
+
     return {
         "symbol": symbol,
         "type": kind,
         "mode": mode,
         "action": action,
         "model_action": model_action,
+        "hybrid_alert": hybrid_alert if 'hybrid_alert' in locals() else False,
         "timeframe": timeframe,
         "price": round(entry, 3),
         "entry_zone": [round(entry_low, 3), round(entry_high, 3)],
@@ -845,7 +875,7 @@ def run_scan(scan_type: str):
         try:
             sigs = analyze_symbol(s, scan_type)
             has_data = bool(sigs)
-            buy_sigs = [x for x in sigs if x["model_action"] == "BUY"]
+            buy_sigs = [x for x in sigs if x["model_action"] == "BUY" or is_hybrid_strong_signal(x)]
             best = max(sigs, key=lambda x: x["score"], default=None)
 
             coverage.append({
@@ -1201,7 +1231,12 @@ def signal_keyboard(symbol):
     return {"inline_keyboard": buttons}
 
 def format_signal(sig):
-    mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·." if sig["mode"] == "LEARNING" else ""
+    if sig.get("hybrid_alert"):
+        mode_note = "\nð¥ <b>STRONG LEARNING ALERT:</b> Ø¥Ø´Ø§Ø±Ø© ÙÙÙØ© Ø¬Ø¯Ø§Ù Ø£Ø«ÙØ§Ø¡ Ø§ÙØªØ¹ÙÙ. ÙÙØ³Øª Ø¯Ø®ÙÙ Ø¥ÙØ²Ø§ÙÙØ ÙÙÙÙØ§ ØªØ³ØªØ­Ù Ø§ÙÙØªØ§Ø¨Ø¹Ø©."
+    elif sig["mode"] == "LEARNING":
+        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
+    else:
+        mode_note = ""
     size = sig.get("position_sizing", {})
     return f"""
 ð <b>{sig['symbol']} PRO AI V3</b>
@@ -1411,7 +1446,7 @@ def dashboard():
     for x in scan["coverage"]:
         coverage_rows += f"""
         <tr>
-            <td>{x['symbol']}</td><td>{'â' if x['has_data'] else 'â'}</td>
+            <td>{x['symbol']}</td><td>{'YES' if x['has_data'] else 'NO'}</td>
             <td>{x['action']}</td><td>{x['model_action']}</td><td>{x['score']}</td><td>{x['strength']}</td>
         </tr>
         """
