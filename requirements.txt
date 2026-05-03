@@ -18,3 +18,8 @@ pandas
 scikit-learn
 joblib
 numpy
+fastapi
+uvicorn[standard]
+psycopg2-binary
+requests
+python-multipart
