@@ -33,6 +33,12 @@ HYBRID_STRONG_ALERTS = os.getenv("HYBRID_STRONG_ALERTS", "true").lower() == "tru
 STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "90"))
 STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.9"))
 
+# V4 Ranking + Observation Learning
+OBSERVATION_LEARNING = os.getenv("OBSERVATION_LEARNING", "true").lower() == "true"
+OBSERVATION_TARGET_PCT = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
+OBSERVATION_DROP_PCT = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
+TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "5"))
+
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
     "MANAZEL","PRESIGHT","SALIK","SHUAA","SIB","UPP","TECOM","JULPHAR",
@@ -189,6 +195,30 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_observations (
+            id SERIAL PRIMARY KEY,
+            obs_key TEXT UNIQUE NOT NULL,
+            symbol TEXT NOT NULL,
+            scan_type TEXT,
+            timeframe TEXT,
+            action TEXT,
+            model_action TEXT,
+            strength TEXT,
+            score DOUBLE PRECISION,
+            rank_score DOUBLE PRECISION,
+            price DOUBLE PRECISION,
+            observed_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            outcome TEXT,
+            outcome_at TEXT,
+            max_high DOUBLE PRECISION,
+            min_low DOUBLE PRECISION,
+            return_pct DOUBLE PRECISION,
+            payload TEXT
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS telegram_sessions (
             chat_id TEXT PRIMARY KEY,
             state TEXT,
@@ -292,6 +322,36 @@ def is_hybrid_strong_signal(sig: Dict[str, Any]) -> bool:
         and float(sig.get("score") or 0) >= STRONG_ALERT_SCORE
         and float(sig.get("rr") or 0) >= STRONG_ALERT_MIN_RR
     )
+
+def ai_rank_score(sig: Dict[str, Any]) -> float:
+    score = float(sig.get("score") or 0)
+    rr = min(float(sig.get("rr") or 0), 5) * 4
+    vol = min(float(sig.get("volume_ratio") or 0), 3) * 3
+    trend_bonus = 10 if sig.get("trend") == "UP" else 3 if sig.get("trend") == "MIXED" else 0
+    strength_bonus = {"VERY STRONG": 12, "STRONG": 7, "MEDIUM": 3, "WEAK": 0}.get(sig.get("strength"), 0)
+    return round(score + rr + vol + trend_bonus + strength_bonus, 2)
+
+def ai_comment(sig: Optional[Dict[str, Any]]) -> str:
+    if not sig:
+        return "No data yet"
+    if sig.get("model_action") == "BUY":
+        return "Trade setup candidate"
+    if sig.get("strength") == "VERY STRONG":
+        return "Strong watch; waiting for confirmation"
+    if sig.get("strength") == "STRONG":
+        return "Good watch; monitor next candle"
+    if sig.get("strength") == "MEDIUM":
+        return "Neutral watch"
+    return "Weak or unclear setup"
+
+def classify_action(sig: Optional[Dict[str, Any]]) -> str:
+    if not sig:
+        return "NO_DATA"
+    if sig.get("model_action") == "BUY":
+        return "BUY"
+    if sig.get("strength") == "VERY STRONG":
+        return "STRONG WATCH"
+    return "WATCH"
 
 def learning_age_days():
     start = parse_dt(get_setting("learning_started_at"))
@@ -783,7 +843,7 @@ def build_signal(symbol, kind, candles, d1):
     if hybrid_alert:
         action = "STRONG_LEARNING_ALERT"
 
-    return {
+    result = {
         "symbol": symbol,
         "type": kind,
         "mode": mode,
@@ -814,6 +874,10 @@ def build_signal(symbol, kind, candles, d1):
         "position_sizing": sizing,
         "reason": " + ".join(reasons) if reasons else "No strong setup"
     }
+    result["rank_score"] = ai_rank_score(result)
+    result["ai_comment"] = ai_comment(result)
+    result["display_action"] = classify_action(result)
+    return result
 
 def analyze_symbol(symbol: str, scan_type: str = "ALL"):
     h1 = get_candles(symbol, "60", 220)
@@ -868,31 +932,44 @@ def latest_scan_result(scan_type: str = "COMBINED"):
     return json.loads(row["payload"])
 
 def run_scan(scan_type: str):
-    all_signals = []
+    ranked = []
+    signals = []
     coverage = []
 
     for s in WATCHLIST:
         try:
             sigs = analyze_symbol(s, scan_type)
-            has_data = bool(sigs)
-            buy_sigs = [x for x in sigs if x["model_action"] == "BUY" or is_hybrid_strong_signal(x)]
-            best = max(sigs, key=lambda x: x["score"], default=None)
+            best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
+
+            if best:
+                ranked.append(best)
+                if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
+                    signals.append(best)
 
             coverage.append({
                 "symbol": s,
-                "has_data": has_data,
-                "action": best["action"] if best else "NO_DATA",
-                "model_action": best["model_action"] if best else "NO_DATA",
-                "score": best["score"] if best else None,
-                "strength": best["strength"] if best else None
+                "has_data": bool(best),
+                "action": classify_action(best) if best else "NO_DATA",
+                "model_action": best.get("model_action") if best else "NO_DATA",
+                "score": best.get("score") if best else None,
+                "rank_score": best.get("rank_score") if best else None,
+                "strength": best.get("strength") if best else None,
+                "price": best.get("price") if best else None,
+                "rr": best.get("rr") if best else None,
+                "volume_ratio": best.get("volume_ratio") if best else None,
+                "ai_comment": ai_comment(best) if best else "No data yet"
             })
-            all_signals.extend(buy_sigs)
         except Exception as e:
-            coverage.append({"symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR", "score": None, "strength": str(e)})
+            coverage.append({
+                "symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR",
+                "score": None, "rank_score": None, "strength": str(e), "price": None,
+                "rr": None, "volume_ratio": None, "ai_comment": str(e)
+            })
 
-    all_signals = sorted(all_signals, key=lambda x: (x["score"], x["rr"]), reverse=True)
+    ranked = sorted(ranked, key=lambda x: x.get("rank_score", 0), reverse=True)
+    signals = sorted(signals, key=lambda x: x.get("rank_score", 0), reverse=True)
 
-    return {
+    payload = {
         "mode": get_ai_mode(),
         "scan_type": scan_type,
         "created_at": utc_now(),
@@ -900,10 +977,17 @@ def run_scan(scan_type: str):
         "learning_remaining_days": round(learning_remaining_days(), 2),
         "watchlist_count": len(WATCHLIST),
         "scanned_count": len(WATCHLIST),
-        "signals_count": len(all_signals),
-        "signals": all_signals[:20],
-        "coverage": coverage
+        "signals_count": len(signals),
+        "signals": signals[:20],
+        "ranked_count": len(ranked),
+        "ranked": ranked,
+        "coverage": sorted(coverage, key=lambda x: (x.get("rank_score") or -1), reverse=True)
     }
+
+    if OBSERVATION_LEARNING:
+        record_observations(payload)
+
+    return payload
 
 @app.get("/api/ai/pro-scan")
 def pro_scan(scan_type: str = "COMBINED"):
@@ -1033,8 +1117,106 @@ def learning_scan():
             created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
     evaluated = evaluate_virtual_signals()
+    observed_evaluated = evaluate_observations()
     return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
 
+
+
+# ============================================================
+# OBSERVATION LEARNING
+# ============================================================
+
+def record_observations(scan_payload: Dict[str, Any]):
+    conn = db()
+    cur = conn.cursor()
+    created = 0
+    for item in scan_payload.get("ranked", []):
+        key = f"{item.get('symbol')}-{scan_payload.get('scan_type')}-{item.get('timeframe')}-{item.get('price')}-{scan_payload.get('created_at')[:13]}"
+        try:
+            cur.execute("""
+                INSERT INTO ai_observations
+                (obs_key,symbol,scan_type,timeframe,action,model_action,strength,score,rank_score,price,observed_at,status,payload)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+                ON CONFLICT DO NOTHING
+            """, (
+                key, item.get("symbol"), scan_payload.get("scan_type"), item.get("timeframe"),
+                item.get("display_action") or item.get("action"), item.get("model_action"),
+                item.get("strength"), item.get("score"), item.get("rank_score"), item.get("price"),
+                scan_payload.get("created_at"), json.dumps(item)
+            ))
+            created += cur.rowcount
+        except Exception:
+            conn.rollback()
+    conn.commit()
+    conn.close()
+    return created
+
+def evaluate_observations():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM ai_observations WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
+    rows = cur.fetchall()
+    out = []
+
+    for obs in rows:
+        tf = obs["timeframe"] or "60"
+        symbol = obs["symbol"]
+        observed = parse_dt(obs["observed_at"])
+        candles = get_candles(symbol, tf, 400)
+        relevant = []
+        for c in candles:
+            t = parse_dt(c["bar_time"]) or parse_dt(c["received_at"])
+            if observed and t and t >= observed:
+                relevant.append(c)
+        if not relevant:
+            continue
+
+        price = float(obs["price"] or 0)
+        if price <= 0:
+            continue
+
+        max_high = max(float(x["high"]) for x in relevant)
+        min_low = min(float(x["low"]) for x in relevant)
+        latest = float(relevant[-1]["close"])
+        return_pct = ((latest - price) / price) * 100
+
+        target_hit = ((max_high - price) / price) * 100 >= OBSERVATION_TARGET_PCT
+        drop_hit = ((price - min_low) / price) * 100 >= OBSERVATION_DROP_PCT
+
+        status = "OPEN"
+        outcome = None
+        max_days = 5 if tf == "60" else 25
+
+        if target_hit:
+            status = "CLOSED"; outcome = "WATCH_RALLIED"
+        elif drop_hit:
+            status = "CLOSED"; outcome = "WATCH_DROPPED"
+        elif observed and (utc_now_dt() - observed) > timedelta(days=max_days):
+            status = "CLOSED"; outcome = "WATCH_TIME_EXIT"
+
+        cur.execute("""
+            UPDATE ai_observations
+            SET max_high=%s,min_low=%s,return_pct=%s,status=%s,outcome=%s,outcome_at=%s
+            WHERE id=%s
+        """, (max_high, min_low, return_pct, status, outcome, utc_now() if status=="CLOSED" else None, obs["id"]))
+
+        if status == "CLOSED":
+            update_learning(symbol, return_pct, "OBSERVATION", is_virtual=True)
+            out.append({"symbol": symbol, "outcome": outcome, "return_pct": round(return_pct, 2)})
+
+    conn.commit()
+    conn.close()
+    return out
+
+@app.get("/api/ai/observations")
+def api_observations(limit: int = 100):
+    evaluated = evaluate_observations()
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM ai_observations ORDER BY id DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
 # ============================================================
 # CRON ENDPOINTS
@@ -1057,13 +1239,14 @@ def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
             created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
     evaluated = evaluate_virtual_signals()
+    observed_evaluated = evaluate_observations()
 
     if send and scan["signals"]:
         tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
 
     save_combined_scan()
 
-    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated)}
+    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -1085,7 +1268,7 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
 
     save_combined_scan()
 
-    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated)}
+    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
 
 def save_combined_scan():
     hourly = latest_scan_result("HOURLY") or {}
@@ -1278,7 +1461,7 @@ Dashboard:
 
 def format_scan_summary(scan, title):
     lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
-    for s in scan["signals"][:5]:
+    for s in scan["signals"][:TELEGRAM_TOP_N]:
         lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
     lines.append("")
     lines.append(DASHBOARD_URL)
@@ -1433,12 +1616,12 @@ def dashboard():
     rep = readiness_report()
 
     signal_rows = ""
-    for s in scan["signals"]:
+    for s in scan.get("ranked", scan.get("signals", [])):
         signal_rows += f"""
         <tr>
-            <td>{s['symbol']}</td><td>{s['type']}</td><td>{s['action']}</td><td>{s['strength']}</td>
-            <td>{s['score']}</td><td>{s['price']}</td><td>{s['entry_zone'][0]} - {s['entry_zone'][1]}</td>
-            <td>{s['stop_loss']}</td><td>{s['target1']} / {s['target2']}</td><td>{s['rr']}</td>
+            <td>{s['symbol']}</td><td>{s['type']}</td><td>{s.get('display_action', s['action'])}</td><td>{s['strength']}</td>
+            <td>{s.get('rank_score')}</td><td>{s['score']}</td><td>{s['price']}</td><td>{s['entry_zone'][0]} - {s['entry_zone'][1]}</td>
+            <td>{s['stop_loss']}</td><td>{s['target1']} / {s['target2']}</td><td>{s['rr']}</td><td>{s.get('ai_comment')}</td>
         </tr>
         """
 
@@ -1447,7 +1630,7 @@ def dashboard():
         coverage_rows += f"""
         <tr>
             <td>{x['symbol']}</td><td>{'YES' if x['has_data'] else 'NO'}</td>
-            <td>{x['action']}</td><td>{x['model_action']}</td><td>{x['score']}</td><td>{x['strength']}</td>
+            <td>{x['action']}</td><td>{x['model_action']}</td><td>{x.get('rank_score')}</td><td>{x['score']}</td><td>{x['strength']}</td><td>{x.get('ai_comment')}</td>
         </tr>
         """
 
@@ -1476,28 +1659,15 @@ def dashboard():
 
         <h2>Top Signals</h2>
         <table>
-            <tr><th>Symbol</th><th>Type</th><th>Action</th><th>Strength</th><th>Score</th><th>Price</th><th>Entry</th><th>Stop</th><th>Targets</th><th>RR</th></tr>
+            <tr><th>Symbol</th><th>Type</th><th>Action</th><th>Strength</th><th>Rank</th><th>Score</th><th>Price</th><th>Entry</th><th>Stop</th><th>Targets</th><th>RR</th><th>AI Comment</th></tr>
             {signal_rows}
         </table>
 
         <h2>Coverage</h2>
         <table>
-            <tr><th>Symbol</th><th>Data</th><th>Action</th><th>Model</th><th>Score</th><th>Strength</th></tr>
+            <tr><th>Symbol</th><th>Data</th><th>Action</th><th>Model</th><th>Rank</th><th>Score</th><th>Strength</th><th>AI Comment</th></tr>
             {coverage_rows}
         </table>
     </body>
     </html>
     """
-
-@app.get("/trigger/hourly")
-def trigger_hourly():
-    from threading import Thread
-    Thread(target=run_hourly_scan).start()
-    return {"status": "started"}
-
-@app.get("/trigger/daily")
-def trigger_daily():
-    from threading import Thread
-    Thread(target=run_daily_scan).start()
-    return {"status": "started"}
-
