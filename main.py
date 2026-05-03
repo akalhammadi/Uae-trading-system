@@ -2517,62 +2517,901 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 # =========================
-# Set Webhook
+# PROFESSIONAL TELEGRAM AI BOT
+# Interactive Trading Assistant + Postgres Learning
 # =========================
+
+from fastapi import Request
+from datetime import datetime
+import os
+import json
+import requests
+import psycopg2.extras
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://uae-market-production.up.railway.app/dashboard")
+
+
+def tg_api(method: str, payload: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    r = requests.post(url, json=payload, timeout=20)
+
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": r.ok, "text": r.text}
+
+
+def tg_send_message(chat_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    return tg_api("sendMessage", payload)
+
+
+def tg_answer_callback(callback_query_id, text=""):
+    return tg_api("answerCallbackQuery", {
+        "callback_query_id": callback_query_id,
+        "text": text
+    })
+
+
+def ensure_telegram_tables():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_sessions (
+            chat_id TEXT PRIMARY KEY,
+            state TEXT,
+            symbol TEXT,
+            amount DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            payload TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_trades (
+            id SERIAL PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            status TEXT NOT NULL,
+            entry_price DOUBLE PRECISION NOT NULL,
+            amount DOUBLE PRECISION NOT NULL,
+            qty DOUBLE PRECISION NOT NULL,
+            stop_loss DOUBLE PRECISION,
+            target1 DOUBLE PRECISION,
+            target2 DOUBLE PRECISION,
+            target3 DOUBLE PRECISION,
+            signal_score DOUBLE PRECISION,
+            signal_strength TEXT,
+            signal_type TEXT,
+            signal_payload TEXT,
+            opened_at TEXT NOT NULL,
+            exit_price DOUBLE PRECISION,
+            closed_at TEXT,
+            pnl DOUBLE PRECISION,
+            pnl_pct DOUBLE PRECISION,
+            close_note TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_trade_events (
+            id SERIAL PRIMARY KEY,
+            trade_id INTEGER,
+            chat_id TEXT NOT NULL,
+            symbol TEXT,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            note TEXT,
+            payload TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_trade_feedback (
+            id SERIAL PRIMARY KEY,
+            trade_id INTEGER,
+            symbol TEXT NOT NULL,
+            signal_type TEXT,
+            predicted_entry DOUBLE PRECISION,
+            predicted_stop DOUBLE PRECISION,
+            predicted_target1 DOUBLE PRECISION,
+            actual_entry DOUBLE PRECISION,
+            actual_exit DOUBLE PRECISION,
+            actual_return_pct DOUBLE PRECISION,
+            result_label TEXT,
+            opened_at TEXT,
+            closed_at TEXT,
+            payload TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def latest_price(symbol: str):
+    symbol = normalize_symbol(symbol)
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT close, bar_time, timeframe
+        FROM candles
+        WHERE symbol = %s
+          AND close IS NOT NULL
+          AND timeframe IN ('60', '1D')
+        ORDER BY
+          CASE WHEN timeframe = '60' THEN 1 ELSE 2 END,
+          bar_time DESC
+        LIMIT 1
+    """, (symbol,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "price": float(row["close"]),
+        "bar_time": row["bar_time"],
+        "timeframe": row["timeframe"]
+    }
+
+
+def ai_symbol_analysis(symbol: str):
+    symbol = normalize_symbol(symbol)
+
+    try:
+        signals = analyze_dual_symbol(symbol)
+    except Exception:
+        signals = []
+
+    signals = sorted(
+        signals,
+        key=lambda x: (x.get("score", 0), x.get("rr", 0)),
+        reverse=True
+    )
+
+    if signals:
+        return signals[0]
+
+    price_data = latest_price(symbol)
+    if not price_data:
+        return None
+
+    price = price_data["price"]
+
+    return {
+        "symbol": symbol,
+        "type": "NO_SIGNAL",
+        "action": "WATCH",
+        "timeframe": price_data["timeframe"],
+        "price": round(price, 3),
+        "entry_zone": [round(price * 0.99, 3), round(price * 1.01, 3)],
+        "stop_loss": round(price * 0.97, 3),
+        "target1": round(price * 1.03, 3),
+        "target2": round(price * 1.05, 3),
+        "target3": None,
+        "expected_move_pct": 3,
+        "risk_pct": 3,
+        "rr": 1,
+        "score": 40,
+        "strength": "WEAK",
+        "trend": "MIXED",
+        "support": None,
+        "resistance": None,
+        "rsi": None,
+        "volume_ratio": None,
+        "holding": "Watch only",
+        "reason": "No confirmed AI signal. مراقبة فقط."
+    }
+
+
+def format_analysis(signal: dict):
+    if not signal:
+        return "❌ لا توجد بيانات كافية لهذا السهم."
+
+    t3 = signal.get("target3")
+    t3_line = f"\n🎯 Target 3: <b>{t3}</b>" if t3 else ""
+
+    return f"""
+📊 <b>{signal['symbol']} AI Analysis</b>
+
+<b>Action:</b> {signal.get('action')}
+<b>Type:</b> {signal.get('type')}
+<b>Strength:</b> {signal.get('strength')}
+<b>Score:</b> {signal.get('score')}
+
+💰 <b>Price:</b> {signal.get('price')}
+📍 <b>Entry Zone:</b> {signal.get('entry_zone')[0]} - {signal.get('entry_zone')[1]}
+🛑 <b>Stop:</b> {signal.get('stop_loss')}
+
+🎯 Target 1: <b>{signal.get('target1')}</b>
+🎯 Target 2: <b>{signal.get('target2')}</b>{t3_line}
+
+📈 Expected Move: <b>{signal.get('expected_move_pct')}%</b>
+⚖️ Risk: <b>{signal.get('risk_pct')}%</b>
+📐 R/R: <b>{signal.get('rr')}</b>
+
+⏱ Timeframe: <b>{signal.get('timeframe')}</b>
+🕒 Holding: <b>{signal.get('holding')}</b>
+
+📌 Reason:
+{signal.get('reason')}
+
+Dashboard:
+{DASHBOARD_URL}
+""".strip()
+
+
+def analysis_keyboard(symbol: str):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ دخلت الصفقة", "callback_data": f"enter:{symbol}"},
+                {"text": "📊 تحليل أكثر", "callback_data": f"more:{symbol}"}
+            ],
+            [
+                {"text": "👀 تجاهل", "callback_data": f"ignore:{symbol}"}
+            ]
+        ]
+    }
+
+
+def amount_keyboard(symbol: str):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "20,000", "callback_data": f"amt:{symbol}:20000"},
+                {"text": "40,000", "callback_data": f"amt:{symbol}:40000"}
+            ],
+            [
+                {"text": "80,000", "callback_data": f"amt:{symbol}:80000"},
+                {"text": "مبلغ يدوي", "callback_data": f"amtmanual:{symbol}"}
+            ]
+        ]
+    }
+
+
+def price_keyboard(symbol: str):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "سعر السوق", "callback_data": f"price:{symbol}:market"},
+                {"text": "منتصف الدخول", "callback_data": f"price:{symbol}:mid"}
+            ],
+            [
+                {"text": "سعر يدوي", "callback_data": f"pricemanual:{symbol}"}
+            ]
+        ]
+    }
+
+
+def trade_keyboard(trade_id: int):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "💰 بيع كامل", "callback_data": f"sell:{trade_id}:full"},
+                {"text": "🟡 استمرار", "callback_data": f"hold:{trade_id}"}
+            ]
+        ]
+    }
+
+
+def set_session(chat_id, state, symbol=None, amount=None, entry_price=None, payload=None):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO telegram_sessions
+        (chat_id, state, symbol, amount, entry_price, payload, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
+            state = EXCLUDED.state,
+            symbol = EXCLUDED.symbol,
+            amount = EXCLUDED.amount,
+            entry_price = EXCLUDED.entry_price,
+            payload = EXCLUDED.payload,
+            updated_at = EXCLUDED.updated_at
+    """, (
+        str(chat_id),
+        state,
+        symbol,
+        amount,
+        entry_price,
+        json.dumps(payload) if payload else None,
+        datetime.utcnow().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_session(chat_id):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM telegram_sessions
+        WHERE chat_id = %s
+    """, (str(chat_id),))
+
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def clear_session(chat_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM telegram_sessions WHERE chat_id = %s", (str(chat_id),))
+    conn.commit()
+    conn.close()
+
+
+def open_telegram_trade(chat_id, symbol, entry_price, amount):
+    symbol = normalize_symbol(symbol)
+    signal = ai_symbol_analysis(symbol)
+
+    qty = amount / entry_price if entry_price else 0
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO telegram_trades
+        (chat_id, symbol, status, entry_price, amount, qty,
+         stop_loss, target1, target2, target3,
+         signal_score, signal_strength, signal_type, signal_payload,
+         opened_at)
+        VALUES (%s, %s, 'OPEN', %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s)
+        RETURNING id
+    """, (
+        str(chat_id),
+        symbol,
+        entry_price,
+        amount,
+        qty,
+        signal.get("stop_loss") if signal else None,
+        signal.get("target1") if signal else None,
+        signal.get("target2") if signal else None,
+        signal.get("target3") if signal else None,
+        signal.get("score") if signal else None,
+        signal.get("strength") if signal else None,
+        signal.get("type") if signal else None,
+        json.dumps(signal) if signal else None,
+        datetime.utcnow().isoformat()
+    ))
+
+    trade_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO telegram_trade_events
+        (trade_id, chat_id, symbol, event_type, event_time, price, note, payload)
+        VALUES (%s, %s, %s, 'BUY', %s, %s, %s, %s)
+    """, (
+        trade_id,
+        str(chat_id),
+        symbol,
+        datetime.utcnow().isoformat(),
+        entry_price,
+        f"Opened via Telegram amount={amount}",
+        json.dumps(signal) if signal else None
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return trade_id, qty, signal
+
+
+def close_telegram_trade(chat_id, symbol=None, exit_price=None, trade_id=None):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    if trade_id:
+        cur.execute("""
+            SELECT *
+            FROM telegram_trades
+            WHERE id = %s AND chat_id = %s AND status = 'OPEN'
+        """, (trade_id, str(chat_id)))
+    else:
+        cur.execute("""
+            SELECT *
+            FROM telegram_trades
+            WHERE chat_id = %s
+              AND symbol = %s
+              AND status = 'OPEN'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (str(chat_id), normalize_symbol(symbol)))
+
+    trade = cur.fetchone()
+
+    if not trade:
+        conn.close()
+        return None
+
+    if exit_price is None:
+        p = latest_price(trade["symbol"])
+        exit_price = p["price"] if p else trade["entry_price"]
+
+    pnl = (exit_price - trade["entry_price"]) * trade["qty"]
+    pnl_pct = ((exit_price - trade["entry_price"]) / trade["entry_price"]) * 100 if trade["entry_price"] else 0
+
+    closed_at = datetime.utcnow().isoformat()
+
+    cur.execute("""
+        UPDATE telegram_trades
+        SET status = 'CLOSED',
+            exit_price = %s,
+            closed_at = %s,
+            pnl = %s,
+            pnl_pct = %s,
+            close_note = %s
+        WHERE id = %s
+    """, (
+        exit_price,
+        closed_at,
+        pnl,
+        pnl_pct,
+        "Closed via Telegram",
+        trade["id"]
+    ))
+
+    cur.execute("""
+        INSERT INTO telegram_trade_events
+        (trade_id, chat_id, symbol, event_type, event_time, price, note)
+        VALUES (%s, %s, %s, 'SELL', %s, %s, %s)
+    """, (
+        trade["id"],
+        str(chat_id),
+        trade["symbol"],
+        closed_at,
+        exit_price,
+        "Closed via Telegram"
+    ))
+
+    result_label = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "FLAT"
+
+    cur.execute("""
+        INSERT INTO ai_trade_feedback
+        (trade_id, symbol, signal_type,
+         predicted_entry, predicted_stop, predicted_target1,
+         actual_entry, actual_exit, actual_return_pct,
+         result_label, opened_at, closed_at, payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        trade["id"],
+        trade["symbol"],
+        trade["signal_type"],
+        trade["entry_price"],
+        trade["stop_loss"],
+        trade["target1"],
+        trade["entry_price"],
+        exit_price,
+        pnl_pct,
+        result_label,
+        trade["opened_at"],
+        closed_at,
+        json.dumps(dict(trade))
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "trade_id": trade["id"],
+        "symbol": trade["symbol"],
+        "entry": trade["entry_price"],
+        "exit": exit_price,
+        "amount": trade["amount"],
+        "qty": trade["qty"],
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "result": result_label
+    }
+
+
+def open_trades_report(chat_id):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM telegram_trades
+        WHERE chat_id = %s
+          AND status = 'OPEN'
+        ORDER BY id DESC
+    """, (str(chat_id),))
+
+    trades = cur.fetchall()
+    conn.close()
+
+    if not trades:
+        return "لا توجد صفقات مفتوحة حالياً."
+
+    messages = []
+
+    for t in trades:
+        p = latest_price(t["symbol"])
+        current = p["price"] if p else t["entry_price"]
+
+        pnl = (current - t["entry_price"]) * t["qty"]
+        pnl_pct = ((current - t["entry_price"]) / t["entry_price"]) * 100 if t["entry_price"] else 0
+
+        status = "HOLD"
+        if t["target1"] and current >= t["target1"]:
+            status = "🎯 Target 1 reached"
+        elif t["stop_loss"] and current <= t["stop_loss"]:
+            status = "⚠️ Stop touched"
+        elif pnl_pct > 2:
+            status = "🟢 Profit running"
+        elif pnl_pct < -1.5:
+            status = "🔴 Risk warning"
+
+        messages.append(f"""
+📌 <b>{t['symbol']}</b>
+Entry: {round(t['entry_price'], 3)}
+Current: {round(current, 3)}
+Amount: {round(t['amount'], 2)}
+PnL: {round(pnl, 2)} AED ({round(pnl_pct, 2)}%)
+Status: {status}
+Stop: {t['stop_loss']}
+Target1: {t['target1']}
+""".strip())
+
+    return "\n\n".join(messages)
+
+
+def parse_buy_text(text):
+    parts = text.replace("،", " ").split()
+    if len(parts) < 4:
+        return None
+
+    # دخلت EMAAR 11.22 40000
+    symbol = parts[1].upper()
+    price = float(parts[2])
+    amount = float(parts[3])
+
+    return symbol, price, amount
+
+
+def parse_sell_text(text):
+    parts = text.replace("،", " ").split()
+    if len(parts) < 4:
+        return None
+
+    # بعت EMAAR على 11.40
+    symbol = parts[1].upper()
+    price = float(parts[-1])
+
+    return symbol, price
+
+
+def looks_like_symbol(text):
+    t = text.strip().upper()
+    return t.isalnum() and 2 <= len(t) <= 15
+
+
+def handle_text_message(chat_id, text):
+    ensure_telegram_tables()
+
+    raw = text.strip()
+    upper = raw.upper()
+
+    session = get_session(chat_id)
+
+    if raw in ["/start", "start", "Hello", "hello", "هلا", "مرحبا"]:
+        return tg_send_message(
+            chat_id,
+            "أهلاً 👋\nاكتب رمز السهم مثل EMAAR أو استخدم:\n\nدخلت EMAAR 11.22 40000\nبعت EMAAR 11.40\nصفقاتي\nمراقبة"
+        )
+
+    if upper in ["صفقاتي", "مراقبة", "TRADES", "MONITOR"]:
+        return tg_send_message(chat_id, open_trades_report(chat_id))
+
+    if session and session["state"] == "WAIT_AMOUNT":
+        try:
+            amount = float(raw.replace(",", ""))
+            symbol = session["symbol"]
+            set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
+            return tg_send_message(chat_id, f"تمام. المبلغ {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
+        except Exception:
+            return tg_send_message(chat_id, "اكتب المبلغ بالأرقام فقط، مثال: 40000")
+
+    if session and session["state"] == "WAIT_PRICE":
+        try:
+            price = float(raw.replace(",", ""))
+            symbol = session["symbol"]
+            amount = float(session["amount"])
+            trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
+            clear_session(chat_id)
+
+            return tg_send_message(
+                chat_id,
+                f"""
+✅ تم تسجيل الصفقة
+
+Trade ID: {trade_id}
+Symbol: {symbol}
+Entry: {price}
+Amount: {amount}
+Qty: {round(qty, 2)}
+
+Stop: {signal.get('stop_loss') if signal else '-'}
+Target1: {signal.get('target1') if signal else '-'}
+Target2: {signal.get('target2') if signal else '-'}
+
+سأتابع الصفقة معك.
+""".strip()
+            )
+        except Exception:
+            return tg_send_message(chat_id, "اكتب سعر الدخول بالأرقام فقط، مثال: 11.22")
+
+    if upper.startswith("دخلت"):
+        try:
+            parsed = parse_buy_text(raw)
+            if not parsed:
+                return tg_send_message(chat_id, "الصيغة:\nدخلت EMAAR 11.22 40000")
+
+            symbol, price, amount = parsed
+            trade_id, qty, signal = open_telegram_trade(chat_id, symbol, price, amount)
+
+            return tg_send_message(
+                chat_id,
+                f"""
+✅ تم تسجيل الصفقة
+
+Trade ID: {trade_id}
+Symbol: {symbol}
+Entry: {price}
+Amount: {amount}
+Qty: {round(qty, 2)}
+
+Stop: {signal.get('stop_loss') if signal else '-'}
+Target1: {signal.get('target1') if signal else '-'}
+Target2: {signal.get('target2') if signal else '-'}
+
+سأتابع الصفقة معك.
+""".strip()
+            )
+        except Exception as e:
+            return tg_send_message(chat_id, f"لم أستطع تسجيل الصفقة.\nالصيغة:\nدخلت EMAAR 11.22 40000")
+
+    if upper.startswith("بعت"):
+        try:
+            parsed = parse_sell_text(raw)
+            if not parsed:
+                return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
+
+            symbol, price = parsed
+            result = close_telegram_trade(chat_id, symbol=symbol, exit_price=price)
+
+            if not result:
+                return tg_send_message(chat_id, "ما حصلت صفقة مفتوحة لهذا السهم.")
+
+            return tg_send_message(
+                chat_id,
+                f"""
+📉 تم إغلاق الصفقة
+
+Symbol: {result['symbol']}
+Entry: {round(result['entry'], 3)}
+Exit: {round(result['exit'], 3)}
+
+PnL: {round(result['pnl'], 2)} AED
+Return: {round(result['pnl_pct'], 2)}%
+Result: {result['result']}
+
+تم حفظ النتيجة للتعلم.
+""".strip()
+            )
+        except Exception:
+            return tg_send_message(chat_id, "الصيغة:\nبعت EMAAR على 11.40")
+
+    if upper.startswith("حلل"):
+        parts = upper.split()
+        if len(parts) >= 2:
+            symbol = normalize_symbol(parts[1])
+            signal = ai_symbol_analysis(symbol)
+            return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
+
+    if looks_like_symbol(upper):
+        symbol = normalize_symbol(upper)
+        signal = ai_symbol_analysis(symbol)
+        return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
+
+    return tg_send_message(chat_id, "اكتب رمز سهم مثل EMAAR أو:\nصفقاتي\nمراقبة\nدخلت EMAAR 11.22 40000")
+
+
+def handle_callback(chat_id, callback_id, data):
+    ensure_telegram_tables()
+
+    parts = data.split(":")
+    action = parts[0]
+
+    tg_answer_callback(callback_id)
+
+    if action == "more":
+        symbol = parts[1]
+        signal = ai_symbol_analysis(symbol)
+        return tg_send_message(chat_id, format_analysis(signal), analysis_keyboard(symbol))
+
+    if action == "ignore":
+        return tg_send_message(chat_id, "تم تجاهل الإشارة 👀")
+
+    if action == "enter":
+        symbol = parts[1]
+        set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
+        return tg_send_message(chat_id, f"اختر مبلغ الدخول لـ {symbol}:", amount_keyboard(symbol))
+
+    if action == "amt":
+        symbol = parts[1]
+        amount = float(parts[2])
+        set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=amount)
+        return tg_send_message(chat_id, f"المبلغ: {amount} AED\nاختر سعر الدخول:", price_keyboard(symbol))
+
+    if action == "amtmanual":
+        symbol = parts[1]
+        set_session(chat_id, "WAIT_AMOUNT", symbol=symbol)
+        return tg_send_message(chat_id, "اكتب المبلغ بالأرقام، مثال: 40000")
+
+    if action == "price":
+        symbol = parts[1]
+        mode = parts[2]
+        session = get_session(chat_id)
+
+        if not session or not session["amount"]:
+            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
+
+        amount = float(session["amount"])
+        signal = ai_symbol_analysis(symbol)
+
+        if mode == "market":
+            p = latest_price(symbol)
+            entry = p["price"] if p else signal.get("price")
+        else:
+            zone = signal.get("entry_zone")
+            entry = (zone[0] + zone[1]) / 2 if zone else signal.get("price")
+
+        trade_id, qty, signal = open_telegram_trade(chat_id, symbol, float(entry), amount)
+        clear_session(chat_id)
+
+        return tg_send_message(
+            chat_id,
+            f"""
+✅ تم تسجيل الصفقة
+
+Trade ID: {trade_id}
+Symbol: {symbol}
+Entry: {round(entry, 3)}
+Amount: {amount}
+Qty: {round(qty, 2)}
+
+Stop: {signal.get('stop_loss')}
+Target1: {signal.get('target1')}
+Target2: {signal.get('target2')}
+
+سأتابع الصفقة معك.
+""".strip()
+        )
+
+    if action == "pricemanual":
+        symbol = parts[1]
+        session = get_session(chat_id)
+
+        if not session or not session["amount"]:
+            return tg_send_message(chat_id, "انتهت الجلسة. اضغط دخلت الصفقة مرة ثانية.")
+
+        set_session(chat_id, "WAIT_PRICE", symbol=symbol, amount=session["amount"])
+        return tg_send_message(chat_id, "اكتب سعر الدخول، مثال: 11.22")
+
+    if action == "sell":
+        trade_id = int(parts[1])
+        result = close_telegram_trade(chat_id, trade_id=trade_id)
+
+        if not result:
+            return tg_send_message(chat_id, "ما حصلت الصفقة أو تم إغلاقها سابقاً.")
+
+        return tg_send_message(
+            chat_id,
+            f"""
+💰 تم البيع
+
+Symbol: {result['symbol']}
+Entry: {round(result['entry'], 3)}
+Exit: {round(result['exit'], 3)}
+
+PnL: {round(result['pnl'], 2)} AED
+Return: {round(result['pnl_pct'], 2)}%
+Result: {result['result']}
+
+تم حفظ النتيجة للتعلم.
+""".strip()
+        )
+
+    if action == "hold":
+        return tg_send_message(chat_id, "تمام، بنستمر في مراقبة الصفقة.")
+
+    return tg_send_message(chat_id, "أمر غير معروف.")
+
+
 @app.get("/api/telegram/set-webhook")
-def set_webhook():
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+def set_telegram_webhook():
     webhook_url = f"https://uae-market-production.up.railway.app/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+    return tg_api("setWebhook", {"url": webhook_url})
 
-    r = requests.post(url, json={"url": webhook_url})
-    return r.json()
 
-# =========================
-# Webhook Receiver
-# =========================
 @app.post("/api/telegram/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != TELEGRAM_WEBHOOK_SECRET:
-        return {"error": "unauthorized"}
+        return {"ok": False, "error": "unauthorized"}
 
     data = await request.json()
 
     try:
-        message = data["message"]["text"]
-        chat_id = data["message"]["chat"]["id"]
+        if "callback_query" in data:
+            cq = data["callback_query"]
+            chat_id = cq["message"]["chat"]["id"]
+            callback_id = cq["id"]
+            callback_data = cq["data"]
+            handle_callback(chat_id, callback_id, callback_data)
 
-        response_text = handle_message(message)
-
-        send_telegram(chat_id, response_text)
+        elif "message" in data:
+            msg = data["message"]
+            chat_id = msg["chat"]["id"]
+            text = msg.get("text", "")
+            handle_text_message(chat_id, text)
 
     except Exception as e:
-        print("Error:", e)
+        print("Telegram webhook error:", str(e))
 
     return {"ok": True}
 
-# =========================
-# Message Handler
-# =========================
-def handle_message(text):
-    text = text.upper()
 
-    if "EMAAR" in text:
-        return "📊 EMAAR تحليل:\nترند صاعد - دعم 11.7 - مقاومة 11.85"
+@app.get("/api/telegram/trades")
+def api_telegram_trades(chat_id: str, status: str = "OPEN"):
+    ensure_telegram_tables()
 
-    if "دخلت" in text:
-        return "✅ تم تسجيل الصفقة"
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    if "بعت" in text:
-        return "📉 تم اغلاق الصفقة وحساب الربح"
+    cur.execute("""
+        SELECT *
+        FROM telegram_trades
+        WHERE chat_id = %s
+          AND status = %s
+        ORDER BY id DESC
+    """, (str(chat_id), status))
 
-    return "❓ اكتب اسم السهم مثل: EMAAR"
+    rows = cur.fetchall()
+    conn.close()
 
-# =========================
-# Send Telegram
-# =========================
-def send_telegram(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": chat_id,
-        "text": text
-    })
+    return {
+        "count": len(rows),
+        "trades": rows
+    }
