@@ -2482,3 +2482,18 @@ def dashboard():
     </body>
     </html>
     """
+
+from fastapi import FastAPI
+from scanner import run_scan
+
+app = FastAPI()
+
+
+@app.get("/test")
+def test():
+    return {"ok": True}
+
+
+@app.get("/run-scan")
+def scan():
+    return run_scan()
