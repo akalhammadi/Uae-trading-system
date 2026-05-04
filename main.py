@@ -2244,3 +2244,7 @@ def dashboard():
     </body>
     </html>
     """
+
+@app.get("/test")
+def test():
+    return {"ok": True}
