@@ -1,6 +1,4 @@
 import os
-import time
-from urllib.parse import quote_plus
 import json
 import requests
 import psycopg2
@@ -72,13 +70,6 @@ SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "t
 SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
 SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
 
-# V9 Data Fix
-DATA_PROVIDER = os.getenv("DATA_PROVIDER", "TWELVEDATA").upper().strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", os.getenv("TWELVEDATA_API_KEY", ""))
-DATA_DEBUG_ENABLED = os.getenv("DATA_DEBUG_ENABLED", "true").lower() == "true"
-TWELVE_REQUEST_DELAY_SEC = float(os.getenv("TWELVE_REQUEST_DELAY_SEC", "1.2"))
-TWELVE_MAX_CANDIDATES = int(os.getenv("TWELVE_MAX_CANDIDATES", "2"))
-
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
 LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
@@ -113,74 +104,6 @@ def db():
 
 def normalize_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace(" ", "").strip()
-
-# ============================================================
-# V9 DATA SYMBOL FIX
-# ============================================================
-UAE_SYMBOL_ALIASES = {
-    # V10: TwelveData UAE format first. Use .AE priority to reduce API credits.
-    "EMAAR": ["EMAAR.AE", "DFM:EMAAR"],
-    "EMAARDEV": ["EMAARDEV.AE", "DFM:EMAARDEV"],
-    "DEWA": ["DEWA.AE", "DFM:DEWA"],
-    "SALIK": ["SALIK.AE", "DFM:SALIK"],
-    "TECOM": ["TECOM.AE", "DFM:TECOM"],
-    "DIC": ["DIC.AE", "DFM:DIC"],
-    "DFM": ["DFM.AE", "DFM:DFM"],
-    "DU": ["DU.AE", "DFM:DU"],
-    "SHUAA": ["SHUAA.AE", "DFM:SHUAA"],
-    "GULFNAV": ["GULFNAV.AE", "DFM:GULFNAV"],
-    "AJMANBANK": ["AJMANBANK.AE", "DFM:AJMANBANK"],
-    "AIRARABIA": ["AIRARABIA.AE", "DFM:AIRARABIA"],
-    "AMLAK": ["AMLAK.AE", "DFM:AMLAK"],
-    "DTC": ["DTC.AE", "DFM:DTC"],
-    "TALABAT": ["TALABAT.AE", "DFM:TALABAT"],
-
-    "ALDAR": ["ALDAR.AE", "ADX:ALDAR"],
-    "ADNOCGAS": ["ADNOCGAS.AE", "ADX:ADNOCGAS"],
-    "ADNOCDRILL": ["ADNOCDRILL.AE", "ADX:ADNOCDRILL"],
-    "ADNOCDIST": ["ADNOCDIST.AE", "ADX:ADNOCDIST"],
-    "ADPORTS": ["ADPORTS.AE", "ADX:ADPORTS"],
-    "BOROUGE": ["BOROUGE.AE", "ADX:BOROUGE"],
-    "EAND": ["EAND.AE", "ADX:EAND", "ETISALAT.AE"],
-    "FAB": ["FAB.AE", "ADX:FAB"],
-    "ADIB": ["ADIB.AE", "ADX:ADIB"],
-    "RAKBANK": ["RAKBANK.AE", "ADX:RAKBANK"],
-    "RAKPROP": ["RAKPROP.AE", "ADX:RAKPROP"],
-    "NMDC": ["NMDC.AE", "ADX:NMDC"],
-    "TAQA": ["TAQA.AE", "ADX:TAQA"],
-    "JULPHAR": ["JULPHAR.AE", "ADX:JULPHAR"],
-    "ESHRAQ": ["ESHRAQ.AE", "ADX:ESHRAQ"],
-    "GFH": ["GFH.AE", "ADX:GFH"],
-    "GHITHA": ["GHITHA.AE", "ADX:GHITHA"],
-    "MANAZEL": ["MANAZEL.AE", "ADX:MANAZEL"],
-    "PRESIGHT": ["PRESIGHT.AE", "ADX:PRESIGHT"],
-    "SIB": ["SIB.AE", "ADX:SIB"],
-    "UPP": ["UPP.AE", "ADX:UPP"],
-    "2POINTZERO": ["2POINTZERO.AE", "ADX:2POINTZERO"],
-    "INVICTUS": ["INVICTUS.AE", "ADX:INVICTUS"],
-    "MODON": ["MODON.AE", "ADX:MODON"],
-    "EMPOWER": ["EMPOWER.AE", "DFM:EMPOWER"],
-    "SPACE42": ["SPACE42.AE", "ADX:SPACE42"],
-    "PUREHEALTH": ["PUREHEALTH.AE", "ADX:PUREHEALTH"],
-    "ALEFEDT": ["ALEFEDT.AE", "ADX:ALEFEDT"],
-}
-def symbol_candidates(symbol: str):
-    s = normalize_symbol(symbol)
-    generic = [f"{s}.AE", f"ADX:{s}", f"DFM:{s}"]
-    out = []
-    for x in UAE_SYMBOL_ALIASES.get(s, []) + generic:
-        if x and x not in out:
-            out.append(x)
-    return out[:max(1, TWELVE_MAX_CANDIDATES)]
-
-def interval_candidates(interval: str):
-    i = str(interval).upper()
-    if i in ["60", "1H", "HOUR", "HOURLY"]:
-        return ["1h"]
-    if i in ["1D", "D", "DAY", "DAILY", "1DAY"]:
-        return ["1day"]
-    return [interval]
-
 
 def safe_float(value, default=None):
     try:
@@ -599,48 +522,20 @@ async def tradingview_webhook(request: Request):
 # CANDLES
 # ============================================================
 
-def get_candles(symbol: str, interval: str = "1day", outputsize: int = 120):
-    """V9 robust data loader for UAE symbols using TwelveData."""
-    if not TWELVE_DATA_API_KEY:
-        return []
-    for sym in symbol_candidates(symbol):
-        for iv in interval_candidates(interval):
-            try:
-                url = (
-                    "https://api.twelvedata.com/time_series"
-                    f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
-                    f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
-                )
-                time.sleep(TWELVE_REQUEST_DELAY_SEC)
-                r = requests.get(url, timeout=20)
-                data = r.json()
-                if isinstance(data, dict) and data.get("status") == "error":
-                    continue
-                values = data.get("values") if isinstance(data, dict) else None
-                if not values:
-                    continue
-                candles = []
-                for row in reversed(values):
-                    try:
-                        candles.append({
-                            "datetime": row.get("datetime"),
-                            "open": float(row.get("open")),
-                            "high": float(row.get("high")),
-                            "low": float(row.get("low")),
-                            "close": float(row.get("close")),
-                            "volume": float(row.get("volume") or 0),
-                            "provider_symbol": sym,
-                            "provider_interval": iv,
-                        })
-                    except Exception:
-                        pass
-                if candles:
-                    return candles
-            except Exception:
-                continue
-    return []
+def get_candles(symbol: str, timeframe: str, limit: int = 220):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM candles
+        WHERE symbol=%s AND timeframe=%s
+        ORDER BY id DESC
+        LIMIT %s
+    """, (normalize_symbol(symbol), timeframe, limit))
+    rows = list(reversed(cur.fetchall()))
+    conn.close()
+    return rows
 
-
+@app.get("/api/candles/latest")
 def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1447,67 +1342,6 @@ def api_observations(limit: int = 100):
     conn.close()
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
-
-@app.get("/api/v10/debug-data")
-def v10_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int = 20):
-    return v9_debug_data(symbol=symbol, interval=interval, outputsize=outputsize)
-
-@app.get("/api/v10/debug-watchlist")
-def v10_debug_watchlist(limit: int = 10):
-    return v9_debug_watchlist(limit=limit)
-
-@app.get("/api/v10/reset-and-scan")
-def v10_reset_and_scan(send: bool = False):
-    try:
-        set_batch_cursor(0)
-    except Exception:
-        pass
-    return v8_safe_scan(send=send)
-
-@app.get("/api/v9/debug-data")
-def v9_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int = 20):
-    s = normalize_symbol(symbol)
-    attempts = []
-    if not TWELVE_DATA_API_KEY:
-        return {"ok": False, "symbol": s, "error": "TWELVE_DATA_API_KEY missing"}
-    for sym in symbol_candidates(s):
-        for iv in interval_candidates(interval):
-            try:
-                url = (
-                    "https://api.twelvedata.com/time_series"
-                    f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
-                    f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
-                )
-                time.sleep(TWELVE_REQUEST_DELAY_SEC)
-                r = requests.get(url, timeout=20)
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {"raw": r.text[:300]}
-                values = data.get("values") if isinstance(data, dict) else None
-                item = {
-                    "candidate": sym, "interval": iv, "http": r.status_code,
-                    "status": data.get("status") if isinstance(data, dict) else None,
-                    "message": data.get("message") if isinstance(data, dict) else None,
-                    "values_count": len(values) if values else 0,
-                    "latest": values[0] if values else None,
-                }
-                attempts.append(item)
-                if values:
-                    return {"ok": True, "symbol": s, "working_symbol": sym,
-                            "working_interval": iv, "values_count": len(values),
-                            "latest": values[0], "attempts": attempts}
-            except Exception as e:
-                attempts.append({"candidate": sym, "interval": iv, "error": str(e)})
-    return {"ok": False, "symbol": s, "attempts": attempts}
-
-@app.get("/api/v9/debug-watchlist")
-def v9_debug_watchlist(limit: int = 10):
-    out = []
-    for s in WATCHLIST[:max(1, min(limit, len(WATCHLIST)))]:
-        d = v9_debug_data(symbol=s, interval="1day", outputsize=5)
-        out.append({"symbol": s, "ok": d.get("ok"), "working_symbol": d.get("working_symbol")})
-    return {"count": len(out), "results": out}
 
 @app.get("/api/v8/stable-health")
 def v8_stable_health():
@@ -2482,18 +2316,3 @@ def dashboard():
     </body>
     </html>
     """
-
-from fastapi import FastAPI
-from scanner import run_scan
-
-app = FastAPI()
-
-
-@app.get("/test")
-def test():
-    return {"ok": True}
-
-
-@app.get("/run-scan")
-def scan():
-    return run_scan()
