@@ -2248,3 +2248,14 @@ def dashboard():
 @app.get("/test")
 def test():
     return {"ok": True}
+
+@app.get("/api/cron/hourly-scan")
+def hourly_scan(secret: str, send: bool = False):
+    try:
+        result = run_scan("HOURLY")
+        return result
+    except Exception as e:
+        return {
+            "error": str(e),
+            "type": str(type(e))
+        }
