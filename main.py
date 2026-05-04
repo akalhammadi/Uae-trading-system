@@ -56,6 +56,10 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "20.0"))
 DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "true").lower() == "true"
 
+# V7 Batch Scanner
+BATCH_SCAN_ENABLED = os.getenv("BATCH_SCAN_ENABLED", "true").lower() == "true"
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "18"))
+
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
 LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
@@ -335,6 +339,30 @@ def startup():
 
 def get_ai_mode():
     return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "LEARNING").upper().strip()
+
+def get_batch_cursor() -> int:
+    try:
+        return int(get_setting("batch_cursor", "0") or 0)
+    except Exception:
+        return 0
+
+def set_batch_cursor(value: int):
+    set_setting("batch_cursor", str(value))
+
+def get_batch_watchlist():
+    if not BATCH_SCAN_ENABLED:
+        return WATCHLIST, 0, len(WATCHLIST), True
+    total = len(WATCHLIST)
+    if total == 0:
+        return [], 0, 0, True
+    start = get_batch_cursor() % total
+    size = max(1, min(BATCH_SIZE, total))
+    end = min(start + size, total)
+    batch = WATCHLIST[start:end]
+    completed_cycle = end >= total
+    next_cursor = 0 if completed_cycle else end
+    set_batch_cursor(next_cursor)
+    return batch, start, end, completed_cycle
 
 def is_hybrid_strong_signal(sig: Dict[str, Any]) -> bool:
     return (
@@ -954,21 +982,23 @@ def latest_scan_result(scan_type: str = "COMBINED"):
     return json.loads(row["payload"])
 
 def run_scan(scan_type: str):
-    ranked = []
-    signals = []
-    coverage = []
+    scan_watchlist, batch_start, batch_end, completed_cycle = get_batch_watchlist()
 
-    for s in WATCHLIST:
+    current_ranked = []
+    signals = []
+    batch_coverage = []
+
+    for s in scan_watchlist:
         try:
             sigs = analyze_symbol(s, scan_type)
             best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
 
             if best:
-                ranked.append(best)
+                current_ranked.append(best)
                 if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
                     signals.append(best)
 
-            coverage.append({
+            batch_coverage.append({
                 "symbol": s,
                 "has_data": bool(best),
                 "action": classify_action(best) if best else "NO_DATA",
@@ -979,16 +1009,48 @@ def run_scan(scan_type: str):
                 "price": best.get("price") if best else None,
                 "rr": best.get("rr") if best else None,
                 "volume_ratio": best.get("volume_ratio") if best else None,
-                "ai_comment": ai_comment(best) if best else "No data yet"
+                "ai_comment": ai_comment(best) if best else "No data yet",
+                "last_batch_update": utc_now()
             })
         except Exception as e:
-            coverage.append({
+            batch_coverage.append({
                 "symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR",
                 "score": None, "rank_score": None, "strength": str(e), "price": None,
-                "rr": None, "volume_ratio": None, "ai_comment": str(e)
+                "rr": None, "volume_ratio": None, "ai_comment": str(e),
+                "last_batch_update": utc_now()
             })
 
-    ranked = sorted(ranked, key=lambda x: x.get("rank_score", 0), reverse=True)
+    prev = latest_scan_result("COMBINED") or {}
+    prev_coverage = prev.get("coverage", []) or []
+    merged_by_symbol = {x.get("symbol"): x for x in prev_coverage if x.get("symbol")}
+    for x in batch_coverage:
+        merged_by_symbol[x.get("symbol")] = x
+
+    coverage = []
+    for sym in WATCHLIST:
+        if sym in merged_by_symbol:
+            coverage.append(merged_by_symbol[sym])
+        else:
+            coverage.append({
+                "symbol": sym,
+                "has_data": False,
+                "action": "PENDING",
+                "model_action": "PENDING",
+                "score": None,
+                "rank_score": None,
+                "strength": None,
+                "price": None,
+                "rr": None,
+                "volume_ratio": None,
+                "ai_comment": "Waiting for batch scan"
+            })
+
+    ranked = sorted(
+        [x for x in coverage if x.get("has_data")],
+        key=lambda x: x.get("rank_score") or x.get("score") or 0,
+        reverse=True
+    )
+
     signals = sorted(signals, key=lambda x: x.get("rank_score", 0), reverse=True)
 
     payload = {
@@ -998,7 +1060,14 @@ def run_scan(scan_type: str):
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
         "watchlist_count": len(WATCHLIST),
-        "scanned_count": len(WATCHLIST),
+        "batch_enabled": BATCH_SCAN_ENABLED,
+        "batch_size": BATCH_SIZE,
+        "batch_start": batch_start,
+        "batch_end": batch_end,
+        "batch_symbols": scan_watchlist,
+        "completed_cycle": completed_cycle,
+        "scanned_count": len(scan_watchlist),
+        "total_covered_count": len([x for x in coverage if x.get("has_data")]),
         "signals_count": len(signals),
         "signals": signals[:20],
         "ranked_count": len(ranked),
@@ -1246,6 +1315,23 @@ def api_observations(limit: int = 100):
     rows = cur.fetchall()
     conn.close()
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
+
+
+@app.get("/api/v7/batch-status")
+def v7_batch_status():
+    cursor = get_batch_cursor()
+    return {
+        "batch_enabled": BATCH_SCAN_ENABLED,
+        "batch_size": BATCH_SIZE,
+        "batch_cursor": cursor,
+        "watchlist_count": len(WATCHLIST),
+        "next_symbols": WATCHLIST[cursor:cursor+BATCH_SIZE]
+    }
+
+@app.get("/api/v7/reset-batch")
+def v7_reset_batch():
+    set_batch_cursor(0)
+    return {"ok": True, "batch_cursor": 0}
 
 # ============================================================
 # CRON ENDPOINTS
@@ -1602,7 +1688,7 @@ def api_v6_report(send: bool = False):
     conn.close()
 
     msg = (
-        "ð <b>UAE PRO AI V6 Report</b>\n\n"
+        "📊 <b>UAE PRO AI V6 Report</b>\n\n"
         f"Mode: <b>{get_ai_mode()}</b>\n"
         f"Paper Open Trades: <b>{open_count}</b>\n"
         f"Paper Closed Trades: <b>{closed_count}</b>\n"
@@ -1778,14 +1864,14 @@ def signal_keyboard(symbol):
 
 def format_signal(sig):
     if sig.get("hybrid_alert"):
-        mode_note = "\nð¥ <b>STRONG LEARNING ALERT:</b> Ø¥Ø´Ø§Ø±Ø© ÙÙÙØ© Ø¬Ø¯Ø§Ù Ø£Ø«ÙØ§Ø¡ Ø§ÙØªØ¹ÙÙ. ÙÙØ³Øª Ø¯Ø®ÙÙ Ø¥ÙØ²Ø§ÙÙØ ÙÙÙÙØ§ ØªØ³ØªØ­Ù Ø§ÙÙØªØ§Ø¨Ø¹Ø©."
+        mode_note = "\n🔥 <b>STRONG LEARNING ALERT:</b> إشارة قوية جداً أثناء التعلم. ليست دخول إلزامي، لكنها تستحق المتابعة."
     elif sig["mode"] == "LEARNING":
-        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
+        mode_note = "\n⚠️ <b>LEARNING MODE:</b> ليست توصية دخول فعلية. النظام يتعلم فقط."
     else:
         mode_note = ""
     size = sig.get("position_sizing", {})
     return f"""
-ð <b>{sig['symbol']} PRO AI V3</b>
+📊 <b>{sig['symbol']} PRO AI V3</b>
 
 <b>Type:</b> {sig['type']}
 <b>Mode:</b> {sig['mode']}
@@ -1794,17 +1880,17 @@ def format_signal(sig):
 <b>Strength:</b> {sig['strength']}
 <b>Score:</b> {sig['score']}
 
-ð° Price: <b>{sig['price']}</b>
-ð Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
-ð Stop: <b>{sig['stop_loss']}</b>
+💰 Price: <b>{sig['price']}</b>
+📍 Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
+🛑 Stop: <b>{sig['stop_loss']}</b>
 
-ð¯ Target 1: <b>{sig['target1']}</b>
-ð¯ Target 2: <b>{sig['target2']}</b>
-ð¯ Target 3: <b>{sig['target3']}</b>
+🎯 Target 1: <b>{sig['target1']}</b>
+🎯 Target 2: <b>{sig['target2']}</b>
+🎯 Target 3: <b>{sig['target3']}</b>
 
-ð Expected: <b>{sig['expected_move_pct']}%</b>
-âï¸ Risk: <b>{sig['risk_pct']}%</b>
-ð RR: <b>{sig['rr']}</b>
+📈 Expected: <b>{sig['expected_move_pct']}%</b>
+⚖️ Risk: <b>{sig['risk_pct']}%</b>
+📐 RR: <b>{sig['rr']}</b>
 
 Position Size:
 Qty: {size.get('qty')}
@@ -1815,7 +1901,7 @@ RSI: {sig['rsi']}
 Volume Ratio: {sig['volume_ratio']}
 Trend: {sig['trend']}
 
-ð {esc(sig['reason'])}
+📌 {esc(sig['reason'])}
 {mode_note}
 
 Dashboard:
@@ -1823,16 +1909,16 @@ Dashboard:
 """.strip()
 
 def format_scan_summary(scan, title):
-    lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
+    lines = [f"🧠 <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
     for s in scan["signals"][:TELEGRAM_TOP_N]:
-        lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
+        lines.append(f"• <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
     lines.append("")
     lines.append(DASHBOARD_URL)
     return "\n".join(lines)
 
 def format_readiness(rep):
     return f"""
-ð§  <b>AI Readiness Report</b>
+🧠 <b>AI Readiness Report</b>
 
 Mode: <b>{rep['mode']}</b>
 Status: <b>{rep['status']}</b>
@@ -1865,7 +1951,7 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
 
     scan = latest_scan_result("COMBINED")
     if not scan:
-        msg = "ð UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
+        msg = "📉 UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
         if not dry_run:
             tg_main_send(msg)
         return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
@@ -1877,15 +1963,17 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
     items = sorted(items, key=lambda x: (x.get("rank_score") or x.get("score") or 0), reverse=True)
 
     if not items:
-        msg = "ð <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
+        msg = "📉 <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
         if not dry_run:
             tg_main_send(msg)
         return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
 
     lines = []
-    lines.append("ð <b>UAE PRO AI V5 - Ranked Opportunities</b>")
+    lines.append("📊 <b>UAE PRO AI V5 - Ranked Opportunities</b>")
     lines.append(f"Mode: <b>{get_ai_mode()}</b>")
     lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
+    if scan.get("batch_enabled"):
+        lines.append(f"Batch: <b>{scan.get('batch_start')} - {scan.get('batch_end')}</b> / {scan.get('watchlist_count')} | Covered: <b>{scan.get('total_covered_count')}</b>")
     lines.append("")
     lines.append("Ranking from strongest to weakest:")
     lines.append("")
@@ -1906,10 +1994,10 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         comment = x.get("ai_comment") or ""
 
         if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
-            status = "ð¥ TRADE CANDIDATE"
+            status = "🔥 TRADE CANDIDATE"
             real_opportunities += 1
         elif strength in ["VERY STRONG", "STRONG"]:
-            status = "ð STRONG WATCH"
+            status = "👀 STRONG WATCH"
         elif action in ["NO_DATA", "ERROR"]:
             status = "WEAK / NO DATA"
         else:
@@ -1944,16 +2032,16 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         })
 
     if real_opportunities == 0:
-        lines.append("ð Summary: No confirmed trade setup now. Current market list is watch/weak.")
+        lines.append("📌 Summary: No confirmed trade setup now. Current market list is watch/weak.")
     else:
-        lines.append(f"ð Summary: {real_opportunities} trade candidate(s) for review.")
+        lines.append(f"📌 Summary: {real_opportunities} trade candidate(s) for review.")
 
     lines.append("")
     if get_ai_mode() == "LIVE" and LIVE_TRADING_ENABLED:
         if LIVE_REQUIRES_CONFIRMATION:
-            lines.append("â ï¸ Live trading is enabled, but confirmation is required before any order.")
+            lines.append("⚠️ Live trading is enabled, but confirmation is required before any order.")
         else:
-            lines.append("â ï¸ Live auto-order mode is enabled. Check broker and risk settings.")
+            lines.append("⚠️ Live auto-order mode is enabled. Check broker and risk settings.")
     else:
         lines.append("Mode note: No real broker order will be placed unless LIVE_TRADING_ENABLED=true and broker webhook is configured.")
 
@@ -2007,17 +2095,17 @@ async def telegram_webhook(secret: str, request: Request):
             text = msg.get("text", "").strip()
             upper = text.upper()
 
-            if upper in ["Ø¬Ø§ÙØ²ÙØ©", "READINESS"]:
+            if upper in ["جاهزية", "READINESS"]:
                 return tg_send(chat_id, format_readiness(readiness_report()))
 
-            if upper.startswith("Ø­ÙÙ"):
+            if upper.startswith("حلل"):
                 parts = upper.split()
                 if len(parts) >= 2:
                     sigs = analyze_symbol(parts[1], "ALL")
                     if sigs:
                         best = max(sigs, key=lambda x: x["score"])
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                    return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+                    return tg_send(chat_id, "لا توجد بيانات كافية.")
 
             if upper.startswith("ENTERED"):
                 parts = text.split()
@@ -2038,7 +2126,7 @@ async def telegram_webhook(secret: str, request: Request):
                         trade_id = cur.fetchone()[0]
                         conn.commit()
                         conn.close()
-                        return tg_send(chat_id, f"â Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
+                        return tg_send(chat_id, f"✅ Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
                 return tg_send(chat_id, "Use: ENTERED SYMBOL PRICE AMOUNT\nExample: ENTERED EMAAR 11.22 40000")
 
             if upper.startswith("SOLD"):
@@ -2048,7 +2136,7 @@ async def telegram_webhook(secret: str, request: Request):
                     exit_price = float(parts[2])
                     result = close_trade(trade_id, exit_price, "Telegram close")
                     if result.get("ok"):
-                        return tg_send(chat_id, f"â Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
+                        return tg_send(chat_id, f"✅ Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
                     return tg_send(chat_id, f"Could not close trade: {result}")
                 return tg_send(chat_id, "Use: SOLD TRADE_ID EXIT_PRICE\nExample: SOLD 12 11.40")
 
@@ -2076,7 +2164,7 @@ async def telegram_webhook(secret: str, request: Request):
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+                return tg_send(chat_id, "لا توجد بيانات كافية.")
 
             if action == "entered":
                 symbol = parts[1]
