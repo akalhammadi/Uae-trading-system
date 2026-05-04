@@ -1,4 +1,5 @@
 import os
+import time
 from urllib.parse import quote_plus
 import json
 import requests
@@ -75,6 +76,8 @@ SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").l
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "TWELVEDATA").upper().strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", os.getenv("TWELVEDATA_API_KEY", ""))
 DATA_DEBUG_ENABLED = os.getenv("DATA_DEBUG_ENABLED", "true").lower() == "true"
+TWELVE_REQUEST_DELAY_SEC = float(os.getenv("TWELVE_REQUEST_DELAY_SEC", "1.2"))
+TWELVE_MAX_CANDIDATES = int(os.getenv("TWELVE_MAX_CANDIDATES", "2"))
 
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
@@ -115,65 +118,69 @@ def normalize_symbol(symbol: str) -> str:
 # V9 DATA SYMBOL FIX
 # ============================================================
 UAE_SYMBOL_ALIASES = {
-    "EMAAR": ["DFM:EMAAR", "EMAAR", "EMAAR.DU", "EMAAR.AE"],
-    "EMAARDEV": ["DFM:EMAARDEV", "EMAARDEV", "EMAARDEV.DU", "EMAARDEV.AE"],
-    "DEWA": ["DFM:DEWA", "DEWA", "DEWA.DU", "DEWA.AE"],
-    "SALIK": ["DFM:SALIK", "SALIK", "SALIK.DU", "SALIK.AE"],
-    "TECOM": ["DFM:TECOM", "TECOM", "TECOM.DU", "TECOM.AE"],
-    "DIC": ["DFM:DIC", "DIC", "DIC.DU"],
-    "DFM": ["DFM:DFM", "DFM", "DFM.DU"],
-    "DU": ["DFM:DU", "DU", "DU.DU"],
-    "SHUAA": ["DFM:SHUAA", "SHUAA", "SHUAA.DU"],
-    "GULFNAV": ["DFM:GULFNAV", "GULFNAV", "GULFNAV.DU"],
-    "AJMANBANK": ["DFM:AJMANBANK", "AJMANBANK", "AJMANBANK.DU"],
-    "AIRARABIA": ["DFM:AIRARABIA", "AIRARABIA", "AIRARABIA.DU"],
-    "AMLAK": ["DFM:AMLAK", "AMLAK", "AMLAK.DU"],
-    "DTC": ["DFM:DTC", "DTC", "DTC.DU"],
-    "TALABAT": ["DFM:TALABAT", "TALABAT", "TALABAT.DU"],
-    "ALDAR": ["ADX:ALDAR", "ALDAR", "ALDAR.AD", "ALDAR.AE"],
-    "ADNOCGAS": ["ADX:ADNOCGAS", "ADNOCGAS", "ADNOCGAS.AD"],
-    "ADNOCDRILL": ["ADX:ADNOCDRILL", "ADNOCDRILL", "ADNOCDRILL.AD"],
-    "ADNOCDIST": ["ADX:ADNOCDIST", "ADNOCDIST", "ADNOCDIST.AD"],
-    "ADPORTS": ["ADX:ADPORTS", "ADPORTS", "ADPORTS.AD"],
-    "BOROUGE": ["ADX:BOROUGE", "BOROUGE", "BOROUGE.AD"],
-    "EAND": ["ADX:EAND", "EAND", "EAND.AD", "ETISALAT.AD"],
-    "FAB": ["ADX:FAB", "FAB", "FAB.AD"],
-    "ADIB": ["ADX:ADIB", "ADIB", "ADIB.AD"],
-    "RAKBANK": ["ADX:RAKBANK", "RAKBANK", "RAKBANK.AD"],
-    "RAKPROP": ["ADX:RAKPROP", "RAKPROP", "RAKPROP.AD"],
-    "NMDC": ["ADX:NMDC", "NMDC", "NMDC.AD"],
-    "TAQA": ["ADX:TAQA", "TAQA", "TAQA.AD"],
-    "JULPHAR": ["ADX:JULPHAR", "JULPHAR", "JULPHAR.AD"],
-    "ESHRAQ": ["ADX:ESHRAQ", "ESHRAQ", "ESHRAQ.AD"],
-    "GFH": ["ADX:GFH", "GFH", "GFH.AD"],
-    "GHITHA": ["ADX:GHITHA", "GHITHA", "GHITHA.AD"],
-    "MANAZEL": ["ADX:MANAZEL", "MANAZEL", "MANAZEL.AD"],
-    "PRESIGHT": ["ADX:PRESIGHT", "PRESIGHT", "PRESIGHT.AD"],
-    "SIB": ["ADX:SIB", "SIB", "SIB.AD"],
-    "UPP": ["ADX:UPP", "UPP", "UPP.AD"],
-    "2POINTZERO": ["ADX:2POINTZERO", "2POINTZERO", "2POINTZERO.AD"],
-    "INVICTUS": ["ADX:INVICTUS", "INVICTUS", "INVICTUS.AD"],
-    "MODON": ["ADX:MODON", "MODON", "MODON.AD"],
-    "EMPOWER": ["DFM:EMPOWER", "EMPOWER", "EMPOWER.DU"],
-    "SPACE42": ["ADX:SPACE42", "SPACE42", "SPACE42.AD"],
-    "PUREHEALTH": ["ADX:PUREHEALTH", "PUREHEALTH", "PUREHEALTH.AD"],
-    "ALEFEDT": ["ADX:ALEFEDT", "ALEFEDT", "ALEFEDT.AD"],
+    # V10: TwelveData UAE format first. Use .AE priority to reduce API credits.
+    "EMAAR": ["EMAAR.AE", "DFM:EMAAR"],
+    "EMAARDEV": ["EMAARDEV.AE", "DFM:EMAARDEV"],
+    "DEWA": ["DEWA.AE", "DFM:DEWA"],
+    "SALIK": ["SALIK.AE", "DFM:SALIK"],
+    "TECOM": ["TECOM.AE", "DFM:TECOM"],
+    "DIC": ["DIC.AE", "DFM:DIC"],
+    "DFM": ["DFM.AE", "DFM:DFM"],
+    "DU": ["DU.AE", "DFM:DU"],
+    "SHUAA": ["SHUAA.AE", "DFM:SHUAA"],
+    "GULFNAV": ["GULFNAV.AE", "DFM:GULFNAV"],
+    "AJMANBANK": ["AJMANBANK.AE", "DFM:AJMANBANK"],
+    "AIRARABIA": ["AIRARABIA.AE", "DFM:AIRARABIA"],
+    "AMLAK": ["AMLAK.AE", "DFM:AMLAK"],
+    "DTC": ["DTC.AE", "DFM:DTC"],
+    "TALABAT": ["TALABAT.AE", "DFM:TALABAT"],
+
+    "ALDAR": ["ALDAR.AE", "ADX:ALDAR"],
+    "ADNOCGAS": ["ADNOCGAS.AE", "ADX:ADNOCGAS"],
+    "ADNOCDRILL": ["ADNOCDRILL.AE", "ADX:ADNOCDRILL"],
+    "ADNOCDIST": ["ADNOCDIST.AE", "ADX:ADNOCDIST"],
+    "ADPORTS": ["ADPORTS.AE", "ADX:ADPORTS"],
+    "BOROUGE": ["BOROUGE.AE", "ADX:BOROUGE"],
+    "EAND": ["EAND.AE", "ADX:EAND", "ETISALAT.AE"],
+    "FAB": ["FAB.AE", "ADX:FAB"],
+    "ADIB": ["ADIB.AE", "ADX:ADIB"],
+    "RAKBANK": ["RAKBANK.AE", "ADX:RAKBANK"],
+    "RAKPROP": ["RAKPROP.AE", "ADX:RAKPROP"],
+    "NMDC": ["NMDC.AE", "ADX:NMDC"],
+    "TAQA": ["TAQA.AE", "ADX:TAQA"],
+    "JULPHAR": ["JULPHAR.AE", "ADX:JULPHAR"],
+    "ESHRAQ": ["ESHRAQ.AE", "ADX:ESHRAQ"],
+    "GFH": ["GFH.AE", "ADX:GFH"],
+    "GHITHA": ["GHITHA.AE", "ADX:GHITHA"],
+    "MANAZEL": ["MANAZEL.AE", "ADX:MANAZEL"],
+    "PRESIGHT": ["PRESIGHT.AE", "ADX:PRESIGHT"],
+    "SIB": ["SIB.AE", "ADX:SIB"],
+    "UPP": ["UPP.AE", "ADX:UPP"],
+    "2POINTZERO": ["2POINTZERO.AE", "ADX:2POINTZERO"],
+    "INVICTUS": ["INVICTUS.AE", "ADX:INVICTUS"],
+    "MODON": ["MODON.AE", "ADX:MODON"],
+    "EMPOWER": ["EMPOWER.AE", "DFM:EMPOWER"],
+    "SPACE42": ["SPACE42.AE", "ADX:SPACE42"],
+    "PUREHEALTH": ["PUREHEALTH.AE", "ADX:PUREHEALTH"],
+    "ALEFEDT": ["ALEFEDT.AE", "ADX:ALEFEDT"],
 }
 def symbol_candidates(symbol: str):
     s = normalize_symbol(symbol)
-    generic = [s, f"DFM:{s}", f"ADX:{s}", f"{s}.DU", f"{s}.AD", f"{s}.AE"]
+    generic = [f"{s}.AE", f"ADX:{s}", f"DFM:{s}"]
     out = []
     for x in UAE_SYMBOL_ALIASES.get(s, []) + generic:
         if x and x not in out:
             out.append(x)
-    return out
+    return out[:max(1, TWELVE_MAX_CANDIDATES)]
+
 def interval_candidates(interval: str):
     i = str(interval).upper()
     if i in ["60", "1H", "HOUR", "HOURLY"]:
-        return ["1h", "60min", "60"]
+        return ["1h"]
     if i in ["1D", "D", "DAY", "DAILY", "1DAY"]:
-        return ["1day", "1D", "1d"]
+        return ["1day"]
     return [interval]
+
 
 def safe_float(value, default=None):
     try:
@@ -604,6 +611,7 @@ def get_candles(symbol: str, interval: str = "1day", outputsize: int = 120):
                     f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
                     f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
                 )
+                time.sleep(TWELVE_REQUEST_DELAY_SEC)
                 r = requests.get(url, timeout=20)
                 data = r.json()
                 if isinstance(data, dict) and data.get("status") == "error":
@@ -1440,6 +1448,22 @@ def api_observations(limit: int = 100):
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
 
+@app.get("/api/v10/debug-data")
+def v10_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int = 20):
+    return v9_debug_data(symbol=symbol, interval=interval, outputsize=outputsize)
+
+@app.get("/api/v10/debug-watchlist")
+def v10_debug_watchlist(limit: int = 10):
+    return v9_debug_watchlist(limit=limit)
+
+@app.get("/api/v10/reset-and-scan")
+def v10_reset_and_scan(send: bool = False):
+    try:
+        set_batch_cursor(0)
+    except Exception:
+        pass
+    return v8_safe_scan(send=send)
+
 @app.get("/api/v9/debug-data")
 def v9_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int = 20):
     s = normalize_symbol(symbol)
@@ -1454,6 +1478,7 @@ def v9_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int
                     f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
                     f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
                 )
+                time.sleep(TWELVE_REQUEST_DELAY_SEC)
                 r = requests.get(url, timeout=20)
                 try:
                     data = r.json()
