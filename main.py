@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote_plus
 import json
 import requests
 import psycopg2
@@ -70,6 +71,11 @@ SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "t
 SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
 SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
 
+# V9 Data Fix
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "TWELVEDATA").upper().strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", os.getenv("TWELVEDATA_API_KEY", ""))
+DATA_DEBUG_ENABLED = os.getenv("DATA_DEBUG_ENABLED", "true").lower() == "true"
+
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
 LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
@@ -104,6 +110,70 @@ def db():
 
 def normalize_symbol(symbol: str) -> str:
     return str(symbol or "").upper().replace(" ", "").strip()
+
+# ============================================================
+# V9 DATA SYMBOL FIX
+# ============================================================
+UAE_SYMBOL_ALIASES = {
+    "EMAAR": ["DFM:EMAAR", "EMAAR", "EMAAR.DU", "EMAAR.AE"],
+    "EMAARDEV": ["DFM:EMAARDEV", "EMAARDEV", "EMAARDEV.DU", "EMAARDEV.AE"],
+    "DEWA": ["DFM:DEWA", "DEWA", "DEWA.DU", "DEWA.AE"],
+    "SALIK": ["DFM:SALIK", "SALIK", "SALIK.DU", "SALIK.AE"],
+    "TECOM": ["DFM:TECOM", "TECOM", "TECOM.DU", "TECOM.AE"],
+    "DIC": ["DFM:DIC", "DIC", "DIC.DU"],
+    "DFM": ["DFM:DFM", "DFM", "DFM.DU"],
+    "DU": ["DFM:DU", "DU", "DU.DU"],
+    "SHUAA": ["DFM:SHUAA", "SHUAA", "SHUAA.DU"],
+    "GULFNAV": ["DFM:GULFNAV", "GULFNAV", "GULFNAV.DU"],
+    "AJMANBANK": ["DFM:AJMANBANK", "AJMANBANK", "AJMANBANK.DU"],
+    "AIRARABIA": ["DFM:AIRARABIA", "AIRARABIA", "AIRARABIA.DU"],
+    "AMLAK": ["DFM:AMLAK", "AMLAK", "AMLAK.DU"],
+    "DTC": ["DFM:DTC", "DTC", "DTC.DU"],
+    "TALABAT": ["DFM:TALABAT", "TALABAT", "TALABAT.DU"],
+    "ALDAR": ["ADX:ALDAR", "ALDAR", "ALDAR.AD", "ALDAR.AE"],
+    "ADNOCGAS": ["ADX:ADNOCGAS", "ADNOCGAS", "ADNOCGAS.AD"],
+    "ADNOCDRILL": ["ADX:ADNOCDRILL", "ADNOCDRILL", "ADNOCDRILL.AD"],
+    "ADNOCDIST": ["ADX:ADNOCDIST", "ADNOCDIST", "ADNOCDIST.AD"],
+    "ADPORTS": ["ADX:ADPORTS", "ADPORTS", "ADPORTS.AD"],
+    "BOROUGE": ["ADX:BOROUGE", "BOROUGE", "BOROUGE.AD"],
+    "EAND": ["ADX:EAND", "EAND", "EAND.AD", "ETISALAT.AD"],
+    "FAB": ["ADX:FAB", "FAB", "FAB.AD"],
+    "ADIB": ["ADX:ADIB", "ADIB", "ADIB.AD"],
+    "RAKBANK": ["ADX:RAKBANK", "RAKBANK", "RAKBANK.AD"],
+    "RAKPROP": ["ADX:RAKPROP", "RAKPROP", "RAKPROP.AD"],
+    "NMDC": ["ADX:NMDC", "NMDC", "NMDC.AD"],
+    "TAQA": ["ADX:TAQA", "TAQA", "TAQA.AD"],
+    "JULPHAR": ["ADX:JULPHAR", "JULPHAR", "JULPHAR.AD"],
+    "ESHRAQ": ["ADX:ESHRAQ", "ESHRAQ", "ESHRAQ.AD"],
+    "GFH": ["ADX:GFH", "GFH", "GFH.AD"],
+    "GHITHA": ["ADX:GHITHA", "GHITHA", "GHITHA.AD"],
+    "MANAZEL": ["ADX:MANAZEL", "MANAZEL", "MANAZEL.AD"],
+    "PRESIGHT": ["ADX:PRESIGHT", "PRESIGHT", "PRESIGHT.AD"],
+    "SIB": ["ADX:SIB", "SIB", "SIB.AD"],
+    "UPP": ["ADX:UPP", "UPP", "UPP.AD"],
+    "2POINTZERO": ["ADX:2POINTZERO", "2POINTZERO", "2POINTZERO.AD"],
+    "INVICTUS": ["ADX:INVICTUS", "INVICTUS", "INVICTUS.AD"],
+    "MODON": ["ADX:MODON", "MODON", "MODON.AD"],
+    "EMPOWER": ["DFM:EMPOWER", "EMPOWER", "EMPOWER.DU"],
+    "SPACE42": ["ADX:SPACE42", "SPACE42", "SPACE42.AD"],
+    "PUREHEALTH": ["ADX:PUREHEALTH", "PUREHEALTH", "PUREHEALTH.AD"],
+    "ALEFEDT": ["ADX:ALEFEDT", "ALEFEDT", "ALEFEDT.AD"],
+}
+def symbol_candidates(symbol: str):
+    s = normalize_symbol(symbol)
+    generic = [s, f"DFM:{s}", f"ADX:{s}", f"{s}.DU", f"{s}.AD", f"{s}.AE"]
+    out = []
+    for x in UAE_SYMBOL_ALIASES.get(s, []) + generic:
+        if x and x not in out:
+            out.append(x)
+    return out
+def interval_candidates(interval: str):
+    i = str(interval).upper()
+    if i in ["60", "1H", "HOUR", "HOURLY"]:
+        return ["1h", "60min", "60"]
+    if i in ["1D", "D", "DAY", "DAILY", "1DAY"]:
+        return ["1day", "1D", "1d"]
+    return [interval]
 
 def safe_float(value, default=None):
     try:
@@ -522,20 +592,47 @@ async def tradingview_webhook(request: Request):
 # CANDLES
 # ============================================================
 
-def get_candles(symbol: str, timeframe: str, limit: int = 220):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT * FROM candles
-        WHERE symbol=%s AND timeframe=%s
-        ORDER BY id DESC
-        LIMIT %s
-    """, (normalize_symbol(symbol), timeframe, limit))
-    rows = list(reversed(cur.fetchall()))
-    conn.close()
-    return rows
+def get_candles(symbol: str, interval: str = "1day", outputsize: int = 120):
+    """V9 robust data loader for UAE symbols using TwelveData."""
+    if not TWELVE_DATA_API_KEY:
+        return []
+    for sym in symbol_candidates(symbol):
+        for iv in interval_candidates(interval):
+            try:
+                url = (
+                    "https://api.twelvedata.com/time_series"
+                    f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
+                    f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
+                )
+                r = requests.get(url, timeout=20)
+                data = r.json()
+                if isinstance(data, dict) and data.get("status") == "error":
+                    continue
+                values = data.get("values") if isinstance(data, dict) else None
+                if not values:
+                    continue
+                candles = []
+                for row in reversed(values):
+                    try:
+                        candles.append({
+                            "datetime": row.get("datetime"),
+                            "open": float(row.get("open")),
+                            "high": float(row.get("high")),
+                            "low": float(row.get("low")),
+                            "close": float(row.get("close")),
+                            "volume": float(row.get("volume") or 0),
+                            "provider_symbol": sym,
+                            "provider_interval": iv,
+                        })
+                    except Exception:
+                        pass
+                if candles:
+                    return candles
+            except Exception:
+                continue
+    return []
 
-@app.get("/api/candles/latest")
+
 def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1343,6 +1440,50 @@ def api_observations(limit: int = 100):
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
 
+@app.get("/api/v9/debug-data")
+def v9_debug_data(symbol: str = "EMAAR", interval: str = "1day", outputsize: int = 20):
+    s = normalize_symbol(symbol)
+    attempts = []
+    if not TWELVE_DATA_API_KEY:
+        return {"ok": False, "symbol": s, "error": "TWELVE_DATA_API_KEY missing"}
+    for sym in symbol_candidates(s):
+        for iv in interval_candidates(interval):
+            try:
+                url = (
+                    "https://api.twelvedata.com/time_series"
+                    f"?symbol={quote_plus(sym)}&interval={quote_plus(iv)}"
+                    f"&outputsize={int(outputsize)}&apikey={quote_plus(TWELVE_DATA_API_KEY)}"
+                )
+                r = requests.get(url, timeout=20)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw": r.text[:300]}
+                values = data.get("values") if isinstance(data, dict) else None
+                item = {
+                    "candidate": sym, "interval": iv, "http": r.status_code,
+                    "status": data.get("status") if isinstance(data, dict) else None,
+                    "message": data.get("message") if isinstance(data, dict) else None,
+                    "values_count": len(values) if values else 0,
+                    "latest": values[0] if values else None,
+                }
+                attempts.append(item)
+                if values:
+                    return {"ok": True, "symbol": s, "working_symbol": sym,
+                            "working_interval": iv, "values_count": len(values),
+                            "latest": values[0], "attempts": attempts}
+            except Exception as e:
+                attempts.append({"candidate": sym, "interval": iv, "error": str(e)})
+    return {"ok": False, "symbol": s, "attempts": attempts}
+
+@app.get("/api/v9/debug-watchlist")
+def v9_debug_watchlist(limit: int = 10):
+    out = []
+    for s in WATCHLIST[:max(1, min(limit, len(WATCHLIST)))]:
+        d = v9_debug_data(symbol=s, interval="1day", outputsize=5)
+        out.append({"symbol": s, "ok": d.get("ok"), "working_symbol": d.get("working_symbol")})
+    return {"count": len(out), "results": out}
+
 @app.get("/api/v8/stable-health")
 def v8_stable_health():
     cursor = get_batch_cursor()
@@ -1429,7 +1570,7 @@ def hourly_scan(secret: str = "", send: bool = False):
             scan["errors_count"] = scan.get("errors_count", 0) + 1
             if SEND_TELEGRAM_ON_SCAN_ERROR:
                 try:
-                    tg_main_send(f"⚠️ UAE PRO AI V8 scan completed with send error: {str(e)}")
+                    tg_main_send(f"â ï¸ UAE PRO AI V8 scan completed with send error: {str(e)}")
                 except Exception:
                     pass
 
@@ -1760,7 +1901,7 @@ def api_v6_report(send: bool = False):
     conn.close()
 
     msg = (
-        "📊 <b>UAE PRO AI V6 Report</b>\n\n"
+        "ð <b>UAE PRO AI V6 Report</b>\n\n"
         f"Mode: <b>{get_ai_mode()}</b>\n"
         f"Paper Open Trades: <b>{open_count}</b>\n"
         f"Paper Closed Trades: <b>{closed_count}</b>\n"
@@ -1936,14 +2077,14 @@ def signal_keyboard(symbol):
 
 def format_signal(sig):
     if sig.get("hybrid_alert"):
-        mode_note = "\n🔥 <b>STRONG LEARNING ALERT:</b> إشارة قوية جداً أثناء التعلم. ليست دخول إلزامي، لكنها تستحق المتابعة."
+        mode_note = "\nð¥ <b>STRONG LEARNING ALERT:</b> Ø¥Ø´Ø§Ø±Ø© ÙÙÙØ© Ø¬Ø¯Ø§Ù Ø£Ø«ÙØ§Ø¡ Ø§ÙØªØ¹ÙÙ. ÙÙØ³Øª Ø¯Ø®ÙÙ Ø¥ÙØ²Ø§ÙÙØ ÙÙÙÙØ§ ØªØ³ØªØ­Ù Ø§ÙÙØªØ§Ø¨Ø¹Ø©."
     elif sig["mode"] == "LEARNING":
-        mode_note = "\n⚠️ <b>LEARNING MODE:</b> ليست توصية دخول فعلية. النظام يتعلم فقط."
+        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
     else:
         mode_note = ""
     size = sig.get("position_sizing", {})
     return f"""
-📊 <b>{sig['symbol']} PRO AI V3</b>
+ð <b>{sig['symbol']} PRO AI V3</b>
 
 <b>Type:</b> {sig['type']}
 <b>Mode:</b> {sig['mode']}
@@ -1952,17 +2093,17 @@ def format_signal(sig):
 <b>Strength:</b> {sig['strength']}
 <b>Score:</b> {sig['score']}
 
-💰 Price: <b>{sig['price']}</b>
-📍 Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
-🛑 Stop: <b>{sig['stop_loss']}</b>
+ð° Price: <b>{sig['price']}</b>
+ð Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
+ð Stop: <b>{sig['stop_loss']}</b>
 
-🎯 Target 1: <b>{sig['target1']}</b>
-🎯 Target 2: <b>{sig['target2']}</b>
-🎯 Target 3: <b>{sig['target3']}</b>
+ð¯ Target 1: <b>{sig['target1']}</b>
+ð¯ Target 2: <b>{sig['target2']}</b>
+ð¯ Target 3: <b>{sig['target3']}</b>
 
-📈 Expected: <b>{sig['expected_move_pct']}%</b>
-⚖️ Risk: <b>{sig['risk_pct']}%</b>
-📐 RR: <b>{sig['rr']}</b>
+ð Expected: <b>{sig['expected_move_pct']}%</b>
+âï¸ Risk: <b>{sig['risk_pct']}%</b>
+ð RR: <b>{sig['rr']}</b>
 
 Position Size:
 Qty: {size.get('qty')}
@@ -1973,7 +2114,7 @@ RSI: {sig['rsi']}
 Volume Ratio: {sig['volume_ratio']}
 Trend: {sig['trend']}
 
-📌 {esc(sig['reason'])}
+ð {esc(sig['reason'])}
 {mode_note}
 
 Dashboard:
@@ -1981,16 +2122,16 @@ Dashboard:
 """.strip()
 
 def format_scan_summary(scan, title):
-    lines = [f"🧠 <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
+    lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
     for s in scan["signals"][:TELEGRAM_TOP_N]:
-        lines.append(f"• <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
+        lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
     lines.append("")
     lines.append(DASHBOARD_URL)
     return "\n".join(lines)
 
 def format_readiness(rep):
     return f"""
-🧠 <b>AI Readiness Report</b>
+ð§  <b>AI Readiness Report</b>
 
 Mode: <b>{rep['mode']}</b>
 Status: <b>{rep['status']}</b>
@@ -2023,7 +2164,7 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
 
     scan = latest_scan_result("COMBINED")
     if not scan:
-        msg = "📉 UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
+        msg = "ð UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
         if not dry_run:
             tg_main_send(msg)
         return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
@@ -2035,13 +2176,13 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
     items = sorted(items, key=lambda x: (x.get("rank_score") or x.get("score") or 0), reverse=True)
 
     if not items:
-        msg = "📉 <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
+        msg = "ð <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
         if not dry_run:
             tg_main_send(msg)
         return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
 
     lines = []
-    lines.append("📊 <b>UAE PRO AI V5 - Ranked Opportunities</b>")
+    lines.append("ð <b>UAE PRO AI V5 - Ranked Opportunities</b>")
     lines.append(f"Mode: <b>{get_ai_mode()}</b>")
     lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
     if scan.get("batch_enabled"):
@@ -2066,10 +2207,10 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         comment = x.get("ai_comment") or ""
 
         if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
-            status = "🔥 TRADE CANDIDATE"
+            status = "ð¥ TRADE CANDIDATE"
             real_opportunities += 1
         elif strength in ["VERY STRONG", "STRONG"]:
-            status = "👀 STRONG WATCH"
+            status = "ð STRONG WATCH"
         elif action in ["NO_DATA", "ERROR"]:
             status = "WEAK / NO DATA"
         else:
@@ -2104,16 +2245,16 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         })
 
     if real_opportunities == 0:
-        lines.append("📌 Summary: No confirmed trade setup now. Current market list is watch/weak.")
+        lines.append("ð Summary: No confirmed trade setup now. Current market list is watch/weak.")
     else:
-        lines.append(f"📌 Summary: {real_opportunities} trade candidate(s) for review.")
+        lines.append(f"ð Summary: {real_opportunities} trade candidate(s) for review.")
 
     lines.append("")
     if get_ai_mode() == "LIVE" and LIVE_TRADING_ENABLED:
         if LIVE_REQUIRES_CONFIRMATION:
-            lines.append("⚠️ Live trading is enabled, but confirmation is required before any order.")
+            lines.append("â ï¸ Live trading is enabled, but confirmation is required before any order.")
         else:
-            lines.append("⚠️ Live auto-order mode is enabled. Check broker and risk settings.")
+            lines.append("â ï¸ Live auto-order mode is enabled. Check broker and risk settings.")
     else:
         lines.append("Mode note: No real broker order will be placed unless LIVE_TRADING_ENABLED=true and broker webhook is configured.")
 
@@ -2167,17 +2308,17 @@ async def telegram_webhook(secret: str, request: Request):
             text = msg.get("text", "").strip()
             upper = text.upper()
 
-            if upper in ["جاهزية", "READINESS"]:
+            if upper in ["Ø¬Ø§ÙØ²ÙØ©", "READINESS"]:
                 return tg_send(chat_id, format_readiness(readiness_report()))
 
-            if upper.startswith("حلل"):
+            if upper.startswith("Ø­ÙÙ"):
                 parts = upper.split()
                 if len(parts) >= 2:
                     sigs = analyze_symbol(parts[1], "ALL")
                     if sigs:
                         best = max(sigs, key=lambda x: x["score"])
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                    return tg_send(chat_id, "لا توجد بيانات كافية.")
+                    return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
             if upper.startswith("ENTERED"):
                 parts = text.split()
@@ -2198,7 +2339,7 @@ async def telegram_webhook(secret: str, request: Request):
                         trade_id = cur.fetchone()[0]
                         conn.commit()
                         conn.close()
-                        return tg_send(chat_id, f"✅ Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
+                        return tg_send(chat_id, f"â Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
                 return tg_send(chat_id, "Use: ENTERED SYMBOL PRICE AMOUNT\nExample: ENTERED EMAAR 11.22 40000")
 
             if upper.startswith("SOLD"):
@@ -2208,7 +2349,7 @@ async def telegram_webhook(secret: str, request: Request):
                     exit_price = float(parts[2])
                     result = close_trade(trade_id, exit_price, "Telegram close")
                     if result.get("ok"):
-                        return tg_send(chat_id, f"✅ Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
+                        return tg_send(chat_id, f"â Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
                     return tg_send(chat_id, f"Could not close trade: {result}")
                 return tg_send(chat_id, "Use: SOLD TRADE_ID EXIT_PRICE\nExample: SOLD 12 11.40")
 
@@ -2236,7 +2377,7 @@ async def telegram_webhook(secret: str, request: Request):
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "لا توجد بيانات كافية.")
+                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
             if action == "entered":
                 symbol = parts[1]
