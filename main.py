@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import json
 import requests
 import psycopg2
@@ -6,7 +7,7 @@ import psycopg2.extras
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Request
 from fastapi.responses import HTMLResponse
 
 
@@ -69,6 +70,13 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
 SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "true"
 SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
 SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
+
+# TradingView webhook
+TRADINGVIEW_WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "tv123")
+TRADINGVIEW_ALERTS_FILE = Path(os.getenv("TRADINGVIEW_ALERTS_FILE", "tradingview_alerts.json"))
+TRADINGVIEW_MAX_ALERTS = int(os.getenv("TRADINGVIEW_MAX_ALERTS", "1000"))
+TRADINGVIEW_SEND_TELEGRAM = os.getenv("TRADINGVIEW_SEND_TELEGRAM", "true").lower() == "true"
+
 
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
@@ -1341,6 +1349,143 @@ def api_observations(limit: int = 100):
     rows = cur.fetchall()
     conn.close()
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
+
+
+
+# ============================================================
+# TRADINGVIEW WEBHOOK ENDPOINTS
+# ============================================================
+
+def load_tradingview_alerts():
+    try:
+        if not TRADINGVIEW_ALERTS_FILE.exists():
+            return []
+        data = json.loads(TRADINGVIEW_ALERTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def save_tradingview_alert(alert: dict):
+    alerts = load_tradingview_alerts()
+    alerts.append(alert)
+    alerts = alerts[-TRADINGVIEW_MAX_ALERTS:]
+    TRADINGVIEW_ALERTS_FILE.write_text(json.dumps(alerts, ensure_ascii=False, indent=2), encoding="utf-8")
+    return alert
+
+def normalize_tv_payload(payload):
+    if not isinstance(payload, dict):
+        payload = {"raw": str(payload)}
+
+    symbol = (
+        payload.get("symbol")
+        or payload.get("ticker")
+        or payload.get("syminfo.ticker")
+        or payload.get("name")
+        or "UNKNOWN"
+    )
+    symbol = str(symbol).upper().replace("DFM:", "").replace("ADX:", "").replace(".DU", "").replace(".AD", "").strip()
+
+    price = payload.get("price") or payload.get("close") or payload.get("last") or payload.get("value")
+    try:
+        price = float(price) if price is not None and str(price) != "" else None
+    except Exception:
+        price = None
+
+    interval = payload.get("interval") or payload.get("timeframe") or payload.get("tf") or "UNKNOWN"
+    action = payload.get("action") or payload.get("signal") or payload.get("side") or "ALERT"
+    action = str(action).upper().strip()
+
+    return {
+        "received_at": utc_now(),
+        "symbol": symbol,
+        "price": price,
+        "interval": str(interval),
+        "action": action,
+        "raw": payload,
+    }
+
+def telegram_send_tradingview_alert(alert):
+    try:
+        msg = (
+            "ð¡ TradingView Alert\n\n"
+            f"Symbol: {alert.get('symbol')}\n"
+            f"Action: {alert.get('action')}\n"
+            f"Interval: {alert.get('interval')}\n"
+            f"Price: {alert.get('price') if alert.get('price') is not None else '-'}\n"
+            f"Time: {alert.get('received_at')}"
+        )
+        if "tg_main_send" in globals():
+            tg_main_send(msg)
+        elif "send_telegram_message" in globals():
+            send_telegram_message(msg)
+    except Exception:
+        pass
+
+@app.get("/api/webhook/tradingview")
+def tradingview_webhook_info():
+    return {
+        "ok": True,
+        "message": "TradingView webhook is ready. Use POST from TradingView.",
+        "url": "/api/webhook/tradingview",
+        "example_message": {
+            "secret": TRADINGVIEW_WEBHOOK_SECRET,
+            "symbol": "{{ticker}}",
+            "price": "{{close}}",
+            "time": "{{time}}",
+            "interval": "{{interval}}",
+            "action": "ALERT"
+        }
+    }
+
+@app.post("/api/webhook/tradingview")
+async def tradingview_webhook(request: Request, secret: str = ""):
+    try:
+        try:
+            payload = await request.json()
+        except Exception:
+            body = (await request.body()).decode("utf-8", errors="ignore")
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {"message": body}
+
+        sent_secret = secret or payload.get("secret") or payload.get("token") or ""
+        if TRADINGVIEW_WEBHOOK_SECRET and sent_secret != TRADINGVIEW_WEBHOOK_SECRET:
+            return {"ok": False, "error": "Invalid TradingView secret"}
+
+        alert = normalize_tv_payload(payload)
+        save_tradingview_alert(alert)
+
+        if TRADINGVIEW_SEND_TELEGRAM:
+            telegram_send_tradingview_alert(alert)
+
+        return {"ok": True, "saved": True, "alert": alert}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/webhook/tradingview/alerts")
+def tradingview_alerts(limit: int = 20):
+    alerts = load_tradingview_alerts()
+    limit = max(1, min(int(limit), 200))
+    return {
+        "ok": True,
+        "count": len(alerts),
+        "alerts": alerts[-limit:][::-1]
+    }
+
+@app.get("/api/webhook/tradingview/latest")
+def tradingview_latest(symbol: str = "", limit: int = 20):
+    alerts = load_tradingview_alerts()
+    if symbol:
+        s = symbol.upper().replace("DFM:", "").replace("ADX:", "").replace(".DU", "").replace(".AD", "").strip()
+        alerts = [a for a in alerts if a.get("symbol") == s]
+    limit = max(1, min(int(limit), 200))
+    return {
+        "ok": True,
+        "symbol": symbol or "ALL",
+        "count": len(alerts),
+        "alerts": alerts[-limit:][::-1]
+    }
 
 
 @app.get("/api/v8/stable-health")
