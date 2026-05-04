@@ -12,6 +12,11 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="UAE Market PRO AI V3 Complete")
 
+@app.get("/test")
+def test():
+    return {"ok": True, "version": "V8_STABLE_FAILSAFE"}
+
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET = os.getenv("SECRET", "abc123")
 CRON_SECRET = os.getenv("CRON_SECRET", "cron123")
@@ -58,7 +63,12 @@ DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "true").lower() == "tru
 
 # V7 Batch Scanner
 BATCH_SCAN_ENABLED = os.getenv("BATCH_SCAN_ENABLED", "true").lower() == "true"
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "18"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
+
+# V8 Stable Fail-Safe
+SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "true"
+SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
+SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
 
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
@@ -982,108 +992,124 @@ def latest_scan_result(scan_type: str = "COMBINED"):
     return json.loads(row["payload"])
 
 def run_scan(scan_type: str):
-    scan_watchlist, batch_start, batch_end, completed_cycle = get_batch_watchlist()
+    errors = []
+    try:
+        scan_watchlist, batch_start, batch_end, completed_cycle = get_batch_watchlist()
+    except Exception as e:
+        scan_watchlist = WATCHLIST[:max(1, min(BATCH_SIZE, len(WATCHLIST)))]
+        batch_start, batch_end, completed_cycle = 0, len(scan_watchlist), False
+        errors.append({"stage": "get_batch_watchlist", "error": str(e)})
 
-    current_ranked = []
     signals = []
     batch_coverage = []
 
     for s in scan_watchlist:
         try:
             sigs = analyze_symbol(s, scan_type)
-            best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
+            safe_sigs = [x for x in (sigs or []) if isinstance(x, dict)]
+            best = max(safe_sigs, key=lambda x: x.get("rank_score") or x.get("score") or 0, default=None)
 
-            if best:
-                current_ranked.append(best)
+            if not best:
+                batch_coverage.append({
+                    "symbol": s, "has_data": False, "action": "NO_DATA", "model_action": "NO_DATA",
+                    "score": None, "rank_score": None, "strength": None, "price": None, "rr": None,
+                    "volume_ratio": None, "ai_comment": "No valid signal", "last_batch_update": utc_now()
+                })
+                continue
+
+            try:
+                action = classify_action(best)
+            except Exception:
+                action = best.get("action") or "WATCH"
+
+            try:
+                comment = ai_comment(best)
+            except Exception:
+                comment = ""
+
+            try:
                 if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
+                    signals.append(best)
+            except Exception:
+                if best.get("model_action") == "BUY":
                     signals.append(best)
 
             batch_coverage.append({
-                "symbol": s,
-                "has_data": bool(best),
-                "action": classify_action(best) if best else "NO_DATA",
-                "model_action": best.get("model_action") if best else "NO_DATA",
-                "score": best.get("score") if best else None,
-                "rank_score": best.get("rank_score") if best else None,
-                "strength": best.get("strength") if best else None,
-                "price": best.get("price") if best else None,
-                "rr": best.get("rr") if best else None,
-                "volume_ratio": best.get("volume_ratio") if best else None,
-                "ai_comment": ai_comment(best) if best else "No data yet",
-                "last_batch_update": utc_now()
+                "symbol": s, "has_data": True, "action": action,
+                "model_action": best.get("model_action") or "WATCH",
+                "score": best.get("score"), "rank_score": best.get("rank_score") or best.get("score"),
+                "strength": best.get("strength"), "price": best.get("price"), "rr": best.get("rr"),
+                "volume_ratio": best.get("volume_ratio"), "ai_comment": comment, "last_batch_update": utc_now()
             })
         except Exception as e:
+            errors.append({"symbol": s, "stage": "analyze_symbol", "error": str(e)})
             batch_coverage.append({
                 "symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR",
-                "score": None, "rank_score": None, "strength": str(e), "price": None,
-                "rr": None, "volume_ratio": None, "ai_comment": str(e),
-                "last_batch_update": utc_now()
+                "score": None, "rank_score": None, "strength": "ERROR", "price": None,
+                "rr": None, "volume_ratio": None, "ai_comment": str(e), "last_batch_update": utc_now()
             })
+            if len(errors) >= SCAN_MAX_ERRORS:
+                break
 
-    prev = latest_scan_result("COMBINED") or {}
-    prev_coverage = prev.get("coverage", []) or []
-    merged_by_symbol = {x.get("symbol"): x for x in prev_coverage if x.get("symbol")}
+    prev_coverage = []
+    try:
+        prev = latest_scan_result("COMBINED") or {}
+        prev_coverage = prev.get("coverage", []) or []
+    except Exception as e:
+        errors.append({"stage": "latest_scan_result", "error": str(e)})
+
+    merged_by_symbol = {x.get("symbol"): x for x in prev_coverage if isinstance(x, dict) and x.get("symbol")}
     for x in batch_coverage:
-        merged_by_symbol[x.get("symbol")] = x
+        if isinstance(x, dict) and x.get("symbol"):
+            merged_by_symbol[x.get("symbol")] = x
 
     coverage = []
     for sym in WATCHLIST:
-        if sym in merged_by_symbol:
-            coverage.append(merged_by_symbol[sym])
-        else:
-            coverage.append({
-                "symbol": sym,
-                "has_data": False,
-                "action": "PENDING",
-                "model_action": "PENDING",
-                "score": None,
-                "rank_score": None,
-                "strength": None,
-                "price": None,
-                "rr": None,
-                "volume_ratio": None,
-                "ai_comment": "Waiting for batch scan"
-            })
+        coverage.append(merged_by_symbol.get(sym, {
+            "symbol": sym, "has_data": False, "action": "PENDING", "model_action": "PENDING",
+            "score": None, "rank_score": None, "strength": None, "price": None, "rr": None,
+            "volume_ratio": None, "ai_comment": "Waiting for batch scan"
+        }))
 
-    ranked = sorted(
-        [x for x in coverage if x.get("has_data")],
-        key=lambda x: x.get("rank_score") or x.get("score") or 0,
-        reverse=True
-    )
-
-    signals = sorted(signals, key=lambda x: x.get("rank_score", 0), reverse=True)
+    ranked = sorted([x for x in coverage if isinstance(x, dict) and x.get("has_data")],
+                    key=lambda x: x.get("rank_score") or x.get("score") or 0, reverse=True)
+    signals = sorted([x for x in signals if isinstance(x, dict)],
+                     key=lambda x: x.get("rank_score") or x.get("score") or 0, reverse=True)
 
     payload = {
-        "mode": get_ai_mode(),
-        "scan_type": scan_type,
-        "created_at": utc_now(),
+        "ok": True, "version": "V8_STABLE_FAILSAFE", "mode": get_ai_mode(),
+        "scan_type": scan_type, "created_at": utc_now(),
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST),
-        "batch_enabled": BATCH_SCAN_ENABLED,
-        "batch_size": BATCH_SIZE,
-        "batch_start": batch_start,
-        "batch_end": batch_end,
-        "batch_symbols": scan_watchlist,
-        "completed_cycle": completed_cycle,
+        "watchlist_count": len(WATCHLIST), "batch_enabled": BATCH_SCAN_ENABLED,
+        "batch_size": BATCH_SIZE, "batch_start": batch_start, "batch_end": batch_end,
+        "batch_symbols": scan_watchlist, "completed_cycle": completed_cycle,
         "scanned_count": len(scan_watchlist),
         "total_covered_count": len([x for x in coverage if x.get("has_data")]),
-        "signals_count": len(signals),
-        "signals": signals[:20],
-        "ranked_count": len(ranked),
-        "ranked": ranked,
-        "coverage": sorted(coverage, key=lambda x: (x.get("rank_score") or -1), reverse=True)
+        "signals_count": len(signals), "signals": signals[:20],
+        "ranked_count": len(ranked), "ranked": ranked,
+        "coverage": sorted(coverage, key=lambda x: (x.get("rank_score") or -1), reverse=True),
+        "errors_count": len(errors), "errors": errors[:20],
+        "status": "OK_WITH_ERRORS" if errors else "OK"
     }
 
-    if OBSERVATION_LEARNING:
-        record_observations(payload)
+    try:
+        if OBSERVATION_LEARNING:
+            record_observations(payload)
+    except Exception as e:
+        payload["errors_count"] += 1
+        payload["errors"].append({"stage": "record_observations", "error": str(e)})
 
     auto_paper_created = 0
     for sig in signals[:TELEGRAM_TOP_N]:
-        if auto_track_paper_trade(sig):
-            auto_paper_created += 1
-    payload["auto_paper_created"] = auto_paper_created
+        try:
+            if auto_track_paper_trade(sig):
+                auto_paper_created += 1
+        except Exception as e:
+            payload["errors_count"] += 1
+            payload["errors"].append({"stage": "auto_track_paper_trade", "symbol": sig.get("symbol"), "error": str(e)})
 
+    payload["auto_paper_created"] = auto_paper_created
     return payload
 
 @app.get("/api/ai/pro-scan")
@@ -1317,6 +1343,20 @@ def api_observations(limit: int = 100):
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
 
+@app.get("/api/v8/stable-health")
+def v8_stable_health():
+    cursor = get_batch_cursor()
+    return {
+        "ok": True, "version": "V8_STABLE_FAILSAFE", "mode": get_ai_mode(),
+        "batch_enabled": BATCH_SCAN_ENABLED, "batch_size": BATCH_SIZE,
+        "batch_cursor": cursor, "watchlist_count": len(WATCHLIST),
+        "next_symbols": WATCHLIST[cursor:cursor+BATCH_SIZE]
+    }
+
+@app.get("/api/v8/safe-scan")
+def v8_safe_scan(send: bool = False):
+    return hourly_scan(secret=CRON_SECRET, send=send)
+
 @app.get("/api/v7/batch-status")
 def v7_batch_status():
     cursor = get_batch_cursor()
@@ -1341,28 +1381,60 @@ def cron_ok(secret: Optional[str]):
     return secret == CRON_SECRET
 
 @app.get("/api/cron/hourly-scan")
-def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
-    if not cron_ok(secret):
-        return {"ok": False, "error": "bad_cron_secret"}
+def hourly_scan(secret: str = "", send: bool = False):
+    if secret != CRON_SECRET:
+        return {"ok": False, "error": "Invalid secret"}
 
-    scan = run_scan("HOURLY")
-    save_scan_result("HOURLY", scan)
+    errors = []
+    try:
+        observed_evaluated = evaluate_observations()
+    except Exception as e:
+        observed_evaluated = []
+        errors.append({"stage": "evaluate_observations", "error": str(e)})
 
-    created = []
-    for sig in scan["signals"]:
-        if record_virtual_signal(sig):
-            created.append({"symbol": sig["symbol"], "type": sig["type"]})
+    try:
+        paper_evaluated = evaluate_open_paper_trades()
+    except Exception as e:
+        paper_evaluated = []
+        errors.append({"stage": "evaluate_open_paper_trades", "error": str(e)})
 
-    evaluated = evaluate_virtual_signals()
-    observed_evaluated = evaluate_observations()
-    paper_evaluated = evaluate_open_paper_trades()
+    try:
+        scan = run_scan("COMBINED")
+    except Exception as e:
+        scan = {
+            "ok": False, "version": "V8_STABLE_FAILSAFE", "error": str(e),
+            "scan_type": "COMBINED", "created_at": utc_now(),
+            "signals": [], "ranked": [], "coverage": [],
+            "errors": [{"stage": "run_scan_outer", "error": str(e)}],
+            "errors_count": 1
+        }
+
+    scan["observations_evaluated"] = len(observed_evaluated)
+    scan["paper_evaluated"] = len(paper_evaluated)
+    if errors:
+        scan.setdefault("errors", []).extend(errors)
+        scan["errors_count"] = scan.get("errors_count", 0) + len(errors)
+
+    try:
+        save_scan_result("COMBINED", scan)
+    except Exception as e:
+        scan.setdefault("errors", []).append({"stage": "save_scan_result", "error": str(e)})
+        scan["errors_count"] = scan.get("errors_count", 0) + 1
 
     if send:
-        send_alerts(force=True, top=TELEGRAM_TOP_N)
+        try:
+            send_alerts(force=True, top=TELEGRAM_TOP_N)
+        except Exception as e:
+            scan.setdefault("errors", []).append({"stage": "send_alerts", "error": str(e)})
+            scan["errors_count"] = scan.get("errors_count", 0) + 1
+            if SEND_TELEGRAM_ON_SCAN_ERROR:
+                try:
+                    tg_main_send(f"⚠️ UAE PRO AI V8 scan completed with send error: {str(e)}")
+                except Exception:
+                    pass
 
-    save_combined_scan()
+    return scan
 
-    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated), "paper_evaluated": len(paper_evaluated)}
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -2244,18 +2316,3 @@ def dashboard():
     </body>
     </html>
     """
-
-@app.get("/test")
-def test():
-    return {"ok": True}
-
-@app.get("/api/cron/hourly-scan")
-def hourly_scan(secret: str, send: bool = False):
-    try:
-        result = run_scan("HOURLY")
-        return result
-    except Exception as e:
-        return {
-            "error": str(e),
-            "type": str(type(e))
-        }
