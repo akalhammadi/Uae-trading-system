@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 import json
 import requests
 import psycopg2
@@ -7,7 +6,7 @@ import psycopg2.extras
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Request, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
 
@@ -70,13 +69,6 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
 SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "true"
 SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
 SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
-
-# TradingView webhook
-TRADINGVIEW_WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "tv123")
-TRADINGVIEW_ALERTS_FILE = Path(os.getenv("TRADINGVIEW_ALERTS_FILE", "tradingview_alerts.json"))
-TRADINGVIEW_MAX_ALERTS = int(os.getenv("TRADINGVIEW_MAX_ALERTS", "1000"))
-TRADINGVIEW_SEND_TELEGRAM = os.getenv("TRADINGVIEW_SEND_TELEGRAM", "true").lower() == "true"
-
 
 # Learning from losing trades
 LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
@@ -1351,143 +1343,6 @@ def api_observations(limit: int = 100):
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
 
-
-# ============================================================
-# TRADINGVIEW WEBHOOK ENDPOINTS
-# ============================================================
-
-def load_tradingview_alerts():
-    try:
-        if not TRADINGVIEW_ALERTS_FILE.exists():
-            return []
-        data = json.loads(TRADINGVIEW_ALERTS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-def save_tradingview_alert(alert: dict):
-    alerts = load_tradingview_alerts()
-    alerts.append(alert)
-    alerts = alerts[-TRADINGVIEW_MAX_ALERTS:]
-    TRADINGVIEW_ALERTS_FILE.write_text(json.dumps(alerts, ensure_ascii=False, indent=2), encoding="utf-8")
-    return alert
-
-def normalize_tv_payload(payload):
-    if not isinstance(payload, dict):
-        payload = {"raw": str(payload)}
-
-    symbol = (
-        payload.get("symbol")
-        or payload.get("ticker")
-        or payload.get("syminfo.ticker")
-        or payload.get("name")
-        or "UNKNOWN"
-    )
-    symbol = str(symbol).upper().replace("DFM:", "").replace("ADX:", "").replace(".DU", "").replace(".AD", "").strip()
-
-    price = payload.get("price") or payload.get("close") or payload.get("last") or payload.get("value")
-    try:
-        price = float(price) if price is not None and str(price) != "" else None
-    except Exception:
-        price = None
-
-    interval = payload.get("interval") or payload.get("timeframe") or payload.get("tf") or "UNKNOWN"
-    action = payload.get("action") or payload.get("signal") or payload.get("side") or "ALERT"
-    action = str(action).upper().strip()
-
-    return {
-        "received_at": utc_now(),
-        "symbol": symbol,
-        "price": price,
-        "interval": str(interval),
-        "action": action,
-        "raw": payload,
-    }
-
-def telegram_send_tradingview_alert(alert):
-    try:
-        msg = (
-            "ð¡ TradingView Alert\n\n"
-            f"Symbol: {alert.get('symbol')}\n"
-            f"Action: {alert.get('action')}\n"
-            f"Interval: {alert.get('interval')}\n"
-            f"Price: {alert.get('price') if alert.get('price') is not None else '-'}\n"
-            f"Time: {alert.get('received_at')}"
-        )
-        if "tg_main_send" in globals():
-            tg_main_send(msg)
-        elif "send_telegram_message" in globals():
-            send_telegram_message(msg)
-    except Exception:
-        pass
-
-@app.get("/api/webhook/tradingview")
-def tradingview_webhook_info():
-    return {
-        "ok": True,
-        "message": "TradingView webhook is ready. Use POST from TradingView.",
-        "url": "/api/webhook/tradingview",
-        "example_message": {
-            "secret": TRADINGVIEW_WEBHOOK_SECRET,
-            "symbol": "{{ticker}}",
-            "price": "{{close}}",
-            "time": "{{time}}",
-            "interval": "{{interval}}",
-            "action": "ALERT"
-        }
-    }
-
-@app.post("/api/webhook/tradingview")
-async def tradingview_webhook(request: Request, secret: str = ""):
-    try:
-        try:
-            payload = await request.json()
-        except Exception:
-            body = (await request.body()).decode("utf-8", errors="ignore")
-            try:
-                payload = json.loads(body)
-            except Exception:
-                payload = {"message": body}
-
-        sent_secret = secret or payload.get("secret") or payload.get("token") or ""
-        if TRADINGVIEW_WEBHOOK_SECRET and sent_secret != TRADINGVIEW_WEBHOOK_SECRET:
-            return {"ok": False, "error": "Invalid TradingView secret"}
-
-        alert = normalize_tv_payload(payload)
-        save_tradingview_alert(alert)
-
-        if TRADINGVIEW_SEND_TELEGRAM:
-            telegram_send_tradingview_alert(alert)
-
-        return {"ok": True, "saved": True, "alert": alert}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/api/webhook/tradingview/alerts")
-def tradingview_alerts(limit: int = 20):
-    alerts = load_tradingview_alerts()
-    limit = max(1, min(int(limit), 200))
-    return {
-        "ok": True,
-        "count": len(alerts),
-        "alerts": alerts[-limit:][::-1]
-    }
-
-@app.get("/api/webhook/tradingview/latest")
-def tradingview_latest(symbol: str = "", limit: int = 20):
-    alerts = load_tradingview_alerts()
-    if symbol:
-        s = symbol.upper().replace("DFM:", "").replace("ADX:", "").replace(".DU", "").replace(".AD", "").strip()
-        alerts = [a for a in alerts if a.get("symbol") == s]
-    limit = max(1, min(int(limit), 200))
-    return {
-        "ok": True,
-        "symbol": symbol or "ALL",
-        "count": len(alerts),
-        "alerts": alerts[-limit:][::-1]
-    }
-
-
 @app.get("/api/v8/stable-health")
 def v8_stable_health():
     cursor = get_batch_cursor()
@@ -1517,6 +1372,182 @@ def v7_batch_status():
 def v7_reset_batch():
     set_batch_cursor(0)
     return {"ok": True, "batch_cursor": 0}
+
+
+# ============================================================
+# V9 PRICE WEBHOOK STORAGE
+# ============================================================
+
+def ensure_price_webhook_tables():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS price_alerts (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT,
+            price DOUBLE PRECISION,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            volume DOUBLE PRECISION,
+            interval TEXT,
+            source TEXT,
+            raw_payload JSONB,
+            received_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS latest_prices (
+            symbol TEXT PRIMARY KEY,
+            price DOUBLE PRECISION,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            volume DOUBLE PRECISION,
+            interval TEXT,
+            source TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            raw_payload JSONB
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def clean_tv_symbol(symbol: str) -> str:
+    if not symbol:
+        return ""
+    s = str(symbol).upper().strip()
+    if ":" in s:
+        s = s.split(":")[-1]
+    if "." in s:
+        s = s.split(".")[0]
+    return s.replace(" ", "")
+
+def parse_float_any(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return default
+
+def store_price_alert(payload: dict):
+    ensure_price_webhook_tables()
+    symbol = clean_tv_symbol(payload.get("symbol") or payload.get("ticker") or payload.get("s"))
+    price = parse_float_any(payload.get("price") or payload.get("close") or payload.get("c"))
+    opn = parse_float_any(payload.get("open") or payload.get("o"))
+    high = parse_float_any(payload.get("high") or payload.get("h"))
+    low = parse_float_any(payload.get("low") or payload.get("l"))
+    close = parse_float_any(payload.get("close") or payload.get("c") or price)
+    volume = parse_float_any(payload.get("volume") or payload.get("v"))
+    interval = str(payload.get("interval") or payload.get("timeframe") or payload.get("tf") or "")
+    source = str(payload.get("source") or "TradingView")
+
+    conn = db()
+    cur = conn.cursor()
+    raw = json.dumps(payload)
+    cur.execute("""
+        INSERT INTO price_alerts
+        (symbol, price, open, high, low, close, volume, interval, source, raw_payload, received_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
+        RETURNING id
+    """, (symbol, price, opn, high, low, close, volume, interval, source, raw))
+    alert_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO latest_prices
+        (symbol, price, open, high, low, close, volume, interval, source, updated_at, raw_payload)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s::jsonb)
+        ON CONFLICT (symbol) DO UPDATE SET
+            price=EXCLUDED.price,
+            open=EXCLUDED.open,
+            high=EXCLUDED.high,
+            low=EXCLUDED.low,
+            close=EXCLUDED.close,
+            volume=EXCLUDED.volume,
+            interval=EXCLUDED.interval,
+            source=EXCLUDED.source,
+            updated_at=NOW(),
+            raw_payload=EXCLUDED.raw_payload
+    """, (symbol, price, opn, high, low, close, volume, interval, source, raw))
+    conn.commit()
+    conn.close()
+    return {"id": alert_id, "symbol": symbol, "price": price, "close": close, "interval": interval, "volume": volume}
+
+def get_latest_price_from_webhook(symbol: str):
+    ensure_price_webhook_tables()
+    symbol = clean_tv_symbol(symbol)
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM latest_prices WHERE symbol=%s", (symbol,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+# ============================================================
+# V9 PRICE WEBHOOK API
+# ============================================================
+
+@app.get("/api/webhook/ping")
+def webhook_ping():
+    return {"ok": True, "version": "V9_PRICE_WEBHOOK", "message": "Webhook receiver is alive"}
+
+@app.post("/api/webhook/price-alert")
+async def price_alert(request: Request, secret: str = ""):
+    if secret != CRON_SECRET:
+        return {"ok": False, "error": "Invalid secret"}
+    try:
+        payload = await request.json()
+    except Exception:
+        body = await request.body()
+        text = body.decode("utf-8", errors="ignore")
+        parts = text.replace(",", " ").split()
+        if len(parts) >= 2:
+            payload = {"symbol": parts[0], "price": parts[1], "source": "text"}
+        else:
+            payload = {"raw_text": text, "source": "text"}
+    result = store_price_alert(payload)
+    return {"ok": True, "stored": result, "received": payload}
+
+@app.get("/api/webhook/test-price")
+def test_price(symbol: str = "EMAAR", price: float = 11.22, interval: str = "5"):
+    payload = {"symbol": symbol, "price": price, "open": price, "high": price, "low": price, "close": price, "volume": 100000, "interval": interval, "source": "manual-test"}
+    result = store_price_alert(payload)
+    return {"ok": True, "stored": result}
+
+@app.get("/api/webhook/last-alert")
+def last_alert(symbol: str = ""):
+    ensure_price_webhook_tables()
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if symbol:
+        cur.execute("SELECT * FROM price_alerts WHERE symbol=%s ORDER BY received_at DESC LIMIT 1", (clean_tv_symbol(symbol),))
+    else:
+        cur.execute("SELECT * FROM price_alerts ORDER BY received_at DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"ok": True, "message": "No alerts received yet"}
+    return {"ok": True, "last_alert": dict(row)}
+
+@app.get("/api/webhook/latest-prices")
+def latest_prices(limit: int = 100):
+    ensure_price_webhook_tables()
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM latest_prices ORDER BY updated_at DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return {"ok": True, "count": len(rows), "prices": [dict(r) for r in rows]}
+
+@app.get("/api/webhook/latest-price/{symbol}")
+def latest_price_symbol(symbol: str):
+    row = get_latest_price_from_webhook(symbol)
+    if not row:
+        return {"ok": False, "symbol": clean_tv_symbol(symbol), "message": "No price received yet"}
+    return {"ok": True, "price": row}
+
 
 # ============================================================
 # CRON ENDPOINTS
@@ -1574,7 +1605,7 @@ def hourly_scan(secret: str = "", send: bool = False):
             scan["errors_count"] = scan.get("errors_count", 0) + 1
             if SEND_TELEGRAM_ON_SCAN_ERROR:
                 try:
-                    tg_main_send(f"â ï¸ UAE PRO AI V8 scan completed with send error: {str(e)}")
+                    tg_main_send(f"⚠️ UAE PRO AI V8 scan completed with send error: {str(e)}")
                 except Exception:
                     pass
 
@@ -1905,7 +1936,7 @@ def api_v6_report(send: bool = False):
     conn.close()
 
     msg = (
-        "ð <b>UAE PRO AI V6 Report</b>\n\n"
+        "📊 <b>UAE PRO AI V6 Report</b>\n\n"
         f"Mode: <b>{get_ai_mode()}</b>\n"
         f"Paper Open Trades: <b>{open_count}</b>\n"
         f"Paper Closed Trades: <b>{closed_count}</b>\n"
@@ -2081,14 +2112,14 @@ def signal_keyboard(symbol):
 
 def format_signal(sig):
     if sig.get("hybrid_alert"):
-        mode_note = "\nð¥ <b>STRONG LEARNING ALERT:</b> Ø¥Ø´Ø§Ø±Ø© ÙÙÙØ© Ø¬Ø¯Ø§Ù Ø£Ø«ÙØ§Ø¡ Ø§ÙØªØ¹ÙÙ. ÙÙØ³Øª Ø¯Ø®ÙÙ Ø¥ÙØ²Ø§ÙÙØ ÙÙÙÙØ§ ØªØ³ØªØ­Ù Ø§ÙÙØªØ§Ø¨Ø¹Ø©."
+        mode_note = "\n🔥 <b>STRONG LEARNING ALERT:</b> إشارة قوية جداً أثناء التعلم. ليست دخول إلزامي، لكنها تستحق المتابعة."
     elif sig["mode"] == "LEARNING":
-        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
+        mode_note = "\n⚠️ <b>LEARNING MODE:</b> ليست توصية دخول فعلية. النظام يتعلم فقط."
     else:
         mode_note = ""
     size = sig.get("position_sizing", {})
     return f"""
-ð <b>{sig['symbol']} PRO AI V3</b>
+📊 <b>{sig['symbol']} PRO AI V3</b>
 
 <b>Type:</b> {sig['type']}
 <b>Mode:</b> {sig['mode']}
@@ -2097,17 +2128,17 @@ def format_signal(sig):
 <b>Strength:</b> {sig['strength']}
 <b>Score:</b> {sig['score']}
 
-ð° Price: <b>{sig['price']}</b>
-ð Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
-ð Stop: <b>{sig['stop_loss']}</b>
+💰 Price: <b>{sig['price']}</b>
+📍 Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
+🛑 Stop: <b>{sig['stop_loss']}</b>
 
-ð¯ Target 1: <b>{sig['target1']}</b>
-ð¯ Target 2: <b>{sig['target2']}</b>
-ð¯ Target 3: <b>{sig['target3']}</b>
+🎯 Target 1: <b>{sig['target1']}</b>
+🎯 Target 2: <b>{sig['target2']}</b>
+🎯 Target 3: <b>{sig['target3']}</b>
 
-ð Expected: <b>{sig['expected_move_pct']}%</b>
-âï¸ Risk: <b>{sig['risk_pct']}%</b>
-ð RR: <b>{sig['rr']}</b>
+📈 Expected: <b>{sig['expected_move_pct']}%</b>
+⚖️ Risk: <b>{sig['risk_pct']}%</b>
+📐 RR: <b>{sig['rr']}</b>
 
 Position Size:
 Qty: {size.get('qty')}
@@ -2118,7 +2149,7 @@ RSI: {sig['rsi']}
 Volume Ratio: {sig['volume_ratio']}
 Trend: {sig['trend']}
 
-ð {esc(sig['reason'])}
+📌 {esc(sig['reason'])}
 {mode_note}
 
 Dashboard:
@@ -2126,16 +2157,16 @@ Dashboard:
 """.strip()
 
 def format_scan_summary(scan, title):
-    lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
+    lines = [f"🧠 <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
     for s in scan["signals"][:TELEGRAM_TOP_N]:
-        lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
+        lines.append(f"• <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
     lines.append("")
     lines.append(DASHBOARD_URL)
     return "\n".join(lines)
 
 def format_readiness(rep):
     return f"""
-ð§  <b>AI Readiness Report</b>
+🧠 <b>AI Readiness Report</b>
 
 Mode: <b>{rep['mode']}</b>
 Status: <b>{rep['status']}</b>
@@ -2168,7 +2199,7 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
 
     scan = latest_scan_result("COMBINED")
     if not scan:
-        msg = "ð UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
+        msg = "📉 UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
         if not dry_run:
             tg_main_send(msg)
         return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
@@ -2180,13 +2211,13 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
     items = sorted(items, key=lambda x: (x.get("rank_score") or x.get("score") or 0), reverse=True)
 
     if not items:
-        msg = "ð <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
+        msg = "📉 <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
         if not dry_run:
             tg_main_send(msg)
         return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
 
     lines = []
-    lines.append("ð <b>UAE PRO AI V5 - Ranked Opportunities</b>")
+    lines.append("📊 <b>UAE PRO AI V5 - Ranked Opportunities</b>")
     lines.append(f"Mode: <b>{get_ai_mode()}</b>")
     lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
     if scan.get("batch_enabled"):
@@ -2211,10 +2242,10 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         comment = x.get("ai_comment") or ""
 
         if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
-            status = "ð¥ TRADE CANDIDATE"
+            status = "🔥 TRADE CANDIDATE"
             real_opportunities += 1
         elif strength in ["VERY STRONG", "STRONG"]:
-            status = "ð STRONG WATCH"
+            status = "👀 STRONG WATCH"
         elif action in ["NO_DATA", "ERROR"]:
             status = "WEAK / NO DATA"
         else:
@@ -2249,16 +2280,16 @@ def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
         })
 
     if real_opportunities == 0:
-        lines.append("ð Summary: No confirmed trade setup now. Current market list is watch/weak.")
+        lines.append("📌 Summary: No confirmed trade setup now. Current market list is watch/weak.")
     else:
-        lines.append(f"ð Summary: {real_opportunities} trade candidate(s) for review.")
+        lines.append(f"📌 Summary: {real_opportunities} trade candidate(s) for review.")
 
     lines.append("")
     if get_ai_mode() == "LIVE" and LIVE_TRADING_ENABLED:
         if LIVE_REQUIRES_CONFIRMATION:
-            lines.append("â ï¸ Live trading is enabled, but confirmation is required before any order.")
+            lines.append("⚠️ Live trading is enabled, but confirmation is required before any order.")
         else:
-            lines.append("â ï¸ Live auto-order mode is enabled. Check broker and risk settings.")
+            lines.append("⚠️ Live auto-order mode is enabled. Check broker and risk settings.")
     else:
         lines.append("Mode note: No real broker order will be placed unless LIVE_TRADING_ENABLED=true and broker webhook is configured.")
 
@@ -2312,17 +2343,17 @@ async def telegram_webhook(secret: str, request: Request):
             text = msg.get("text", "").strip()
             upper = text.upper()
 
-            if upper in ["Ø¬Ø§ÙØ²ÙØ©", "READINESS"]:
+            if upper in ["جاهزية", "READINESS"]:
                 return tg_send(chat_id, format_readiness(readiness_report()))
 
-            if upper.startswith("Ø­ÙÙ"):
+            if upper.startswith("حلل"):
                 parts = upper.split()
                 if len(parts) >= 2:
                     sigs = analyze_symbol(parts[1], "ALL")
                     if sigs:
                         best = max(sigs, key=lambda x: x["score"])
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                    return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+                    return tg_send(chat_id, "لا توجد بيانات كافية.")
 
             if upper.startswith("ENTERED"):
                 parts = text.split()
@@ -2343,7 +2374,7 @@ async def telegram_webhook(secret: str, request: Request):
                         trade_id = cur.fetchone()[0]
                         conn.commit()
                         conn.close()
-                        return tg_send(chat_id, f"â Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
+                        return tg_send(chat_id, f"✅ Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
                 return tg_send(chat_id, "Use: ENTERED SYMBOL PRICE AMOUNT\nExample: ENTERED EMAAR 11.22 40000")
 
             if upper.startswith("SOLD"):
@@ -2353,7 +2384,7 @@ async def telegram_webhook(secret: str, request: Request):
                     exit_price = float(parts[2])
                     result = close_trade(trade_id, exit_price, "Telegram close")
                     if result.get("ok"):
-                        return tg_send(chat_id, f"â Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
+                        return tg_send(chat_id, f"✅ Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
                     return tg_send(chat_id, f"Could not close trade: {result}")
                 return tg_send(chat_id, "Use: SOLD TRADE_ID EXIT_PRICE\nExample: SOLD 12 11.40")
 
@@ -2381,7 +2412,7 @@ async def telegram_webhook(secret: str, request: Request):
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
+                return tg_send(chat_id, "لا توجد بيانات كافية.")
 
             if action == "entered":
                 symbol = parts[1]
