@@ -12,11 +12,6 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="UAE Market PRO AI V3 Complete")
 
-@app.get("/test")
-def test():
-    return {"ok": True, "version": "V8_STABLE_FAILSAFE"}
-
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET = os.getenv("SECRET", "abc123")
 CRON_SECRET = os.getenv("CRON_SECRET", "cron123")
@@ -35,45 +30,14 @@ CAPITAL = float(os.getenv("CAPITAL", "200000"))
 # Hybrid Learning Alerts:
 # Keep AI_MODE=LEARNING but send alerts only for the strongest setups.
 HYBRID_STRONG_ALERTS = os.getenv("HYBRID_STRONG_ALERTS", "true").lower() == "true"
-STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "75"))
-STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.6"))
+STRONG_ALERT_SCORE = float(os.getenv("STRONG_ALERT_SCORE", "90"))
+STRONG_ALERT_MIN_RR = float(os.getenv("STRONG_ALERT_MIN_RR", "0.9"))
 
 # V4 Ranking + Observation Learning
 OBSERVATION_LEARNING = os.getenv("OBSERVATION_LEARNING", "true").lower() == "true"
 OBSERVATION_TARGET_PCT = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
 OBSERVATION_DROP_PCT = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
-TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "10"))
-
-# V5 Live-trading guardrails
-# LIVE trading is disabled by default. It only activates with AI_MODE=LIVE and LIVE_TRADING_ENABLED=true.
-LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
-LIVE_REQUIRES_CONFIRMATION = os.getenv("LIVE_REQUIRES_CONFIRMATION", "true").lower() == "true"
-BROKER_WEBHOOK_URL = os.getenv("BROKER_WEBHOOK_URL", "")
-BROKER_API_KEY = os.getenv("BROKER_API_KEY", "")
-MAX_LIVE_ORDER_AED = float(os.getenv("MAX_LIVE_ORDER_AED", "10000"))
-MAX_DAILY_LIVE_ORDERS = int(os.getenv("MAX_DAILY_LIVE_ORDERS", "3"))
-
-# V6 Risk + Auto Paper Tracking
-AUTO_PAPER_TRACKING = os.getenv("AUTO_PAPER_TRACKING", "true").lower() == "true"
-MIN_AUTO_PAPER_SCORE = float(os.getenv("MIN_AUTO_PAPER_SCORE", "75"))
-MIN_AUTO_PAPER_RR = float(os.getenv("MIN_AUTO_PAPER_RR", "0.6"))
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "20.0"))
-DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "true").lower() == "true"
-
-# V7 Batch Scanner
-BATCH_SCAN_ENABLED = os.getenv("BATCH_SCAN_ENABLED", "true").lower() == "true"
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
-
-# V8 Stable Fail-Safe
-SCAN_FAILSAFE_ENABLED = os.getenv("SCAN_FAILSAFE_ENABLED", "true").lower() == "true"
-SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "50"))
-SEND_TELEGRAM_ON_SCAN_ERROR = os.getenv("SEND_TELEGRAM_ON_SCAN_ERROR", "true").lower() == "true"
-
-# Learning from losing trades
-LOSS_LEARNING_ENABLED = os.getenv("LOSS_LEARNING_ENABLED", "true").lower() == "true"
-LOSS_SCORE_PENALTY = float(os.getenv("LOSS_SCORE_PENALTY", "6"))
-WIN_SCORE_REWARD = float(os.getenv("WIN_SCORE_REWARD", "3"))
+TELEGRAM_TOP_N = int(os.getenv("TELEGRAM_TOP_N", "5"))
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
@@ -349,30 +313,6 @@ def startup():
 
 def get_ai_mode():
     return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "LEARNING").upper().strip()
-
-def get_batch_cursor() -> int:
-    try:
-        return int(get_setting("batch_cursor", "0") or 0)
-    except Exception:
-        return 0
-
-def set_batch_cursor(value: int):
-    set_setting("batch_cursor", str(value))
-
-def get_batch_watchlist():
-    if not BATCH_SCAN_ENABLED:
-        return WATCHLIST, 0, len(WATCHLIST), True
-    total = len(WATCHLIST)
-    if total == 0:
-        return [], 0, 0, True
-    start = get_batch_cursor() % total
-    size = max(1, min(BATCH_SIZE, total))
-    end = min(start + size, total)
-    batch = WATCHLIST[start:end]
-    completed_cycle = end >= total
-    next_cursor = 0 if completed_cycle else end
-    set_batch_cursor(next_cursor)
-    return batch, start, end, completed_cycle
 
 def is_hybrid_strong_signal(sig: Dict[str, Any]) -> bool:
     return (
@@ -880,7 +820,7 @@ def build_signal(symbol, kind, candles, d1):
     rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
 
     strength = "VERY STRONG" if score >= 85 else "STRONG" if score >= 70 else "MEDIUM" if score >= 55 else "WEAK"
-    model_action = "BUY" if score >= 65 and rr >= 0.6 and (risk_pct <= (5.5 if kind == "SHORT_SWING" else 12)) else "WATCH"
+    model_action = "BUY" if score >= 70 and rr >= 0.9 and (risk_pct <= (4.5 if kind == "SHORT_SWING" else 11)) else "WATCH"
 
     mode = get_ai_mode()
     if mode == "LEARNING":
@@ -992,124 +932,61 @@ def latest_scan_result(scan_type: str = "COMBINED"):
     return json.loads(row["payload"])
 
 def run_scan(scan_type: str):
-    errors = []
-    try:
-        scan_watchlist, batch_start, batch_end, completed_cycle = get_batch_watchlist()
-    except Exception as e:
-        scan_watchlist = WATCHLIST[:max(1, min(BATCH_SIZE, len(WATCHLIST)))]
-        batch_start, batch_end, completed_cycle = 0, len(scan_watchlist), False
-        errors.append({"stage": "get_batch_watchlist", "error": str(e)})
-
+    ranked = []
     signals = []
-    batch_coverage = []
+    coverage = []
 
-    for s in scan_watchlist:
+    for s in WATCHLIST:
         try:
             sigs = analyze_symbol(s, scan_type)
-            safe_sigs = [x for x in (sigs or []) if isinstance(x, dict)]
-            best = max(safe_sigs, key=lambda x: x.get("rank_score") or x.get("score") or 0, default=None)
+            best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
 
-            if not best:
-                batch_coverage.append({
-                    "symbol": s, "has_data": False, "action": "NO_DATA", "model_action": "NO_DATA",
-                    "score": None, "rank_score": None, "strength": None, "price": None, "rr": None,
-                    "volume_ratio": None, "ai_comment": "No valid signal", "last_batch_update": utc_now()
-                })
-                continue
-
-            try:
-                action = classify_action(best)
-            except Exception:
-                action = best.get("action") or "WATCH"
-
-            try:
-                comment = ai_comment(best)
-            except Exception:
-                comment = ""
-
-            try:
+            if best:
+                ranked.append(best)
                 if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
                     signals.append(best)
-            except Exception:
-                if best.get("model_action") == "BUY":
-                    signals.append(best)
 
-            batch_coverage.append({
-                "symbol": s, "has_data": True, "action": action,
-                "model_action": best.get("model_action") or "WATCH",
-                "score": best.get("score"), "rank_score": best.get("rank_score") or best.get("score"),
-                "strength": best.get("strength"), "price": best.get("price"), "rr": best.get("rr"),
-                "volume_ratio": best.get("volume_ratio"), "ai_comment": comment, "last_batch_update": utc_now()
+            coverage.append({
+                "symbol": s,
+                "has_data": bool(best),
+                "action": classify_action(best) if best else "NO_DATA",
+                "model_action": best.get("model_action") if best else "NO_DATA",
+                "score": best.get("score") if best else None,
+                "rank_score": best.get("rank_score") if best else None,
+                "strength": best.get("strength") if best else None,
+                "price": best.get("price") if best else None,
+                "rr": best.get("rr") if best else None,
+                "volume_ratio": best.get("volume_ratio") if best else None,
+                "ai_comment": ai_comment(best) if best else "No data yet"
             })
         except Exception as e:
-            errors.append({"symbol": s, "stage": "analyze_symbol", "error": str(e)})
-            batch_coverage.append({
+            coverage.append({
                 "symbol": s, "has_data": False, "action": "ERROR", "model_action": "ERROR",
-                "score": None, "rank_score": None, "strength": "ERROR", "price": None,
-                "rr": None, "volume_ratio": None, "ai_comment": str(e), "last_batch_update": utc_now()
+                "score": None, "rank_score": None, "strength": str(e), "price": None,
+                "rr": None, "volume_ratio": None, "ai_comment": str(e)
             })
-            if len(errors) >= SCAN_MAX_ERRORS:
-                break
 
-    prev_coverage = []
-    try:
-        prev = latest_scan_result("COMBINED") or {}
-        prev_coverage = prev.get("coverage", []) or []
-    except Exception as e:
-        errors.append({"stage": "latest_scan_result", "error": str(e)})
-
-    merged_by_symbol = {x.get("symbol"): x for x in prev_coverage if isinstance(x, dict) and x.get("symbol")}
-    for x in batch_coverage:
-        if isinstance(x, dict) and x.get("symbol"):
-            merged_by_symbol[x.get("symbol")] = x
-
-    coverage = []
-    for sym in WATCHLIST:
-        coverage.append(merged_by_symbol.get(sym, {
-            "symbol": sym, "has_data": False, "action": "PENDING", "model_action": "PENDING",
-            "score": None, "rank_score": None, "strength": None, "price": None, "rr": None,
-            "volume_ratio": None, "ai_comment": "Waiting for batch scan"
-        }))
-
-    ranked = sorted([x for x in coverage if isinstance(x, dict) and x.get("has_data")],
-                    key=lambda x: x.get("rank_score") or x.get("score") or 0, reverse=True)
-    signals = sorted([x for x in signals if isinstance(x, dict)],
-                     key=lambda x: x.get("rank_score") or x.get("score") or 0, reverse=True)
+    ranked = sorted(ranked, key=lambda x: x.get("rank_score", 0), reverse=True)
+    signals = sorted(signals, key=lambda x: x.get("rank_score", 0), reverse=True)
 
     payload = {
-        "ok": True, "version": "V8_STABLE_FAILSAFE", "mode": get_ai_mode(),
-        "scan_type": scan_type, "created_at": utc_now(),
+        "mode": get_ai_mode(),
+        "scan_type": scan_type,
+        "created_at": utc_now(),
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST), "batch_enabled": BATCH_SCAN_ENABLED,
-        "batch_size": BATCH_SIZE, "batch_start": batch_start, "batch_end": batch_end,
-        "batch_symbols": scan_watchlist, "completed_cycle": completed_cycle,
-        "scanned_count": len(scan_watchlist),
-        "total_covered_count": len([x for x in coverage if x.get("has_data")]),
-        "signals_count": len(signals), "signals": signals[:20],
-        "ranked_count": len(ranked), "ranked": ranked,
-        "coverage": sorted(coverage, key=lambda x: (x.get("rank_score") or -1), reverse=True),
-        "errors_count": len(errors), "errors": errors[:20],
-        "status": "OK_WITH_ERRORS" if errors else "OK"
+        "watchlist_count": len(WATCHLIST),
+        "scanned_count": len(WATCHLIST),
+        "signals_count": len(signals),
+        "signals": signals[:20],
+        "ranked_count": len(ranked),
+        "ranked": ranked,
+        "coverage": sorted(coverage, key=lambda x: (x.get("rank_score") or -1), reverse=True)
     }
 
-    try:
-        if OBSERVATION_LEARNING:
-            record_observations(payload)
-    except Exception as e:
-        payload["errors_count"] += 1
-        payload["errors"].append({"stage": "record_observations", "error": str(e)})
+    if OBSERVATION_LEARNING:
+        record_observations(payload)
 
-    auto_paper_created = 0
-    for sig in signals[:TELEGRAM_TOP_N]:
-        try:
-            if auto_track_paper_trade(sig):
-                auto_paper_created += 1
-        except Exception as e:
-            payload["errors_count"] += 1
-            payload["errors"].append({"stage": "auto_track_paper_trade", "symbol": sig.get("symbol"), "error": str(e)})
-
-    payload["auto_paper_created"] = auto_paper_created
     return payload
 
 @app.get("/api/ai/pro-scan")
@@ -1241,7 +1118,6 @@ def learning_scan():
 
     evaluated = evaluate_virtual_signals()
     observed_evaluated = evaluate_observations()
-    paper_evaluated = evaluate_open_paper_trades()
     return {"mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated}
 
 
@@ -1342,213 +1218,6 @@ def api_observations(limit: int = 100):
     conn.close()
     return {"evaluated_now": evaluated, "count": len(rows), "observations": rows}
 
-
-@app.get("/api/v8/stable-health")
-def v8_stable_health():
-    cursor = get_batch_cursor()
-    return {
-        "ok": True, "version": "V8_STABLE_FAILSAFE", "mode": get_ai_mode(),
-        "batch_enabled": BATCH_SCAN_ENABLED, "batch_size": BATCH_SIZE,
-        "batch_cursor": cursor, "watchlist_count": len(WATCHLIST),
-        "next_symbols": WATCHLIST[cursor:cursor+BATCH_SIZE]
-    }
-
-@app.get("/api/v8/safe-scan")
-def v8_safe_scan(send: bool = False):
-    return hourly_scan(secret=CRON_SECRET, send=send)
-
-@app.get("/api/v7/batch-status")
-def v7_batch_status():
-    cursor = get_batch_cursor()
-    return {
-        "batch_enabled": BATCH_SCAN_ENABLED,
-        "batch_size": BATCH_SIZE,
-        "batch_cursor": cursor,
-        "watchlist_count": len(WATCHLIST),
-        "next_symbols": WATCHLIST[cursor:cursor+BATCH_SIZE]
-    }
-
-@app.get("/api/v7/reset-batch")
-def v7_reset_batch():
-    set_batch_cursor(0)
-    return {"ok": True, "batch_cursor": 0}
-
-
-# ============================================================
-# V9 PRICE WEBHOOK STORAGE
-# ============================================================
-
-def ensure_price_webhook_tables():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS price_alerts (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT,
-            price DOUBLE PRECISION,
-            open DOUBLE PRECISION,
-            high DOUBLE PRECISION,
-            low DOUBLE PRECISION,
-            close DOUBLE PRECISION,
-            volume DOUBLE PRECISION,
-            interval TEXT,
-            source TEXT,
-            raw_payload JSONB,
-            received_at TIMESTAMPTZ DEFAULT NOW()
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS latest_prices (
-            symbol TEXT PRIMARY KEY,
-            price DOUBLE PRECISION,
-            open DOUBLE PRECISION,
-            high DOUBLE PRECISION,
-            low DOUBLE PRECISION,
-            close DOUBLE PRECISION,
-            volume DOUBLE PRECISION,
-            interval TEXT,
-            source TEXT,
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
-            raw_payload JSONB
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def clean_tv_symbol(symbol: str) -> str:
-    if not symbol:
-        return ""
-    s = str(symbol).upper().strip()
-    if ":" in s:
-        s = s.split(":")[-1]
-    if "." in s:
-        s = s.split(".")[0]
-    return s.replace(" ", "")
-
-def parse_float_any(v, default=None):
-    try:
-        if v is None or v == "":
-            return default
-        return float(str(v).replace(",", ""))
-    except Exception:
-        return default
-
-def store_price_alert(payload: dict):
-    ensure_price_webhook_tables()
-    symbol = clean_tv_symbol(payload.get("symbol") or payload.get("ticker") or payload.get("s"))
-    price = parse_float_any(payload.get("price") or payload.get("close") or payload.get("c"))
-    opn = parse_float_any(payload.get("open") or payload.get("o"))
-    high = parse_float_any(payload.get("high") or payload.get("h"))
-    low = parse_float_any(payload.get("low") or payload.get("l"))
-    close = parse_float_any(payload.get("close") or payload.get("c") or price)
-    volume = parse_float_any(payload.get("volume") or payload.get("v"))
-    interval = str(payload.get("interval") or payload.get("timeframe") or payload.get("tf") or "")
-    source = str(payload.get("source") or "TradingView")
-
-    conn = db()
-    cur = conn.cursor()
-    raw = json.dumps(payload)
-    cur.execute("""
-        INSERT INTO price_alerts
-        (symbol, price, open, high, low, close, volume, interval, source, raw_payload, received_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
-        RETURNING id
-    """, (symbol, price, opn, high, low, close, volume, interval, source, raw))
-    alert_id = cur.fetchone()[0]
-    cur.execute("""
-        INSERT INTO latest_prices
-        (symbol, price, open, high, low, close, volume, interval, source, updated_at, raw_payload)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s::jsonb)
-        ON CONFLICT (symbol) DO UPDATE SET
-            price=EXCLUDED.price,
-            open=EXCLUDED.open,
-            high=EXCLUDED.high,
-            low=EXCLUDED.low,
-            close=EXCLUDED.close,
-            volume=EXCLUDED.volume,
-            interval=EXCLUDED.interval,
-            source=EXCLUDED.source,
-            updated_at=NOW(),
-            raw_payload=EXCLUDED.raw_payload
-    """, (symbol, price, opn, high, low, close, volume, interval, source, raw))
-    conn.commit()
-    conn.close()
-    return {"id": alert_id, "symbol": symbol, "price": price, "close": close, "interval": interval, "volume": volume}
-
-def get_latest_price_from_webhook(symbol: str):
-    ensure_price_webhook_tables()
-    symbol = clean_tv_symbol(symbol)
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM latest_prices WHERE symbol=%s", (symbol,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-# ============================================================
-# V9 PRICE WEBHOOK API
-# ============================================================
-
-@app.get("/api/webhook/ping")
-def webhook_ping():
-    return {"ok": True, "version": "V9_PRICE_WEBHOOK", "message": "Webhook receiver is alive"}
-
-@app.post("/api/webhook/price-alert")
-async def price_alert(request: Request, secret: str = ""):
-    if secret != CRON_SECRET:
-        return {"ok": False, "error": "Invalid secret"}
-    try:
-        payload = await request.json()
-    except Exception:
-        body = await request.body()
-        text = body.decode("utf-8", errors="ignore")
-        parts = text.replace(",", " ").split()
-        if len(parts) >= 2:
-            payload = {"symbol": parts[0], "price": parts[1], "source": "text"}
-        else:
-            payload = {"raw_text": text, "source": "text"}
-    result = store_price_alert(payload)
-    return {"ok": True, "stored": result, "received": payload}
-
-@app.get("/api/webhook/test-price")
-def test_price(symbol: str = "EMAAR", price: float = 11.22, interval: str = "5"):
-    payload = {"symbol": symbol, "price": price, "open": price, "high": price, "low": price, "close": price, "volume": 100000, "interval": interval, "source": "manual-test"}
-    result = store_price_alert(payload)
-    return {"ok": True, "stored": result}
-
-@app.get("/api/webhook/last-alert")
-def last_alert(symbol: str = ""):
-    ensure_price_webhook_tables()
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    if symbol:
-        cur.execute("SELECT * FROM price_alerts WHERE symbol=%s ORDER BY received_at DESC LIMIT 1", (clean_tv_symbol(symbol),))
-    else:
-        cur.execute("SELECT * FROM price_alerts ORDER BY received_at DESC LIMIT 1")
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return {"ok": True, "message": "No alerts received yet"}
-    return {"ok": True, "last_alert": dict(row)}
-
-@app.get("/api/webhook/latest-prices")
-def latest_prices(limit: int = 100):
-    ensure_price_webhook_tables()
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM latest_prices ORDER BY updated_at DESC LIMIT %s", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return {"ok": True, "count": len(rows), "prices": [dict(r) for r in rows]}
-
-@app.get("/api/webhook/latest-price/{symbol}")
-def latest_price_symbol(symbol: str):
-    row = get_latest_price_from_webhook(symbol)
-    if not row:
-        return {"ok": False, "symbol": clean_tv_symbol(symbol), "message": "No price received yet"}
-    return {"ok": True, "price": row}
-
-
 # ============================================================
 # CRON ENDPOINTS
 # ============================================================
@@ -1557,60 +1226,27 @@ def cron_ok(secret: Optional[str]):
     return secret == CRON_SECRET
 
 @app.get("/api/cron/hourly-scan")
-def hourly_scan(secret: str = "", send: bool = False):
-    if secret != CRON_SECRET:
-        return {"ok": False, "error": "Invalid secret"}
+def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
 
-    errors = []
-    try:
-        observed_evaluated = evaluate_observations()
-    except Exception as e:
-        observed_evaluated = []
-        errors.append({"stage": "evaluate_observations", "error": str(e)})
+    scan = run_scan("HOURLY")
+    save_scan_result("HOURLY", scan)
 
-    try:
-        paper_evaluated = evaluate_open_paper_trades()
-    except Exception as e:
-        paper_evaluated = []
-        errors.append({"stage": "evaluate_open_paper_trades", "error": str(e)})
+    created = []
+    for sig in scan["signals"]:
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
-    try:
-        scan = run_scan("COMBINED")
-    except Exception as e:
-        scan = {
-            "ok": False, "version": "V8_STABLE_FAILSAFE", "error": str(e),
-            "scan_type": "COMBINED", "created_at": utc_now(),
-            "signals": [], "ranked": [], "coverage": [],
-            "errors": [{"stage": "run_scan_outer", "error": str(e)}],
-            "errors_count": 1
-        }
+    evaluated = evaluate_virtual_signals()
+    observed_evaluated = evaluate_observations()
 
-    scan["observations_evaluated"] = len(observed_evaluated)
-    scan["paper_evaluated"] = len(paper_evaluated)
-    if errors:
-        scan.setdefault("errors", []).extend(errors)
-        scan["errors_count"] = scan.get("errors_count", 0) + len(errors)
+    if send and scan["signals"]:
+        tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
 
-    try:
-        save_scan_result("COMBINED", scan)
-    except Exception as e:
-        scan.setdefault("errors", []).append({"stage": "save_scan_result", "error": str(e)})
-        scan["errors_count"] = scan.get("errors_count", 0) + 1
+    save_combined_scan()
 
-    if send:
-        try:
-            send_alerts(force=True, top=TELEGRAM_TOP_N)
-        except Exception as e:
-            scan.setdefault("errors", []).append({"stage": "send_alerts", "error": str(e)})
-            scan["errors_count"] = scan.get("errors_count", 0) + 1
-            if SEND_TELEGRAM_ON_SCAN_ERROR:
-                try:
-                    tg_main_send(f"⚠️ UAE PRO AI V8 scan completed with send error: {str(e)}")
-                except Exception:
-                    pass
-
-    return scan
-
+    return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -1627,12 +1263,12 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
 
     evaluated = evaluate_virtual_signals()
 
-    if send:
-        send_alerts(force=True, top=TELEGRAM_TOP_N)
+    if send and scan["signals"]:
+        tg_main_send(format_scan_summary(scan, "Daily 1D Long Swing"))
 
     save_combined_scan()
 
-    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated), "paper_evaluated": len(paper_evaluated)}
+    return {"ok": True, "scan_type": "DAILY", "signals_count": scan["signals_count"], "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
 
 def save_combined_scan():
     hourly = latest_scan_result("HOURLY") or {}
@@ -1749,336 +1385,6 @@ def readiness_report():
     }
 
 
-
-
-# ============================================================
-# V6 RISK ENGINE + AUTO PAPER TRACKING
-# ============================================================
-
-def calc_v6_risk_plan(sig: Dict[str, Any]) -> Dict[str, Any]:
-    price = safe_float(sig.get("price"), 0) or 0
-    stop = safe_float(sig.get("stop_loss"), 0) or 0
-    target1 = safe_float(sig.get("target1"), 0) or 0
-
-    if price <= 0 or stop <= 0 or stop >= price:
-        return {
-            "ok": False,
-            "reason": "Invalid price or stop",
-            "amount_aed": 0,
-            "qty": 0,
-            "risk_aed": 0,
-            "reward_aed": 0,
-        }
-
-    max_risk_aed = CAPITAL * (RISK_PER_TRADE_PCT / 100)
-    max_position_aed = CAPITAL * (MAX_POSITION_PCT / 100)
-
-    risk_per_share = price - stop
-    qty_by_risk = max_risk_aed / risk_per_share
-    qty_by_position = max_position_aed / price
-    qty = max(0, min(qty_by_risk, qty_by_position))
-
-    amount = qty * price
-    risk_aed = qty * risk_per_share
-    reward_aed = qty * (target1 - price) if target1 > price else 0
-
-    return {
-        "ok": True,
-        "amount_aed": round(amount, 2),
-        "qty": round(qty, 2),
-        "risk_aed": round(risk_aed, 2),
-        "reward_aed": round(reward_aed, 2),
-        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
-        "max_position_pct": MAX_POSITION_PCT,
-    }
-
-def should_auto_track_paper(sig: Dict[str, Any]) -> bool:
-    if not AUTO_PAPER_TRACKING:
-        return False
-    return (
-        get_ai_mode() in ["PAPER", "LEARNING"]
-        and (sig.get("model_action") == "BUY" or sig.get("display_action") in ["BUY", "STRONG WATCH"] or sig.get("action") in ["PAPER_BUY", "BUY", "STRONG_LEARNING_ALERT"])
-        and float(sig.get("score") or 0) >= MIN_AUTO_PAPER_SCORE
-        and float(sig.get("rr") or 0) >= MIN_AUTO_PAPER_RR
-    )
-
-def auto_track_paper_trade(sig: Dict[str, Any]) -> bool:
-    if not should_auto_track_paper(sig):
-        return False
-
-    plan = calc_v6_risk_plan(sig)
-    if not plan.get("ok"):
-        return False
-
-    symbol = sig.get("symbol")
-    price = safe_float(sig.get("price"), 0)
-    amount = plan["amount_aed"]
-    qty = plan["qty"]
-
-    conn = db()
-    cur = conn.cursor()
-    key_payload = json.dumps(sig, sort_keys=True)
-
-    # avoid duplicate paper tracking for same symbol/type/price during same day
-    today = datetime.now(timezone.utc).date().isoformat()
-    cur.execute("""
-        SELECT id FROM telegram_trades
-        WHERE symbol=%s AND status='PAPER_OPEN' AND opened_at >= %s
-        LIMIT 1
-    """, (symbol, today))
-    exists = cur.fetchone()
-    if exists:
-        conn.close()
-        return False
-
-    cur.execute("""
-        INSERT INTO telegram_trades
-        (chat_id,symbol,status,entry_price,amount,qty,stop_loss,target1,target2,target3,
-         signal_score,signal_strength,signal_type,signal_payload,opened_at)
-        VALUES(%s,%s,'PAPER_OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        TELEGRAM_CHAT_ID or "paper",
-        symbol,
-        price,
-        amount,
-        qty,
-        sig.get("stop_loss"),
-        sig.get("target1"),
-        sig.get("target2"),
-        sig.get("target3"),
-        sig.get("score"),
-        sig.get("strength"),
-        sig.get("type"),
-        key_payload,
-        utc_now()
-    ))
-    conn.commit()
-    conn.close()
-    return True
-
-def evaluate_open_paper_trades():
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM telegram_trades WHERE status='PAPER_OPEN' ORDER BY id ASC LIMIT 500")
-    trades = cur.fetchall()
-    evaluated = []
-
-    for tr in trades:
-        symbol = tr["symbol"]
-        # use 60 first, fallback 1D
-        candles = get_candles(symbol, "60", 200) or get_candles(symbol, "1D", 200)
-        if not candles:
-            continue
-
-        entry = float(tr["entry_price"])
-        stop = safe_float(tr.get("stop_loss"))
-        target1 = safe_float(tr.get("target1"))
-        latest = float(candles[-1]["close"])
-        max_high = max(float(x["high"]) for x in candles[-48:])
-        min_low = min(float(x["low"]) for x in candles[-48:])
-
-        close_reason = None
-        exit_price = None
-
-        if target1 and max_high >= target1:
-            close_reason = "TARGET1_HIT"
-            exit_price = target1
-        elif stop and min_low <= stop:
-            close_reason = "STOP_HIT"
-            exit_price = stop
-        else:
-            opened = parse_dt(tr["opened_at"])
-            if opened and (utc_now_dt() - opened) > timedelta(days=5):
-                close_reason = "TIME_EXIT"
-                exit_price = latest
-
-        if close_reason:
-            qty = float(tr["qty"])
-            pnl = (exit_price - entry) * qty
-            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
-
-            cur.execute("""
-                UPDATE telegram_trades
-                SET status='PAPER_CLOSED', exit_price=%s, closed_at=%s, pnl=%s, pnl_pct=%s, close_note=%s
-                WHERE id=%s
-            """, (exit_price, utc_now(), pnl, pnl_pct, close_reason, tr["id"]))
-
-            apply_loss_learning(symbol, pnl_pct, tr.get("signal_type") or "PAPER")
-            evaluated.append({
-                "trade_id": tr["id"],
-                "symbol": symbol,
-                "reason": close_reason,
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct, 2),
-            })
-
-    conn.commit()
-    conn.close()
-    return evaluated
-
-@app.get("/api/v6/evaluate-paper")
-def api_evaluate_paper():
-    evaluated = evaluate_open_paper_trades()
-    return {"ok": True, "evaluated_count": len(evaluated), "evaluated": evaluated}
-
-@app.get("/api/v6/report")
-def api_v6_report(send: bool = False):
-    evaluated = evaluate_open_paper_trades()
-
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT COUNT(*) c FROM telegram_trades WHERE status='PAPER_OPEN'")
-    open_count = int(cur.fetchone()["c"])
-    cur.execute("SELECT COUNT(*) c FROM telegram_trades WHERE status='PAPER_CLOSED'")
-    closed_count = int(cur.fetchone()["c"])
-    cur.execute("SELECT COALESCE(SUM(pnl),0) pnl, COALESCE(AVG(pnl_pct),0) avg_pct FROM telegram_trades WHERE status='PAPER_CLOSED'")
-    row = cur.fetchone()
-    conn.close()
-
-    msg = (
-        "📊 <b>UAE PRO AI V6 Report</b>\n\n"
-        f"Mode: <b>{get_ai_mode()}</b>\n"
-        f"Paper Open Trades: <b>{open_count}</b>\n"
-        f"Paper Closed Trades: <b>{closed_count}</b>\n"
-        f"Total Paper PnL: <b>{round(float(row['pnl']), 2)} AED</b>\n"
-        f"Average Paper Return: <b>{round(float(row['avg_pct']), 2)}%</b>\n"
-        f"Evaluated Now: <b>{len(evaluated)}</b>\n\n"
-        f"Dashboard:\n{DASHBOARD_URL}"
-    )
-
-    if send:
-        tg_main_send(msg)
-
-    return {
-        "mode": get_ai_mode(),
-        "open_paper_trades": open_count,
-        "closed_paper_trades": closed_count,
-        "total_paper_pnl": round(float(row["pnl"]), 2),
-        "avg_paper_return_pct": round(float(row["avg_pct"]), 2),
-        "evaluated_now": evaluated,
-    }
-
-# ============================================================
-# V5 LIVE ORDER ENGINE + LOSS LEARNING
-# ============================================================
-
-def count_live_orders_today() -> int:
-    conn = db()
-    cur = conn.cursor()
-    today = datetime.now(timezone.utc).date().isoformat()
-    cur.execute("""
-        SELECT COUNT(*) FROM telegram_trades
-        WHERE opened_at >= %s AND status IN ('LIVE_OPEN','LIVE_SENT','OPEN')
-    """, (today,))
-    n = cur.fetchone()[0]
-    conn.close()
-    return int(n or 0)
-
-def send_broker_order(symbol: str, side: str, amount: float, price: float, stop_loss=None, target1=None, payload=None):
-    """
-    Generic broker webhook integration.
-    You must connect this to your licensed broker/order-management API.
-    """
-    if not LIVE_TRADING_ENABLED:
-        return {"ok": False, "reason": "LIVE_TRADING_ENABLED=false"}
-    if get_ai_mode() != "LIVE":
-        return {"ok": False, "reason": "AI_MODE is not LIVE"}
-    if LIVE_REQUIRES_CONFIRMATION:
-        return {"ok": False, "reason": "LIVE_REQUIRES_CONFIRMATION=true"}
-    if not BROKER_WEBHOOK_URL:
-        return {"ok": False, "reason": "BROKER_WEBHOOK_URL missing"}
-    if amount > MAX_LIVE_ORDER_AED:
-        return {"ok": False, "reason": "amount exceeds MAX_LIVE_ORDER_AED"}
-    if count_live_orders_today() >= MAX_DAILY_LIVE_ORDERS:
-        return {"ok": False, "reason": "daily live order limit reached"}
-
-    order = {
-        "symbol": normalize_symbol(symbol),
-        "side": side.upper(),
-        "amount_aed": amount,
-        "price_hint": price,
-        "stop_loss": stop_loss,
-        "target1": target1,
-        "source": "UAE_PRO_AI_V5",
-        "created_at": utc_now(),
-        "payload": payload or {},
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if BROKER_API_KEY:
-        headers["Authorization"] = f"Bearer {BROKER_API_KEY}"
-
-    try:
-        r = requests.post(BROKER_WEBHOOK_URL, json=order, headers=headers, timeout=20)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"text": r.text}
-        return {"ok": r.ok, "status_code": r.status_code, "broker_response": body, "order": order}
-    except Exception as e:
-        return {"ok": False, "reason": str(e), "order": order}
-
-def apply_loss_learning(symbol: str, pnl_pct: float, signal_type: str = "TRADE"):
-    if not LOSS_LEARNING_ENABLED:
-        return
-    update_learning(symbol, pnl_pct, signal_type, is_virtual=False)
-
-@app.get("/api/live/status")
-def live_status():
-    return {
-        "mode": get_ai_mode(),
-        "live_trading_enabled": LIVE_TRADING_ENABLED,
-        "live_requires_confirmation": LIVE_REQUIRES_CONFIRMATION,
-        "broker_webhook_configured": bool(BROKER_WEBHOOK_URL),
-        "max_live_order_aed": MAX_LIVE_ORDER_AED,
-        "max_daily_live_orders": MAX_DAILY_LIVE_ORDERS,
-        "live_orders_today": count_live_orders_today()
-    }
-
-@app.post("/api/live/order")
-async def live_order(request: Request):
-    data = await request.json()
-    symbol = normalize_symbol(data.get("symbol"))
-    amount = safe_float(data.get("amount_aed"), 0)
-    price = safe_float(data.get("price"), 0)
-    side = data.get("side", "BUY")
-    stop_loss = safe_float(data.get("stop_loss"))
-    target1 = safe_float(data.get("target1"))
-
-    if not symbol or amount <= 0 or price <= 0:
-        return {"ok": False, "error": "symbol, amount_aed and price are required"}
-
-    result = send_broker_order(symbol, side, amount, price, stop_loss, target1, data)
-    return result
-
-@app.get("/api/trades/close")
-def close_trade(trade_id: int, exit_price: float, note: str = ""):
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM telegram_trades WHERE id=%s", (trade_id,))
-    trade = cur.fetchone()
-    if not trade:
-        conn.close()
-        return {"ok": False, "error": "trade not found"}
-
-    entry = float(trade["entry_price"])
-    qty = float(trade["qty"])
-    pnl = (exit_price - entry) * qty
-    pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0
-
-    cur.execute("""
-        UPDATE telegram_trades
-        SET status='CLOSED', exit_price=%s, closed_at=%s, pnl=%s, pnl_pct=%s, close_note=%s
-        WHERE id=%s
-    """, (exit_price, utc_now(), pnl, pnl_pct, note, trade_id))
-
-    conn.commit()
-    conn.close()
-
-    apply_loss_learning(trade["symbol"], pnl_pct, trade.get("signal_type") or "TRADE")
-
-    return {"ok": True, "trade_id": trade_id, "symbol": trade["symbol"], "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2)}
-
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -2104,22 +1410,19 @@ def tg_main_send(text, reply_markup=None):
     return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
 
 def signal_keyboard(symbol):
-    buttons = [
-        [{"text": "More Analysis", "callback_data": f"more:{symbol}"}, {"text": "Ignore", "callback_data": f"ignore:{symbol}"}],
-        [{"text": "I Entered This Trade", "callback_data": f"entered:{symbol}"}]
-    ]
+    buttons = [[{"text": "ð ØªØ­ÙÙÙ Ø£ÙØ«Ø±", "callback_data": f"more:{symbol}"}, {"text": "ð ØªØ¬Ø§ÙÙ", "callback_data": f"ignore:{symbol}"}]]
     return {"inline_keyboard": buttons}
 
 def format_signal(sig):
     if sig.get("hybrid_alert"):
-        mode_note = "\n🔥 <b>STRONG LEARNING ALERT:</b> إشارة قوية جداً أثناء التعلم. ليست دخول إلزامي، لكنها تستحق المتابعة."
+        mode_note = "\nð¥ <b>STRONG LEARNING ALERT:</b> Ø¥Ø´Ø§Ø±Ø© ÙÙÙØ© Ø¬Ø¯Ø§Ù Ø£Ø«ÙØ§Ø¡ Ø§ÙØªØ¹ÙÙ. ÙÙØ³Øª Ø¯Ø®ÙÙ Ø¥ÙØ²Ø§ÙÙØ ÙÙÙÙØ§ ØªØ³ØªØ­Ù Ø§ÙÙØªØ§Ø¨Ø¹Ø©."
     elif sig["mode"] == "LEARNING":
-        mode_note = "\n⚠️ <b>LEARNING MODE:</b> ليست توصية دخول فعلية. النظام يتعلم فقط."
+        mode_note = "\nâ ï¸ <b>LEARNING MODE:</b> ÙÙØ³Øª ØªÙØµÙØ© Ø¯Ø®ÙÙ ÙØ¹ÙÙØ©. Ø§ÙÙØ¸Ø§Ù ÙØªØ¹ÙÙ ÙÙØ·."
     else:
         mode_note = ""
     size = sig.get("position_sizing", {})
     return f"""
-📊 <b>{sig['symbol']} PRO AI V3</b>
+ð <b>{sig['symbol']} PRO AI V3</b>
 
 <b>Type:</b> {sig['type']}
 <b>Mode:</b> {sig['mode']}
@@ -2128,17 +1431,17 @@ def format_signal(sig):
 <b>Strength:</b> {sig['strength']}
 <b>Score:</b> {sig['score']}
 
-💰 Price: <b>{sig['price']}</b>
-📍 Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
-🛑 Stop: <b>{sig['stop_loss']}</b>
+ð° Price: <b>{sig['price']}</b>
+ð Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
+ð Stop: <b>{sig['stop_loss']}</b>
 
-🎯 Target 1: <b>{sig['target1']}</b>
-🎯 Target 2: <b>{sig['target2']}</b>
-🎯 Target 3: <b>{sig['target3']}</b>
+ð¯ Target 1: <b>{sig['target1']}</b>
+ð¯ Target 2: <b>{sig['target2']}</b>
+ð¯ Target 3: <b>{sig['target3']}</b>
 
-📈 Expected: <b>{sig['expected_move_pct']}%</b>
-⚖️ Risk: <b>{sig['risk_pct']}%</b>
-📐 RR: <b>{sig['rr']}</b>
+ð Expected: <b>{sig['expected_move_pct']}%</b>
+âï¸ Risk: <b>{sig['risk_pct']}%</b>
+ð RR: <b>{sig['rr']}</b>
 
 Position Size:
 Qty: {size.get('qty')}
@@ -2149,7 +1452,7 @@ RSI: {sig['rsi']}
 Volume Ratio: {sig['volume_ratio']}
 Trend: {sig['trend']}
 
-📌 {esc(sig['reason'])}
+ð {esc(sig['reason'])}
 {mode_note}
 
 Dashboard:
@@ -2157,16 +1460,16 @@ Dashboard:
 """.strip()
 
 def format_scan_summary(scan, title):
-    lines = [f"🧠 <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
+    lines = [f"ð§  <b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
     for s in scan["signals"][:TELEGRAM_TOP_N]:
-        lines.append(f"• <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
+        lines.append(f"â¢ <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
     lines.append("")
     lines.append(DASHBOARD_URL)
     return "\n".join(lines)
 
 def format_readiness(rep):
     return f"""
-🧠 <b>AI Readiness Report</b>
+ð§  <b>AI Readiness Report</b>
 
 Mode: <b>{rep['mode']}</b>
 Status: <b>{rep['status']}</b>
@@ -2188,127 +1491,40 @@ Reasons:
 """.strip()
 
 @app.get("/api/ai/send-alerts")
-def send_alerts(force: bool = False, dry_run: bool = False, top: int = None):
-    """
-    V5 English Telegram ranked alerts.
-    Sends ranked opportunities from strongest to weakest.
-    If no confirmed trade exists, it still sends the ranked watchlist and states market is WEAK.
-    """
-    if top is None:
-        top = TELEGRAM_TOP_N
-
+def send_alerts(force: bool = False, dry_run: bool = False):
     scan = latest_scan_result("COMBINED")
     if not scan:
-        msg = "📉 UAE PRO AI V5\nNo saved scan yet. Run hourly scan first."
+        return {"ok": False, "message": "No saved scan yet. Run hourly/daily cron first."}
+
+    sent, skipped = [], []
+
+    conn = db()
+    cur = conn.cursor()
+
+    for sig in scan["signals"][:5]:
+        key = f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['mode']}"
+
+        if not force:
+            cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
+            if cur.fetchone():
+                skipped.append({"symbol": sig["symbol"], "type": sig["type"], "reason": "duplicate_alert"})
+                continue
+
         if not dry_run:
-            tg_main_send(msg)
-        return {"ok": False, "message": "No saved scan yet. Run hourly scan first."}
+            tg_main_send(format_signal(sig), signal_keyboard(sig["symbol"]))
 
-    ranked = scan.get("ranked", []) or []
-    coverage = scan.get("coverage", []) or []
+        cur.execute("""
+            INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
+            VALUES(%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+        """, (key, sig["symbol"], sig["type"], utc_now(), json.dumps(sig)))
 
-    items = ranked if ranked else coverage
-    items = sorted(items, key=lambda x: (x.get("rank_score") or x.get("score") or 0), reverse=True)
+        sent.append({"symbol": sig["symbol"], "type": sig["type"]})
 
-    if not items:
-        msg = "📉 <b>UAE PRO AI V5</b>\nNo opportunities now. Market status: <b>WEAK / NO DATA</b>"
-        if not dry_run:
-            tg_main_send(msg)
-        return {"mode": get_ai_mode(), "sent_count": 1, "message": "WEAK", "items": []}
+    conn.commit()
+    conn.close()
 
-    lines = []
-    lines.append("📊 <b>UAE PRO AI V5 - Ranked Opportunities</b>")
-    lines.append(f"Mode: <b>{get_ai_mode()}</b>")
-    lines.append(f"Scan: <b>{scan.get('scan_type', 'COMBINED')}</b>")
-    if scan.get("batch_enabled"):
-        lines.append(f"Batch: <b>{scan.get('batch_start')} - {scan.get('batch_end')}</b> / {scan.get('watchlist_count')} | Covered: <b>{scan.get('total_covered_count')}</b>")
-    lines.append("")
-    lines.append("Ranking from strongest to weakest:")
-    lines.append("")
-
-    sent_items = []
-    real_opportunities = 0
-
-    for i, x in enumerate(items[:top], start=1):
-        symbol = x.get("symbol")
-        action = x.get("display_action") or x.get("action") or "WATCH"
-        model_action = x.get("model_action") or "WATCH"
-        strength = x.get("strength")
-        score = x.get("score")
-        rank_score = x.get("rank_score") or score
-        price = x.get("price")
-        rr = x.get("rr")
-        vol = x.get("volume_ratio")
-        comment = x.get("ai_comment") or ""
-
-        if model_action == "BUY" or action in ["BUY", "PAPER_BUY", "STRONG_LEARNING_ALERT"]:
-            status = "🔥 TRADE CANDIDATE"
-            real_opportunities += 1
-        elif strength in ["VERY STRONG", "STRONG"]:
-            status = "👀 STRONG WATCH"
-        elif action in ["NO_DATA", "ERROR"]:
-            status = "WEAK / NO DATA"
-        else:
-            status = "WEAK / WATCH"
-
-        price_txt = price if price is not None else "-"
-        rr_txt = rr if rr is not None else "-"
-        vol_txt = vol if vol is not None else "-"
-        risk_plan = calc_v6_risk_plan(x)
-        risk_line = ""
-        if risk_plan.get("ok"):
-            risk_line = f"\nRisk Plan: Amount {risk_plan['amount_aed']} AED | Qty {risk_plan['qty']} | Risk {risk_plan['risk_aed']} AED"
-
-        lines.append(
-            f"{i}. <b>{symbol}</b> | {status}\n"
-            f"Action: <b>{action}</b> | Model: {model_action}\n"
-            f"Strength: {strength} | Score: {score} | Rank: {rank_score}\n"
-            f"Price: {price_txt} | RR: {rr_txt} | Vol: {vol_txt}{risk_line}\n"
-            f"{comment}\n"
-        )
-
-        sent_items.append({
-            "rank": i,
-            "symbol": symbol,
-            "action": action,
-            "model_action": model_action,
-            "strength": strength,
-            "score": score,
-            "rank_score": rank_score,
-            "price": price,
-            "rr": rr,
-        })
-
-    if real_opportunities == 0:
-        lines.append("📌 Summary: No confirmed trade setup now. Current market list is watch/weak.")
-    else:
-        lines.append(f"📌 Summary: {real_opportunities} trade candidate(s) for review.")
-
-    lines.append("")
-    if get_ai_mode() == "LIVE" and LIVE_TRADING_ENABLED:
-        if LIVE_REQUIRES_CONFIRMATION:
-            lines.append("⚠️ Live trading is enabled, but confirmation is required before any order.")
-        else:
-            lines.append("⚠️ Live auto-order mode is enabled. Check broker and risk settings.")
-    else:
-        lines.append("Mode note: No real broker order will be placed unless LIVE_TRADING_ENABLED=true and broker webhook is configured.")
-
-    lines.append("")
-    lines.append(f"Dashboard:\n{DASHBOARD_URL}")
-
-    msg = "\n".join(lines)
-
-    if not dry_run:
-        tg_main_send(msg)
-
-    return {
-        "mode": get_ai_mode(),
-        "dry_run": dry_run,
-        "sent_count": 1,
-        "items_count": len(sent_items),
-        "real_opportunities": real_opportunities,
-        "sent": sent_items
-    }
+    return {"mode": get_ai_mode(), "dry_run": dry_run, "sent_count": len(sent), "skipped_count": len(skipped), "sent": sent, "skipped": skipped}
 
 @app.get("/api/ai/reset-alerts")
 def reset_alerts():
@@ -2343,59 +1559,26 @@ async def telegram_webhook(secret: str, request: Request):
             text = msg.get("text", "").strip()
             upper = text.upper()
 
-            if upper in ["جاهزية", "READINESS"]:
+            if upper in ["Ø¬Ø§ÙØ²ÙØ©", "READINESS"]:
                 return tg_send(chat_id, format_readiness(readiness_report()))
 
-            if upper.startswith("حلل"):
+            if upper.startswith("Ø­ÙÙ"):
                 parts = upper.split()
                 if len(parts) >= 2:
                     sigs = analyze_symbol(parts[1], "ALL")
                     if sigs:
                         best = max(sigs, key=lambda x: x["score"])
                         return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                    return tg_send(chat_id, "لا توجد بيانات كافية.")
-
-            if upper.startswith("ENTERED"):
-                parts = text.split()
-                if len(parts) >= 4:
-                    symbol = normalize_symbol(parts[1])
-                    price = safe_float(parts[2], 0)
-                    amount = safe_float(parts[3], 0)
-                    if symbol and price > 0 and amount > 0:
-                        qty = amount / price
-                        conn = db()
-                        cur = conn.cursor()
-                        cur.execute("""
-                            INSERT INTO telegram_trades
-                            (chat_id,symbol,status,entry_price,amount,qty,opened_at,signal_type)
-                            VALUES(%s,%s,'OPEN',%s,%s,%s,%s,'MANUAL')
-                            RETURNING id
-                        """, (str(chat_id), symbol, price, amount, qty, utc_now()))
-                        trade_id = cur.fetchone()[0]
-                        conn.commit()
-                        conn.close()
-                        return tg_send(chat_id, f"✅ Trade tracked: {symbol}\nTrade ID: {trade_id}\nEntry: {price}\nAmount: {amount}\nQty: {round(qty,2)}")
-                return tg_send(chat_id, "Use: ENTERED SYMBOL PRICE AMOUNT\nExample: ENTERED EMAAR 11.22 40000")
-
-            if upper.startswith("SOLD"):
-                parts = text.split()
-                if len(parts) >= 3:
-                    trade_id = int(parts[1])
-                    exit_price = float(parts[2])
-                    result = close_trade(trade_id, exit_price, "Telegram close")
-                    if result.get("ok"):
-                        return tg_send(chat_id, f"✅ Trade closed\n{result['symbol']}\nPnL: {result['pnl']} AED\nPnL %: {result['pnl_pct']}%\nAI learning updated.")
-                    return tg_send(chat_id, f"Could not close trade: {result}")
-                return tg_send(chat_id, "Use: SOLD TRADE_ID EXIT_PRICE\nExample: SOLD 12 11.40")
+                    return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
             if upper in WATCHLIST:
                 sigs = analyze_symbol(upper, "ALL")
                 if sigs:
-                    best = max(sigs, key=lambda x: x.get("rank_score", x["score"]))
+                    best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "Not enough data for this symbol.")
+                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ© ÙÙØ°Ø§ Ø§ÙØ³ÙÙ.")
 
-            return tg_send(chat_id, "Send a symbol like EMAAR, or:\nANALYZE EMAAR\nREADINESS\nENTERED EMAAR 11.22 40000\nSOLD 1 11.40")
+            return tg_send(chat_id, "Ø§ÙØªØ¨ Ø±ÙØ² Ø³ÙÙ ÙØ«Ù EMAAR Ø£Ù:\nØ­ÙÙ EMAAR\nØ¬Ø§ÙØ²ÙØ©")
 
         if "callback_query" in data:
             cq = data["callback_query"]
@@ -2412,14 +1595,10 @@ async def telegram_webhook(secret: str, request: Request):
                 if sigs:
                     best = max(sigs, key=lambda x: x["score"])
                     return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "لا توجد بيانات كافية.")
-
-            if action == "entered":
-                symbol = parts[1]
-                return tg_send(chat_id, f"Manual trade tracking started for {symbol}. Send: ENTERED {symbol} price amount\nExample: ENTERED EMAAR 11.22 40000")
+                return tg_send(chat_id, "ÙØ§ ØªÙØ¬Ø¯ Ø¨ÙØ§ÙØ§Øª ÙØ§ÙÙØ©.")
 
             if action == "ignore":
-                return tg_send(chat_id, "Ignored.")
+                return tg_send(chat_id, "ØªÙ ØªØ¬Ø§ÙÙ Ø§ÙØ¥Ø´Ø§Ø±Ø© ð")
 
     except Exception as e:
         print("Telegram error:", str(e))
