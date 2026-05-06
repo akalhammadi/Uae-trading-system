@@ -61,7 +61,11 @@ def utc_now_dt() -> datetime:
 def db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing")
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(
+           DATABASE_URL,
+           sslmode="require",
+           connect_timeout=10
+    )
 
 def normalize_symbol(symbol: str) -> str:
     s = str(symbol or "").upper().replace(" ", "").strip()
