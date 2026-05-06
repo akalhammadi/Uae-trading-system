@@ -1108,26 +1108,62 @@ def api_observations(limit: int = 100):
 def cron_ok(secret: Optional[str]):
     return secret == CRON_SECRET
 
-@app.get("/api/cron/hourly-scan")
-def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
+SCAN_INDEX = 0
+
+@app.get("/api/cron/batch-scan")
+def batch_scan(secret: Optional[str] = None, limit: int = 8):
+
+    global SCAN_INDEX
+
     if not cron_ok(secret):
         return {"ok": False, "error": "bad_cron_secret"}
-    try:
-        scan = run_scan("HOURLY")
-        save_scan_result("HOURLY", scan)
-        created = []
-        for sig in scan["signals"]:
-            if record_virtual_signal(sig):
-                created.append({"symbol": sig["symbol"], "type": sig["type"]})
-        evaluated = evaluate_virtual_signals()
-        observed_evaluated = evaluate_observations()
-        save_combined_scan()
-        if send and scan["signals"]:
-            tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
-        return {"ok": True, "scan_type": "HOURLY", "signals_count": scan["signals_count"], "ranked_count": scan["ranked_count"], "errors_count": scan.get("errors_count", 0), "created_virtual": len(created), "evaluated": len(evaluated), "observations_evaluated": len(observed_evaluated)}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
 
+    total = len(WATCHLIST)
+
+    start = SCAN_INDEX
+    end = min(start + limit, total)
+
+    batch = WATCHLIST[start:end]
+
+    if end >= total:
+        SCAN_INDEX = 0
+    else:
+        SCAN_INDEX = end
+
+    results = []
+
+    for symbol in batch:
+        try:
+            sigs = analyze_symbol(symbol, "ALL")
+
+            best = max(
+                sigs,
+                key=lambda x: x.get("rank_score", 0),
+                default=None
+            )
+
+            results.append({
+                "symbol": symbol,
+                "ok": bool(best),
+                "signals": sigs
+            })
+
+        except Exception as e:
+            results.append({
+                "symbol": symbol,
+                "ok": False,
+                "error": str(e)
+            })
+
+    return {
+        "ok": True,
+        "batch_start": start,
+        "batch_end": end,
+        "next_index": SCAN_INDEX,
+        "count": len(results),
+        "results": results
+    }
+    
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
     if not cron_ok(secret):
