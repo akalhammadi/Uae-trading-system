@@ -1084,7 +1084,12 @@ def learning_scan():
         for sig in signals:
             if record_virtual_signal(sig):
                 created.append({"symbol": sig["symbol"], "type": sig["type"]})
-        evaluated = evaluate_virtual_signals()
+        evaluated = []
+
+        try:
+            evaluated = evaluate_virtual_signals()
+        except Exception as e:
+            print("EVALUATION ERROR", e)
         observed_evaluated = evaluate_observations()
         return {"ok": True, "mode": get_ai_mode(), "created_count": len(created), "created": created, "evaluated_count": len(evaluated), "evaluated": evaluated, "observations_evaluated": len(observed_evaluated)}
     except Exception as e:
