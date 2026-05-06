@@ -409,13 +409,17 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
 def coverage():
     out = []
     ready_count = 0
-    for s in WATCHLIST:
-        h1 = len(get_candles(s, "60", 5))
-        d1 = len(get_candles(s, "1D", 5))
-        ready = h1 > 0 and d1 > 0
-        ready_count += 1 if ready else 0
-        out.append({"symbol": s, "has_1h": h1 > 0, "has_1d": d1 > 0, "ready": ready})
-    return {"count": len(out), "ready_count": ready_count, "coverage": out}
+    for i, s in enumerate(WATCHLIST):
+        try:
+            sigs = analyze_symbol(s, scan_type)
+        except Exception as e:
+            print(f"SCAN ERROR {s}: {e}")
+            continue
+
+    # تخفيف الضغط على Railway
+        if i % 5 == 0:
+            import time
+            time.sleep(0.3)
 
 def sma(values, n):
     vals = [x for x in values if x is not None]
