@@ -1463,3 +1463,110 @@ def dashboard():
     </body>
     </html>
     """
+
+from fastapi.responses import JSONResponse
+import requests
+import os
+
+@app.get("/api/signals/open")
+def get_open_signals():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT symbol, timeframe, action, entry_price,
+                   target_price, stop_loss, created_at
+            FROM ai_signals
+            WHERE status='OPEN'
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
+
+        rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "symbol": r[0],
+                "timeframe": r[1],
+                "action": r[2],
+                "entry_price": float(r[3]),
+                "target_price": float(r[4]),
+                "stop_loss": float(r[5]),
+                "created_at": str(r[6]),
+            })
+
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "count": len(data), "signals": data}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/signals/completed")
+def get_completed_signals():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT symbol, timeframe, action, result,
+                   pnl_pct, created_at
+            FROM ai_signals
+            WHERE status='CLOSED'
+            ORDER BY created_at DESC
+            LIMIT 50
+        """)
+
+        rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "symbol": r[0],
+                "timeframe": r[1],
+                "action": r[2],
+                "result": r[3],
+                "pnl_pct": float(r[4]) if r[4] else 0,
+                "created_at": str(r[5]),
+            })
+
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "count": len(data), "signals": data}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/ai/test-telegram")
+def test_telegram():
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return {
+            "ok": False,
+            "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        }
+
+    text = "✅ UAE AI System Telegram Test Successful"
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text
+    }
+
+    r = requests.post(url, json=payload)
+
+    return {
+        "ok": r.status_code == 200,
+        "telegram_response": r.text
+    }
