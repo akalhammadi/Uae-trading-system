@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-app = FastAPI(title="UAE Market PRO AI V12 Stable Reports")
+app = FastAPI(title="UAE Market PRO AI V13 Professional")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET = os.getenv("SECRET", "abc123")
@@ -363,8 +363,8 @@ def learning_remaining_days():
 def home():
     return {
         "ok": True,
-        "status": "UAE PRO AI V12 Stable Running",
-        "version": "V12_REPORTS_WEEKEND_SAFE",
+        "status": "UAE PRO AI V13 Professional Running",
+        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
         "mode": get_ai_mode(),
         "uae_now": uae_now_dt().isoformat(),
         "is_trading_day": is_uae_trading_day(),
@@ -380,7 +380,7 @@ def home():
 def health():
     return {
         "ok": True,
-        "version": "V12_REPORTS_WEEKEND_SAFE",
+        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
         "mode": get_ai_mode(),
         "uae_now": uae_now_dt().isoformat(),
         "is_trading_day": is_uae_trading_day(),
@@ -1108,7 +1108,7 @@ def run_scan(scan_type: str):
 
     payload = {
         "ok": True,
-        "version": "V12_REPORTS_WEEKEND_SAFE",
+        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
         "mode": get_ai_mode(),
         "scan_type": scan_type,
         "created_at": utc_now(),
@@ -1567,7 +1567,7 @@ def save_combined_scan():
 
     combined = {
         "ok": True,
-        "version": "V12_REPORTS_WEEKEND_SAFE",
+        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
         "mode": get_ai_mode(),
         "scan_type": "COMBINED",
         "created_at": utc_now(),
@@ -1810,7 +1810,7 @@ def test_telegram():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
 
-    text = "â UAE AI System Telegram Test Successful"
+    text = "Ã¢ÂÂ UAE AI System Telegram Test Successful"
     result = tg_main_send(text)
     return {"ok": bool(result.get("ok")), "telegram_response": result}
 
@@ -1898,10 +1898,10 @@ async def telegram_webhook(secret: str, request: Request):
             text = msg.get("text", "").strip()
             upper = text.upper()
 
-            if upper in ["READINESS", "Ø¬Ø§ÙØ²ÙØ©"]:
+            if upper in ["READINESS", "ÃÂ¬ÃÂ§ÃÂÃÂ²ÃÂÃÂ©"]:
                 return tg_send(chat_id, str(readiness_report()))
 
-            if upper.startswith("Ø­ÙÙ") or upper.startswith("ANALYZE"):
+            if upper.startswith("ÃÂ­ÃÂÃÂ") or upper.startswith("ANALYZE"):
                 parts = upper.split()
                 if len(parts) >= 2:
                     sigs = analyze_symbol(parts[1], "ALL")
@@ -2096,6 +2096,73 @@ def telegram_send_summary(secret: Optional[str] = None):
     return {"ok": True, "sent": True, "telegram": sent}
 
 
+
+
+# ============================================================
+# PROFESSIONAL CRON ALIASES - safe endpoints for Railway cron
+# ============================================================
+
+@app.get("/api/cron/send-alerts")
+def cron_send_alerts(secret: Optional[str] = None, force: bool = False):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+    try:
+        return send_alerts(force=force, dry_run=False)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
+
+@app.get("/api/cron/readiness-report")
+def cron_readiness_report(secret: Optional[str] = None):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+    try:
+        rep = readiness_report()
+        text = (
+            f"<b>AI Readiness Report</b>\n"
+            f"Mode: {rep.get('mode')}\n"
+            f"Status: {rep.get('status')}\n"
+            f"Learning: {rep.get('learning_progress_pct')}%\n"
+            f"Trading Days: {rep.get('learning_age_days')}/{rep.get('learning_days_required')}\n"
+            f"Total Signals: {rep.get('total_signals')}\n"
+            f"Open: {rep.get('open_signals')}\n"
+            f"Evaluated: {rep.get('evaluated_signals')}\n"
+            f"Win Rate: {rep.get('win_rate')}%\n"
+            f"Avg Return: {rep.get('avg_return_pct')}%"
+        )
+        sent = tg_main_send(text)
+        return {"ok": True, "telegram": sent, "readiness": rep}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
+
+@app.get("/api/cron/end-of-day")
+def cron_end_of_day(secret: Optional[str] = None):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+    if not is_uae_trading_day():
+        return {"ok": True, "skipped": True, "reason": "UAE weekend - no end of day report"}
+    try:
+        scan = run_scan("COMBINED")
+        save_scan_result("COMBINED", scan)
+        created = []
+        for sig in scan.get("signals", []):
+            if record_virtual_signal(sig):
+                created.append({"symbol": sig["symbol"], "type": sig["type"]})
+        evaluated = evaluate_virtual_signals()
+        observed = evaluate_observations()
+        text = format_daily_report()
+        sent = tg_main_send(text)
+        return {
+            "ok": True,
+            "scan_signals": scan.get("signals_count", 0),
+            "ranked_count": scan.get("ranked_count", 0),
+            "created_virtual": len(created),
+            "evaluated": len(evaluated),
+            "observations_evaluated": len(observed),
+            "telegram": sent,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
+
 # ============================================================
 # DASHBOARD
 # ============================================================
@@ -2130,7 +2197,7 @@ def dashboard():
     return f"""
     <html>
     <head>
-        <title>UAE PRO AI V12 Stable</title>
+        <title>UAE PRO AI V13 Professional</title>
         <style>
             body {{ font-family: Arial; background:#111827; color:#e5e7eb; padding:20px; }}
             .card {{ background:#1f2937; padding:16px; border-radius:12px; margin-bottom:18px; }}
@@ -2140,7 +2207,7 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h1>UAE PRO AI V12 Stable</h1>
+        <h1>UAE PRO AI V13 Professional</h1>
         <div class="card">
             Mode: <b>{scan.get('mode')}</b><br>
             Readiness: <b>{rep['status']}</b><br>
