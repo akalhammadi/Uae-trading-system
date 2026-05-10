@@ -1070,8 +1070,8 @@ def analyze_symbol(symbol: str, scan_type: str = "ALL"):
     if scan_type == "COMBINED":
         scan_type = "ALL"
 
-    h1 = get_candles(symbol, "60", 220)
-    d1 = get_candles(symbol, "1D", 220)
+    h1 = get_candles(symbol, "60", 80)
+    d1 = get_candles(symbol, "1D", 80)
     signals = []
 
     if scan_type in ["ALL", "HOURLY"]:
