@@ -550,6 +550,46 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
     conn.close()
     return {"ok": True, "count": len(rows), "candles": rows}
 
+@app.get("/api/admin/move-historical-to-learning")
+def move_historical_to_learning(secret: Optional[str] = None):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS historical_candles AS
+        SELECT * FROM candles WHERE 1=0
+    """)
+
+    cur.execute("""
+        INSERT INTO historical_candles
+        SELECT *
+        FROM candles
+        WHERE exchange='HISTORICAL'
+        ON CONFLICT DO NOTHING
+    """)
+
+    moved = cur.rowcount
+
+    cur.execute("""
+        DELETE FROM candles
+        WHERE exchange='HISTORICAL'
+    """)
+
+    deleted = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "moved_to_learning": moved,
+        "deleted_from_live_candles": deleted,
+        "kept_in_live": "all non-HISTORICAL candles, including 2026 TradingView"
+    }
+
 @app.get("/api/watchlist/coverage")
 def coverage():
     out = []
