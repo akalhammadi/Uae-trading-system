@@ -438,7 +438,78 @@ async def tradingview_webhook(request: Request):
 
     return {"ok": True, "symbol": symbol, "timeframe": tf, "close": c}
 
+@app.post("/api/webhook/price-alert")
+@app.get("/api/webhook/price-alert")
+async def price_alert_webhook(request: Request, secret: Optional[str] = None):
+    try:
+        if secret != SECRET and secret != CRON_SECRET:
+            return {"ok": False, "error": "bad_secret"}
 
+        try:
+            data = await request.json()
+        except Exception:
+            data = dict(request.query_params)
+
+        symbol = normalize_symbol(
+            data.get("symbol") or data.get("ticker") or data.get("syminfo.ticker")
+        )
+
+        tf = normalize_tf(
+            data.get("timeframe") or data.get("interval") or data.get("tf") or "60"
+        )
+
+        o = safe_float(data.get("open") or data.get("o"))
+        h = safe_float(data.get("high") or data.get("h"))
+        l = safe_float(data.get("low") or data.get("l"))
+        c = safe_float(data.get("close") or data.get("price") or data.get("c"))
+        v = safe_float(data.get("volume") or data.get("v"), 0)
+
+        if not symbol:
+            return {"ok": False, "error": "missing_symbol", "received": data}
+
+        if tf not in ["60", "1D"]:
+            return {"ok": False, "error": "bad_timeframe", "timeframe": tf, "received": data}
+
+        if None in [o, h, l, c]:
+            return {
+                "ok": False,
+                "error": "missing_ohlc",
+                "symbol": symbol,
+                "timeframe": tf,
+                "received": data
+            }
+
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            symbol,
+            data.get("exchange") or "TRADINGVIEW",
+            tf,
+            parse_bar_time(data.get("time") or data.get("timenow")),
+            o, h, l, c, v,
+            utc_now()
+        ))
+        conn.commit()
+        conn.close()
+
+        return {
+            "ok": True,
+            "saved": True,
+            "symbol": symbol,
+            "timeframe": tf,
+            "close": c
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc()[-1500:]
+        }
+        
 # ============================================================
 # CANDLES + COVERAGE
 # ============================================================
