@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-app = FastAPI(title="UAE Market PRO AI V13 Professional")
+app = FastAPI(title="UAE Market PRO AI V14 Full Stable")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET = os.getenv("SECRET", "abc123")
@@ -21,7 +21,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
 
-BASE_URL = os.getenv("API_BASE", "https://uae-market-production.up.railway.app")
+BASE_URL = os.getenv("API_BASE", "https://uae-market-production.up.railway.app").rstrip("/")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", f"{BASE_URL}/dashboard")
 
 AI_MODE = os.getenv("AI_MODE", "PAPER").upper().strip()
@@ -42,7 +42,6 @@ MIN_D1_CANDLES = int(os.getenv("MIN_D1_CANDLES", "5"))
 SCAN_MAX_ERRORS = int(os.getenv("SCAN_MAX_ERRORS", "100"))
 
 UAE_TZ_OFFSET = timedelta(hours=4)
-SCAN_INDEX = 0
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
@@ -60,14 +59,14 @@ WATCHLIST = [
 # TIME + HELPERS
 # ============================================================
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 def utc_now_dt() -> datetime:
     return datetime.now(timezone.utc)
 
+def utc_now() -> str:
+    return utc_now_dt().isoformat()
+
 def uae_now_dt() -> datetime:
-    return datetime.now(timezone.utc) + UAE_TZ_OFFSET
+    return utc_now_dt() + UAE_TZ_OFFSET
 
 def is_uae_trading_day(dt: Optional[datetime] = None) -> bool:
     d = dt or uae_now_dt()
@@ -81,8 +80,8 @@ def business_days_between(start: datetime, end: datetime) -> int:
     if start > end:
         return 0
     count = 0
-    cur = start.date()
-    end_date = end.date()
+    cur = (start + UAE_TZ_OFFSET).date()
+    end_date = (end + UAE_TZ_OFFSET).date()
     while cur <= end_date:
         if cur.weekday() in [0, 1, 2, 3, 4]:
             count += 1
@@ -263,32 +262,6 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_trades (
-            id SERIAL PRIMARY KEY,
-            chat_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            status TEXT NOT NULL,
-            entry_price DOUBLE PRECISION NOT NULL,
-            amount DOUBLE PRECISION NOT NULL,
-            qty DOUBLE PRECISION NOT NULL,
-            stop_loss DOUBLE PRECISION,
-            target1 DOUBLE PRECISION,
-            target2 DOUBLE PRECISION,
-            target3 DOUBLE PRECISION,
-            signal_score DOUBLE PRECISION,
-            signal_strength TEXT,
-            signal_type TEXT,
-            signal_payload TEXT,
-            opened_at TEXT NOT NULL,
-            exit_price DOUBLE PRECISION,
-            closed_at TEXT,
-            pnl DOUBLE PRECISION,
-            pnl_pct DOUBLE PRECISION,
-            close_note TEXT
-        )
-    """)
-
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_learning_stats (
             symbol TEXT PRIMARY KEY,
             trades_count INTEGER DEFAULT 0,
@@ -302,6 +275,14 @@ def init_db():
             virtual_long_losses INTEGER DEFAULT 0,
             avg_return_pct DOUBLE PRECISION DEFAULT 0,
             score_adjustment DOUBLE PRECISION DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS batch_scan_state (
+            key TEXT PRIMARY KEY,
+            next_index INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         )
     """)
@@ -339,11 +320,11 @@ def startup():
 
 
 # ============================================================
-# MODE + LEARNING TIME
+# MODE
 # ============================================================
 
 def get_ai_mode():
-    return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "LEARNING").upper().strip()
+    return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "PAPER").upper().strip()
 
 def learning_age_days():
     start = parse_dt(get_setting("learning_started_at"))
@@ -363,8 +344,8 @@ def learning_remaining_days():
 def home():
     return {
         "ok": True,
-        "status": "UAE PRO AI V13 Professional Running",
-        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
+        "status": "UAE PRO AI V14 Full Stable Running",
+        "version": "V14_FULL_STABLE",
         "mode": get_ai_mode(),
         "uae_now": uae_now_dt().isoformat(),
         "is_trading_day": is_uae_trading_day(),
@@ -372,15 +353,13 @@ def home():
         "learning_age_days": round(learning_age_days(), 2),
         "learning_remaining_days": round(learning_remaining_days(), 2),
         "watchlist_count": len(WATCHLIST),
-        "min_h1_candles": MIN_H1_CANDLES,
-        "min_d1_candles": MIN_D1_CANDLES,
     }
 
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
-        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
+        "version": "V14_FULL_STABLE",
         "mode": get_ai_mode(),
         "uae_now": uae_now_dt().isoformat(),
         "is_trading_day": is_uae_trading_day(),
@@ -393,11 +372,12 @@ def healthz():
 
 @app.get("/api/watchlist")
 def watchlist():
-    return {"count": len(WATCHLIST), "stocks": WATCHLIST}
+    return {"ok": True, "count": len(WATCHLIST), "stocks": WATCHLIST}
 
 @app.get("/api/system/mode")
 def api_mode():
     return {
+        "ok": True,
         "mode": get_ai_mode(),
         "learning_days": LEARNING_DAYS,
         "learning_age_days": round(learning_age_days(), 2),
@@ -497,7 +477,7 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
     cur.execute(q, tuple(params))
     rows = cur.fetchall()
     conn.close()
-    return {"count": len(rows), "candles": rows}
+    return {"ok": True, "count": len(rows), "candles": rows}
 
 @app.get("/api/watchlist/coverage")
 def coverage():
@@ -508,6 +488,7 @@ def coverage():
         h1 = len(get_candles(s, "60", 25))
         d1 = len(get_candles(s, "1D", 10))
         ready = h1 >= MIN_H1_CANDLES and d1 >= MIN_D1_CANDLES
+
         if ready:
             ready_count += 1
 
@@ -974,6 +955,10 @@ def build_signal(symbol, kind, candles, d1):
 
 def analyze_symbol(symbol: str, scan_type: str = "ALL"):
     symbol = normalize_symbol(symbol)
+    scan_type = scan_type.upper()
+    if scan_type == "COMBINED":
+        scan_type = "ALL"
+
     h1 = get_candles(symbol, "60", 220)
     d1 = get_candles(symbol, "1D", 220)
     signals = []
@@ -1004,10 +989,11 @@ def api_analyze_alias(symbol: str):
 
 
 # ============================================================
-# SCAN STORAGE + RUN SCAN
+# SCANS
 # ============================================================
 
 def save_scan_result(scan_type: str, payload: Dict[str, Any]):
+    scan_type = scan_type.upper()
     conn = db()
     cur = conn.cursor()
     cur.execute("""
@@ -1026,6 +1012,7 @@ def save_scan_result(scan_type: str, payload: Dict[str, Any]):
     conn.close()
 
 def latest_scan_result(scan_type: str = "COMBINED"):
+    scan_type = scan_type.upper()
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM ai_scan_results WHERE scan_type=%s ORDER BY id DESC LIMIT 1", (scan_type,))
@@ -1108,7 +1095,7 @@ def run_scan(scan_type: str):
 
     payload = {
         "ok": True,
-        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
+        "version": "V14_FULL_STABLE",
         "mode": get_ai_mode(),
         "scan_type": scan_type,
         "created_at": utc_now(),
@@ -1212,6 +1199,9 @@ def record_virtual_signal(sig):
     return ok
 
 def evaluate_virtual_signals():
+    if not is_uae_trading_day():
+        return []
+
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
@@ -1258,7 +1248,7 @@ def evaluate_virtual_signals():
             elif target_hit and stop_hit:
                 status, outcome = "CLOSED", "BOTH_TOUCHED_CONSERVATIVE_STOP"
                 ret_pct = ((stop - price) / price) * 100
-            elif created and (utc_now_dt() - created) > timedelta(days=max_hold_days):
+            elif created and business_days_between(created, utc_now_dt()) > max_hold_days:
                 status, outcome = "CLOSED", "TIME_EXIT"
                 ret_pct = ((latest_close - price) / price) * 100
 
@@ -1332,6 +1322,9 @@ def record_observations(scan_payload: Dict[str, Any]):
     return created
 
 def evaluate_observations():
+    if not is_uae_trading_day():
+        return []
+
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM ai_observations WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
@@ -1373,7 +1366,7 @@ def evaluate_observations():
                 status, outcome = "CLOSED", "WATCH_RALLIED"
             elif drop_hit:
                 status, outcome = "CLOSED", "WATCH_DROPPED"
-            elif observed and (utc_now_dt() - observed) > timedelta(days=max_days):
+            elif observed and business_days_between(observed, utc_now_dt()) > max_days:
                 status, outcome = "CLOSED", "WATCH_TIME_EXIT"
 
             cur.execute("""
@@ -1417,12 +1410,7 @@ def learning_scan():
             if record_virtual_signal(sig):
                 created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
-        evaluated = []
-        try:
-            evaluated = evaluate_virtual_signals()
-        except Exception as e:
-            print("EVALUATION ERROR", e)
-
+        evaluated = evaluate_virtual_signals()
         observed_evaluated = evaluate_observations()
 
         return {
@@ -1432,7 +1420,8 @@ def learning_scan():
             "created": created,
             "evaluated_count": len(evaluated),
             "evaluated": evaluated,
-            "observations_evaluated": len(observed_evaluated)
+            "observations_evaluated": len(observed_evaluated),
+            "weekend_excluded": True
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
@@ -1455,10 +1444,33 @@ def api_observations(limit: int = 100):
 def cron_ok(secret: Optional[str]):
     return secret == CRON_SECRET
 
+def get_batch_index():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO batch_scan_state(key,next_index,updated_at)
+        VALUES('main',0,%s)
+        ON CONFLICT(key) DO NOTHING
+    """, (utc_now(),))
+    conn.commit()
+    cur.execute("SELECT next_index FROM batch_scan_state WHERE key='main'")
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+def set_batch_index(i: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO batch_scan_state(key,next_index,updated_at)
+        VALUES('main',%s,%s)
+        ON CONFLICT(key) DO UPDATE SET next_index=EXCLUDED.next_index, updated_at=EXCLUDED.updated_at
+    """, (i, utc_now()))
+    conn.commit()
+    conn.close()
+
 @app.get("/api/cron/batch-scan")
 def batch_scan(secret: Optional[str] = None, limit: int = 8, send: bool = False):
-    global SCAN_INDEX
-
     if not cron_ok(secret):
         return {"ok": False, "error": "bad_cron_secret"}
 
@@ -1466,43 +1478,129 @@ def batch_scan(secret: Optional[str] = None, limit: int = 8, send: bool = False)
         return {"ok": True, "skipped": True, "reason": "UAE weekend - no trading"}
 
     total = len(WATCHLIST)
-    start = SCAN_INDEX
+    start = get_batch_index()
     end = min(start + limit, total)
     batch = WATCHLIST[start:end]
-
-    SCAN_INDEX = 0 if end >= total else end
+    next_index = 0 if end >= total else end
+    set_batch_index(next_index)
 
     results = []
     batch_signals = []
+    ranked = []
+    coverage_rows = []
 
     for symbol in batch:
+        h1_count = len(get_candles(symbol, "60", 25))
+        d1_count = len(get_candles(symbol, "1D", 10))
         try:
             sigs = analyze_symbol(symbol, "ALL")
             best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
 
-            if best and (best.get("model_action") == "BUY" or is_hybrid_strong_signal(best)):
-                batch_signals.append(best)
+            if best:
+                ranked.append(best)
+                if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
+                    batch_signals.append(best)
+                coverage_rows.append({
+                    "symbol": symbol,
+                    "has_data": True,
+                    "action": classify_action(best),
+                    "model_action": best.get("model_action"),
+                    "score": best.get("score"),
+                    "rank_score": best.get("rank_score"),
+                    "strength": best.get("strength"),
+                    "price": best.get("price"),
+                    "rr": best.get("rr"),
+                    "volume_ratio": best.get("volume_ratio"),
+                    "ai_comment": ai_comment(best),
+                    "h1_count": h1_count,
+                    "d1_count": d1_count,
+                })
+            else:
+                coverage_rows.append(no_data_result(symbol, "no setup or not enough data", h1_count, d1_count))
 
             results.append({"symbol": symbol, "ok": bool(best), "best": best, "signals": sigs})
         except Exception as e:
             results.append({"symbol": symbol, "ok": False, "error": str(e)})
+            coverage_rows.append(no_data_result(symbol, str(e), h1_count, d1_count))
+
+    ranked = sorted(ranked, key=lambda x: x.get("rank_score", 0), reverse=True)
+    batch_signals = sorted(batch_signals, key=lambda x: x.get("rank_score", 0), reverse=True)
+
+    payload = {
+        "ok": True,
+        "version": "V14_FULL_STABLE",
+        "mode": get_ai_mode(),
+        "scan_type": "HOURLY",
+        "created_at": utc_now(),
+        "watchlist_count": total,
+        "scanned_count": len(batch),
+        "batch_start": start,
+        "batch_end": end,
+        "next_index": next_index,
+        "signals_count": len(batch_signals),
+        "signals": batch_signals[:20],
+        "ranked_count": len(ranked),
+        "ranked": ranked,
+        "coverage": coverage_rows,
+        "results": results
+    }
+
+    save_scan_result("HOURLY", payload)
+    save_combined_scan()
+
+    created = []
+    for sig in batch_signals:
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
+    evaluated = evaluate_virtual_signals()
+    observed_evaluated = evaluate_observations()
 
     if send and batch_signals:
         tg_main_send(format_batch_summary(batch_signals, start, end))
 
-    return {
-        "ok": True,
-        "batch_start": start,
-        "batch_end": end,
-        "next_index": SCAN_INDEX,
-        "count": len(results),
-        "signals_count": len(batch_signals),
-        "results": results
-    }
+    payload["created_virtual"] = len(created)
+    payload["evaluated"] = len(evaluated)
+    payload["observations_evaluated"] = len(observed_evaluated)
+    return payload
 
 @app.get("/api/cron/safe-batch")
 def safe_batch_scan(secret: Optional[str] = None, limit: int = 8):
     return batch_scan(secret=secret, limit=limit, send=False)
+
+@app.get("/api/cron/hourly-scan")
+def cron_hourly_scan(secret: Optional[str] = None, send: bool = False):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    try:
+        scan = run_scan("HOURLY")
+        save_scan_result("HOURLY", scan)
+
+        created = []
+        for sig in scan["signals"]:
+            if record_virtual_signal(sig):
+                created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
+        evaluated = evaluate_virtual_signals()
+        observed_evaluated = evaluate_observations()
+        save_combined_scan()
+
+        if send and scan["signals"]:
+            tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
+
+        return {
+            "ok": True,
+            "scan_type": "HOURLY",
+            "signals_count": scan["signals_count"],
+            "ranked_count": scan["ranked_count"],
+            "errors_count": scan.get("errors_count", 0),
+            "created_virtual": len(created),
+            "evaluated": len(evaluated),
+            "observations_evaluated": len(observed_evaluated)
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -1525,8 +1623,8 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
         observed_evaluated = evaluate_observations()
         save_combined_scan()
 
-        if send and scan["signals"]:
-            tg_main_send(format_scan_summary(scan, "Daily 1D Long Swing"))
+        if send:
+            tg_main_send(format_daily_report())
 
         return {
             "ok": True,
@@ -1567,7 +1665,7 @@ def save_combined_scan():
 
     combined = {
         "ok": True,
-        "version": "V13_PRO_REPORTS_WEEKEND_SAFE",
+        "version": "V14_FULL_STABLE",
         "mode": get_ai_mode(),
         "scan_type": "COMBINED",
         "created_at": utc_now(),
@@ -1586,12 +1684,15 @@ def save_combined_scan():
 
 
 # ============================================================
-# READINESS + SIGNAL LISTS
+# READINESS + REPORTS
 # ============================================================
 
 @app.get("/api/ai/readiness")
-def readiness_report():
-    evaluate_virtual_signals()
+def readiness_report(secret: Optional[str] = None):
+    try:
+        evaluate_virtual_signals()
+    except Exception:
+        pass
 
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1667,267 +1768,6 @@ def readiness_report():
         "reasons": reasons
     }
 
-@app.get("/api/signals/open")
-def get_open_signals():
-    try:
-        conn = db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-        cur.execute("""
-            SELECT symbol, signal_type, timeframe, action, price, target1, stop_loss,
-                   score, strength, rr, risk_pct, created_at, status
-            FROM ai_virtual_signals
-            WHERE status='OPEN'
-            ORDER BY id DESC
-            LIMIT 50
-        """)
-
-        rows = cur.fetchall()
-        conn.close()
-        return {"ok": True, "count": len(rows), "signals": rows}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-@app.get("/api/signals/completed")
-def get_completed_signals():
-    try:
-        conn = db()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-        cur.execute("""
-            SELECT symbol, signal_type, timeframe, action, price, target1, stop_loss,
-                   score, strength, rr, outcome, outcome_at, max_high, min_low, created_at, status
-            FROM ai_virtual_signals
-            WHERE status='CLOSED'
-            ORDER BY id DESC
-            LIMIT 50
-        """)
-
-        rows = cur.fetchall()
-        conn.close()
-        return {"ok": True, "count": len(rows), "signals": rows}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def tg_api(method, payload):
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", json=payload, timeout=20)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def tg_send(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_api("sendMessage", payload)
-
-def tg_main_send(text, reply_markup=None):
-    if not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "TELEGRAM_CHAT_ID missing"}
-    return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
-
-def signal_keyboard(symbol):
-    buttons = [[{"text": "More analysis", "callback_data": f"more:{symbol}"}, {"text": "Ignore", "callback_data": f"ignore:{symbol}"}]]
-    return {"inline_keyboard": buttons}
-
-def format_signal(sig):
-    size = sig.get("position_sizing", {})
-    return f"""
-<b>{sig['symbol']} PRO AI V12</b>
-
-Type: {sig['type']}
-Mode: {sig['mode']}
-Action: {sig['action']}
-Model: {sig['model_action']}
-Strength: {sig['strength']}
-Score: {sig['score']}
-
-Price: <b>{sig['price']}</b>
-Entry: <b>{sig['entry_zone'][0]} - {sig['entry_zone'][1]}</b>
-Stop: <b>{sig['stop_loss']}</b>
-
-Target 1: <b>{sig['target1']}</b>
-Target 2: <b>{sig['target2']}</b>
-Target 3: <b>{sig['target3']}</b>
-
-Expected: <b>{sig['expected_move_pct']}%</b>
-Risk: <b>{sig['risk_pct']}%</b>
-RR: <b>{sig['rr']}</b>
-
-Position Size:
-Qty: {size.get('qty')}
-Value: {size.get('position_value')} AED
-Risk: {size.get('max_risk_aed')} AED
-
-RSI: {sig['rsi']}
-Volume Ratio: {sig['volume_ratio']}
-Trend: {sig['trend']}
-
-{esc(sig['reason'])}
-
-Dashboard:
-{DASHBOARD_URL}
-""".strip()
-
-def format_scan_summary(scan, title):
-    lines = [f"<b>{title}</b>", f"Mode: <b>{scan['mode']}</b>", f"Signals: <b>{scan['signals_count']}</b>", ""]
-
-    if scan["signals"]:
-        for s in scan["signals"][:TELEGRAM_TOP_N]:
-            lines.append(f"- <b>{s['symbol']}</b> {s['type']} | Score {s['score']} | Entry {s['entry_zone'][0]}-{s['entry_zone'][1]} | T1 {s['target1']}")
-    else:
-        lines.append("No strong signals. Market is weak or setup not ready.")
-
-    lines.append("")
-    lines.append(DASHBOARD_URL)
-    return "\n".join(lines)
-
-def format_batch_summary(signals, start, end):
-    lines = [
-        "<b>UAE AI Batch Scan Alert</b>",
-        f"Batch: {start} - {end}",
-        f"Signals: <b>{len(signals)}</b>",
-        ""
-    ]
-
-    for s in signals[:TELEGRAM_TOP_N]:
-        lines.append(f"- <b>{s['symbol']}</b> {s['type']} | {s['action']} | Score {s['score']} | T1 {s['target1']}")
-
-    lines.append("")
-    lines.append(DASHBOARD_URL)
-    return "\n".join(lines)
-
-@app.get("/api/ai/test-telegram")
-def test_telegram():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
-
-    text = "Ã¢ÂÂ UAE AI System Telegram Test Successful"
-    result = tg_main_send(text)
-    return {"ok": bool(result.get("ok")), "telegram_response": result}
-
-@app.get("/api/ai/send-alerts")
-def send_alerts(force: bool = False, dry_run: bool = False):
-    scan = latest_scan_result("COMBINED")
-    if not scan:
-        return {"ok": False, "message": "No saved scan yet. Run hourly/daily cron first."}
-
-    sent, skipped = [], []
-    conn = db()
-    cur = conn.cursor()
-
-    for sig in scan.get("signals", [])[:5]:
-        key = f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['mode']}"
-
-        if not force:
-            cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
-            if cur.fetchone():
-                skipped.append({"symbol": sig["symbol"], "type": sig["type"], "reason": "duplicate_alert"})
-                continue
-
-        if not dry_run:
-            tg_main_send(format_signal(sig), signal_keyboard(sig["symbol"]))
-
-        cur.execute("""
-            INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
-            VALUES(%s,%s,%s,%s,%s)
-            ON CONFLICT DO NOTHING
-        """, (key, sig["symbol"], sig["type"], utc_now(), json.dumps(sig)))
-
-        sent.append({"symbol": sig["symbol"], "type": sig["type"]})
-
-    conn.commit()
-    conn.close()
-
-    return {
-        "ok": True,
-        "mode": get_ai_mode(),
-        "dry_run": dry_run,
-        "sent_count": len(sent),
-        "skipped_count": len(skipped),
-        "sent": sent,
-        "skipped": skipped
-    }
-
-@app.get("/api/ai/reset-alerts")
-def reset_alerts():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM ai_alerts_log")
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
-@app.get("/api/ai/send-readiness")
-def send_readiness():
-    rep = readiness_report()
-    return tg_main_send(
-        f"<b>AI Readiness Report</b>\n"
-        f"Mode: {rep['mode']}\n"
-        f"Status: {rep['status']}\n"
-        f"Learning: {rep['learning_progress_pct']}%\n"
-        f"Total Signals: {rep['total_signals']}\n"
-        f"Evaluated: {rep['evaluated_signals']}\n"
-        f"Win Rate: {rep['win_rate']}%"
-    )
-
-@app.get("/api/telegram/set-webhook")
-def set_webhook():
-    webhook_url = f"{BASE_URL}/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
-    return tg_api("setWebhook", {"url": webhook_url})
-
-@app.post("/api/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != TELEGRAM_WEBHOOK_SECRET:
-        return {"ok": False, "error": "unauthorized"}
-
-    data = await request.json()
-
-    try:
-        if "message" in data:
-            msg = data["message"]
-            chat_id = msg["chat"]["id"]
-            text = msg.get("text", "").strip()
-            upper = text.upper()
-
-            if upper in ["READINESS", "ÃÂ¬ÃÂ§ÃÂÃÂ²ÃÂÃÂ©"]:
-                return tg_send(chat_id, str(readiness_report()))
-
-            if upper.startswith("ÃÂ­ÃÂÃÂ") or upper.startswith("ANALYZE"):
-                parts = upper.split()
-                if len(parts) >= 2:
-                    sigs = analyze_symbol(parts[1], "ALL")
-                    if sigs:
-                        best = max(sigs, key=lambda x: x["score"])
-                        return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                    return tg_send(chat_id, "No enough data yet.")
-
-            if upper in WATCHLIST:
-                sigs = analyze_symbol(upper, "ALL")
-                if sigs:
-                    best = max(sigs, key=lambda x: x["score"])
-                    return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
-                return tg_send(chat_id, "No enough data yet for this symbol.")
-
-            return tg_send(chat_id, "Send symbol like EMAAR or: ANALYZE EMAAR or READINESS")
-    except Exception as e:
-        print("Telegram error:", str(e))
-
-    return {"ok": True}
-
-
-# ============================================================
-# REPORTS
-# ============================================================
-
 def get_signal_stats():
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1947,15 +1787,6 @@ def get_signal_stats():
     cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'")
     stop_hits = int(cur.fetchone()["c"])
 
-    cur.execute("""
-        SELECT symbol, signal_type, action, price, target1, stop_loss, score, strength, created_at
-        FROM ai_virtual_signals
-        WHERE status='OPEN'
-        ORDER BY id DESC
-        LIMIT 20
-    """)
-    open_list = cur.fetchall()
-
     conn.close()
 
     win_rate = round((target_hits / closed_count * 100), 2) if closed_count else 0
@@ -1967,7 +1798,6 @@ def get_signal_stats():
         "target_hits": target_hits,
         "stop_hits": stop_hits,
         "win_rate": win_rate,
-        "open_list": open_list
     }
 
 def format_daily_report():
@@ -2001,11 +1831,11 @@ def format_daily_report():
     if scan.get("signals"):
         lines.append("<b>Top BUY Signals:</b>")
         for s in scan["signals"][:5]:
-            lines.append(f"- {s['symbol']} | {s['type']} | {s['action']} | Score {s['score']} | T1 {s['target1']}")
+            lines.append(f"- {s.get('symbol')} | {s.get('type')} | {s.get('action')} | Score {s.get('score')} | T1 {s.get('target1')}")
     elif latest_ranked:
         lines.append("<b>Top Ranked Watches:</b>")
         for s in latest_ranked:
-            lines.append(f"- {s['symbol']} | {s.get('type')} | {s.get('display_action')} | Score {s.get('score')} | Rank {s.get('rank_score')}")
+            lines.append(f"- {s.get('symbol')} | {s.get('type')} | {s.get('display_action')} | Score {s.get('score')} | Rank {s.get('rank_score')}")
     else:
         lines.append("No strong signals in latest scan.")
 
@@ -2095,44 +1925,352 @@ def telegram_send_summary(secret: Optional[str] = None):
     sent = tg_main_send(text)
     return {"ok": True, "sent": True, "telegram": sent}
 
+@app.get("/api/signals/open")
+def get_open_signals():
+    try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
+        cur.execute("""
+            SELECT symbol, signal_type, timeframe, action, price, target1, stop_loss,
+                   score, strength, rr, risk_pct, created_at, status
+            FROM ai_virtual_signals
+            WHERE status='OPEN'
+            ORDER BY id DESC
+            LIMIT 50
+        """)
+
+        rows = cur.fetchall()
+        conn.close()
+        return {"ok": True, "count": len(rows), "signals": rows}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+@app.get("/api/signals/completed")
+def get_completed_signals():
+    try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("""
+            SELECT symbol, signal_type, timeframe, action, price, target1, stop_loss,
+                   score, strength, rr, outcome, outcome_at, max_high, min_low, created_at, status
+            FROM ai_virtual_signals
+            WHERE status='CLOSED'
+            ORDER BY id DESC
+            LIMIT 50
+        """)
+
+        rows = cur.fetchall()
+        conn.close()
+        return {"ok": True, "count": len(rows), "signals": rows}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 # ============================================================
-# PROFESSIONAL CRON ALIASES - safe endpoints for Railway cron
+# TELEGRAM
 # ============================================================
+
+def tg_api(method, payload):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+            json=payload,
+            timeout=30
+        )
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "status_code": r.status_code, "text": r.text[:1000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def tg_send(chat_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": str(text)[:4000],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    return tg_api("sendMessage", payload)
+
+def tg_main_send(text, reply_markup=None):
+    if not TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "TELEGRAM_CHAT_ID missing"}
+    return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
+
+def signal_keyboard(symbol):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "More analysis", "callback_data": f"more:{symbol}"},
+                {"text": "Ignore", "callback_data": f"ignore:{symbol}"}
+            ]
+        ]
+    }
+
+def format_signal(sig):
+    size = sig.get("position_sizing") or {}
+    entry_zone = sig.get("entry_zone") or ["-", "-"]
+
+    return f"""
+<b>{sig.get('symbol', 'UNKNOWN')} PRO AI V14</b>
+
+Type: {sig.get('type', '-')}
+Mode: {sig.get('mode', '-')}
+Action: {sig.get('action', '-')}
+Model: {sig.get('model_action', '-')}
+Strength: {sig.get('strength', '-')}
+Score: {sig.get('score', '-')}
+
+Price: <b>{sig.get('price', '-')}</b>
+Entry: <b>{entry_zone[0]} - {entry_zone[1]}</b>
+Stop: <b>{sig.get('stop_loss', '-')}</b>
+
+Target 1: <b>{sig.get('target1', '-')}</b>
+Target 2: <b>{sig.get('target2', '-')}</b>
+Target 3: <b>{sig.get('target3', '-')}</b>
+
+Expected: <b>{sig.get('expected_move_pct', '-')}%</b>
+Risk: <b>{sig.get('risk_pct', '-')}%</b>
+RR: <b>{sig.get('rr', '-')}</b>
+
+Position Size:
+Qty: {size.get('qty', '-')}
+Value: {size.get('position_value', '-')} AED
+Risk: {size.get('max_risk_aed', '-')} AED
+
+RSI: {sig.get('rsi', '-')}
+Volume Ratio: {sig.get('volume_ratio', '-')}
+Trend: {sig.get('trend', '-')}
+
+{esc(sig.get('reason', '-'))}
+
+Dashboard:
+{DASHBOARD_URL}
+""".strip()
+
+def format_scan_summary(scan, title):
+    lines = [
+        f"<b>{title}</b>",
+        f"Mode: <b>{scan.get('mode', get_ai_mode())}</b>",
+        f"Signals: <b>{scan.get('signals_count', 0)}</b>",
+        ""
+    ]
+
+    if scan.get("signals"):
+        for s in scan["signals"][:TELEGRAM_TOP_N]:
+            entry = s.get("entry_zone") or ["-", "-"]
+            lines.append(
+                f"- <b>{s.get('symbol')}</b> {s.get('type')} | "
+                f"Score {s.get('score')} | Entry {entry[0]}-{entry[1]} | T1 {s.get('target1')}"
+            )
+    else:
+        lines.append("No strong signals. Market is weak or setup not ready.")
+
+    lines.append("")
+    lines.append(DASHBOARD_URL)
+    return "\n".join(lines)
+
+def format_batch_summary(signals, start, end):
+    lines = [
+        "<b>UAE AI Batch Scan Alert</b>",
+        f"Batch: {start} - {end}",
+        f"Signals: <b>{len(signals)}</b>",
+        ""
+    ]
+
+    for s in signals[:TELEGRAM_TOP_N]:
+        lines.append(
+            f"- <b>{s.get('symbol')}</b> {s.get('type')} | "
+            f"{s.get('action')} | Score {s.get('score')} | T1 {s.get('target1')}"
+        )
+
+    lines.append("")
+    lines.append(DASHBOARD_URL)
+    return "\n".join(lines)
+
+@app.get("/api/ai/test-telegram")
+def test_telegram():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
+
+    text = "â UAE AI System Telegram Test Successful"
+    result = tg_main_send(text)
+    return {"ok": bool(result.get("ok")), "telegram_response": result}
+
+@app.get("/api/ai/send-alerts")
+def send_alerts(secret: Optional[str] = None, force: bool = False, dry_run: bool = False):
+    if secret is not None and not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    try:
+        scan = latest_scan_result("COMBINED")
+        if not scan:
+            return {"ok": False, "message": "No saved COMBINED scan yet."}
+
+        signals = scan.get("signals", [])
+        if not signals:
+            return {
+                "ok": True,
+                "mode": get_ai_mode(),
+                "dry_run": dry_run,
+                "sent_count": 0,
+                "skipped_count": 0,
+                "errors_count": 0,
+                "message": "No signals to send.",
+                "signals_count": 0
+            }
+
+        sent = []
+        skipped = []
+        errors = []
+
+        conn = db()
+        cur = conn.cursor()
+
+        for sig in signals[:5]:
+            try:
+                symbol = sig.get("symbol", "UNKNOWN")
+                sig_type = sig.get("type", "UNKNOWN")
+                price = sig.get("price", "NA")
+                target1 = sig.get("target1", "NA")
+                mode = sig.get("mode", get_ai_mode())
+                key = f"{symbol}-{sig_type}-{price}-{target1}-{mode}"
+
+                if not force:
+                    cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
+                    if cur.fetchone():
+                        skipped.append({"symbol": symbol, "type": sig_type, "reason": "duplicate_alert"})
+                        continue
+
+                tg_result = None
+                if not dry_run:
+                    tg_result = tg_main_send(format_signal(sig), signal_keyboard(symbol))
+
+                cur.execute("""
+                    INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
+                    VALUES(%s,%s,%s,%s,%s)
+                    ON CONFLICT DO NOTHING
+                """, (key, symbol, sig_type, utc_now(), json.dumps(sig)))
+
+                sent.append({"symbol": symbol, "type": sig_type, "telegram": tg_result})
+            except Exception as e:
+                errors.append({"symbol": sig.get("symbol", "UNKNOWN"), "error": str(e)})
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "ok": True,
+            "mode": get_ai_mode(),
+            "dry_run": dry_run,
+            "sent_count": len(sent),
+            "skipped_count": len(skipped),
+            "errors_count": len(errors),
+            "sent": sent,
+            "skipped": skipped,
+            "errors": errors
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
+
+@app.get("/api/ai/reset-alerts")
+def reset_alerts():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ai_alerts_log")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.get("/api/ai/send-readiness")
+def send_readiness(secret: Optional[str] = None):
+    if secret is not None and not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    rep = readiness_report()
+    return tg_main_send(
+        f"<b>AI Readiness Report</b>\n"
+        f"Mode: {rep['mode']}\n"
+        f"Status: {rep['status']}\n"
+        f"Learning: {rep['learning_progress_pct']}%\n"
+        f"Total Signals: {rep['total_signals']}\n"
+        f"Open: {rep['open_signals']}\n"
+        f"Evaluated: {rep['evaluated_signals']}\n"
+        f"Win Rate: {rep['win_rate']}%\n"
+        f"Avg Return: {rep['avg_return_pct']}%"
+    )
+
+@app.get("/api/telegram/set-webhook")
+def set_webhook():
+    webhook_url = f"{BASE_URL}/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+    return tg_api("setWebhook", {"url": webhook_url})
+
+@app.post("/api/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        return {"ok": False, "error": "unauthorized"}
+
+    data = await request.json()
+
+    try:
+        if "message" in data:
+            msg = data["message"]
+            chat_id = msg["chat"]["id"]
+            text = msg.get("text", "").strip()
+            upper = text.upper()
+
+            if upper in ["READINESS", "Ø¬Ø§ÙØ²ÙØ©"]:
+                return tg_send(chat_id, str(readiness_report()))
+
+            if upper in ["DAILY", "ØªÙØ±ÙØ±", "ØªÙØ±ÙØ± ÙÙÙÙ"]:
+                return tg_send(chat_id, format_daily_report())
+
+            if upper in ["WEEKLY", "ØªÙØ±ÙØ± Ø£Ø³Ø¨ÙØ¹Ù", "Ø§Ø³Ø¨ÙØ¹Ù"]:
+                return tg_send(chat_id, format_weekly_report())
+
+            if upper.startswith("Ø­ÙÙ") or upper.startswith("ØªØ­ÙÙÙ") or upper.startswith("ANALYZE"):
+                parts = upper.split()
+                if len(parts) >= 2:
+                    sigs = analyze_symbol(parts[1], "ALL")
+                    if sigs:
+                        best = max(sigs, key=lambda x: x["score"])
+                        return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
+                    return tg_send(chat_id, "No enough data yet.")
+
+            if upper in WATCHLIST:
+                sigs = analyze_symbol(upper, "ALL")
+                if sigs:
+                    best = max(sigs, key=lambda x: x["score"])
+                    return tg_send(chat_id, format_signal(best), signal_keyboard(best["symbol"]))
+                return tg_send(chat_id, "No enough data yet for this symbol.")
+
+            return tg_send(chat_id, "Send symbol like EMAAR or: ANALYZE EMAAR, READINESS, DAILY, WEEKLY")
+    except Exception as e:
+        print("Telegram error:", str(e))
+
+    return {"ok": True}
 
 @app.get("/api/cron/send-alerts")
 def cron_send_alerts(secret: Optional[str] = None, force: bool = False):
     if not cron_ok(secret):
         return {"ok": False, "error": "bad_cron_secret"}
-    try:
-        return send_alerts(force=force, dry_run=False)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
+    return send_alerts(force=force, dry_run=False)
 
 @app.get("/api/cron/readiness-report")
 def cron_readiness_report(secret: Optional[str] = None):
     if not cron_ok(secret):
         return {"ok": False, "error": "bad_cron_secret"}
-    try:
-        rep = readiness_report()
-        text = (
-            f"<b>AI Readiness Report</b>\n"
-            f"Mode: {rep.get('mode')}\n"
-            f"Status: {rep.get('status')}\n"
-            f"Learning: {rep.get('learning_progress_pct')}%\n"
-            f"Trading Days: {rep.get('learning_age_days')}/{rep.get('learning_days_required')}\n"
-            f"Total Signals: {rep.get('total_signals')}\n"
-            f"Open: {rep.get('open_signals')}\n"
-            f"Evaluated: {rep.get('evaluated_signals')}\n"
-            f"Win Rate: {rep.get('win_rate')}%\n"
-            f"Avg Return: {rep.get('avg_return_pct')}%"
-        )
-        sent = tg_main_send(text)
-        return {"ok": True, "telegram": sent, "readiness": rep}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
+    return send_readiness()
 
 @app.get("/api/cron/end-of-day")
 def cron_end_of_day(secret: Optional[str] = None):
@@ -2140,17 +2278,20 @@ def cron_end_of_day(secret: Optional[str] = None):
         return {"ok": False, "error": "bad_cron_secret"}
     if not is_uae_trading_day():
         return {"ok": True, "skipped": True, "reason": "UAE weekend - no end of day report"}
+
     try:
         scan = run_scan("COMBINED")
         save_scan_result("COMBINED", scan)
+
         created = []
         for sig in scan.get("signals", []):
             if record_virtual_signal(sig):
                 created.append({"symbol": sig["symbol"], "type": sig["type"]})
+
         evaluated = evaluate_virtual_signals()
         observed = evaluate_observations()
-        text = format_daily_report()
-        sent = tg_main_send(text)
+        sent = tg_main_send(format_daily_report())
+
         return {
             "ok": True,
             "scan_signals": scan.get("signals_count", 0),
@@ -2162,6 +2303,7 @@ def cron_end_of_day(secret: Optional[str] = None):
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
+
 
 # ============================================================
 # DASHBOARD
@@ -2176,11 +2318,12 @@ def dashboard():
     for s in scan.get("ranked", scan.get("signals", [])):
         if not s.get("has_data", True):
             continue
+        entry_zone = s.get("entry_zone") or ["-", "-"]
         signal_rows += f"""
         <tr>
-            <td>{s['symbol']}</td><td>{s['type']}</td><td>{s.get('display_action', s['action'])}</td><td>{s['strength']}</td>
-            <td>{s.get('rank_score')}</td><td>{s['score']}</td><td>{s['price']}</td><td>{s['entry_zone'][0]} - {s['entry_zone'][1]}</td>
-            <td>{s['stop_loss']}</td><td>{s['target1']} / {s['target2']}</td><td>{s['rr']}</td><td>{s.get('ai_comment')}</td>
+            <td>{s.get('symbol')}</td><td>{s.get('type')}</td><td>{s.get('display_action', s.get('action'))}</td><td>{s.get('strength')}</td>
+            <td>{s.get('rank_score')}</td><td>{s.get('score')}</td><td>{s.get('price')}</td><td>{entry_zone[0]} - {entry_zone[1]}</td>
+            <td>{s.get('stop_loss')}</td><td>{s.get('target1')} / {s.get('target2')}</td><td>{s.get('rr')}</td><td>{s.get('ai_comment')}</td>
         </tr>
         """
 
@@ -2188,7 +2331,7 @@ def dashboard():
     for x in scan.get("coverage", []):
         coverage_rows += f"""
         <tr>
-            <td>{x['symbol']}</td><td>{'YES' if x.get('has_data') else 'NO'}</td>
+            <td>{x.get('symbol')}</td><td>{'YES' if x.get('has_data') else 'NO'}</td>
             <td>{x.get('action')}</td><td>{x.get('model_action')}</td><td>{x.get('rank_score')}</td><td>{x.get('score')}</td>
             <td>{x.get('strength')}</td><td>{x.get('h1_count','-')}</td><td>{x.get('d1_count','-')}</td><td>{x.get('ai_comment')}</td>
         </tr>
@@ -2197,7 +2340,7 @@ def dashboard():
     return f"""
     <html>
     <head>
-        <title>UAE PRO AI V13 Professional</title>
+        <title>UAE PRO AI V14 Full Stable</title>
         <style>
             body {{ font-family: Arial; background:#111827; color:#e5e7eb; padding:20px; }}
             .card {{ background:#1f2937; padding:16px; border-radius:12px; margin-bottom:18px; }}
@@ -2207,7 +2350,7 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h1>UAE PRO AI V13 Professional</h1>
+        <h1>UAE PRO AI V14 Full Stable</h1>
         <div class="card">
             Mode: <b>{scan.get('mode')}</b><br>
             Readiness: <b>{rep['status']}</b><br>
