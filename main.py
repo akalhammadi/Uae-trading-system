@@ -1133,6 +1133,64 @@ def latest_scan_result(scan_type: str = "COMBINED"):
         return None
     return json.loads(row["payload"])
 
+def get_all_candles_for_scan(limit_per_symbol_tf: int = 220):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT *
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY symbol, timeframe
+                       ORDER BY id DESC
+                   ) AS rn
+            FROM candles
+            WHERE symbol = ANY(%s)
+              AND timeframe IN ('60', '1D')
+        ) x
+        WHERE rn <= %s
+        ORDER BY symbol, timeframe, id ASC
+    """, (WATCHLIST, limit_per_symbol_tf))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    data = {}
+    for r in rows:
+        s = normalize_symbol(r["symbol"])
+        tf = normalize_tf(r["timeframe"])
+        data.setdefault(s, {"60": [], "1D": []})
+        data[s][tf].append(r)
+
+    return data
+
+
+def analyze_symbol_from_cache(symbol: str, scan_type: str, candle_cache: dict):
+    symbol = normalize_symbol(symbol)
+    scan_type = scan_type.upper()
+
+    if scan_type == "COMBINED":
+        scan_type = "ALL"
+
+    h1 = candle_cache.get(symbol, {}).get("60", [])
+    d1 = candle_cache.get(symbol, {}).get("1D", [])
+
+    signals = []
+
+    if scan_type in ["ALL", "HOURLY"]:
+        short_sig = build_signal(symbol, "SHORT_SWING", h1, d1)
+        if short_sig:
+            signals.append(short_sig)
+
+    if scan_type in ["ALL", "DAILY"]:
+        long_sig = build_signal(symbol, "LONG_SWING", d1, d1)
+        if long_sig:
+            signals.append(long_sig)
+
+    return signals
+
+
 def run_scan(scan_type: str):
     scan_type = scan_type.upper()
     if scan_type == "COMBINED":
@@ -1141,17 +1199,24 @@ def run_scan(scan_type: str):
     ranked, signals, coverage_rows, errors = [], [], [], []
     scanned = 0
 
+    candle_cache = get_all_candles_for_scan(220)
+
     for s in WATCHLIST:
         scanned += 1
-        h1_count = len(get_candles(s, "60", 25))
-        d1_count = len(get_candles(s, "1D", 10))
+
+        h1 = candle_cache.get(s, {}).get("60", [])
+        d1 = candle_cache.get(s, {}).get("1D", [])
+
+        h1_count = len(h1[-25:])
+        d1_count = len(d1[-10:])
 
         try:
-            sigs = analyze_symbol(s, scan_type)
+            sigs = analyze_symbol_from_cache(s, scan_type, candle_cache)
             best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
 
             if best:
                 ranked.append(best)
+
                 if best.get("model_action") == "BUY" or is_hybrid_strong_signal(best):
                     signals.append(best)
 
@@ -1179,7 +1244,9 @@ def run_scan(scan_type: str):
                     reason = f"need more 1D candles: {d1_count}/{MIN_D1_CANDLES}"
                 else:
                     reason = "no setup"
+
                 coverage_rows.append(no_data_result(s, reason, h1_count, d1_count))
+
         except Exception as e:
             err = str(e)
             errors.append({"symbol": s, "error": err})
@@ -1198,6 +1265,7 @@ def run_scan(scan_type: str):
                 "h1_count": h1_count,
                 "d1_count": d1_count
             })
+
             if len(errors) >= SCAN_MAX_ERRORS:
                 break
 
@@ -1206,7 +1274,7 @@ def run_scan(scan_type: str):
 
     payload = {
         "ok": True,
-        "version": "V14_FULL_STABLE",
+        "version": "V14_FULL_STABLE_OPTIMIZED",
         "mode": get_ai_mode(),
         "scan_type": scan_type,
         "created_at": utc_now(),
