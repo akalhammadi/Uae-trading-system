@@ -7,9 +7,21 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
+from threading import Thread
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+def run_background_job(job_func, *args, **kwargs):
+    def wrapper():
+        try:
+            job_func(*args, **kwargs)
+        except Exception:
+            print("BACKGROUND JOB ERROR:")
+            print(traceback.format_exc())
+
+    t = Thread(target=wrapper, daemon=True)
+    t.start()
 
 app = FastAPI(title="UAE Market PRO AI V14 Full Stable")
 
@@ -1752,34 +1764,30 @@ def cron_hourly_scan(secret: Optional[str] = None, send: bool = False):
     if not cron_ok(secret):
         return {"ok": False, "error": "bad_cron_secret"}
 
-    try:
-        scan = run_scan("HOURLY")
-        save_scan_result("HOURLY", scan)
+    run_background_job(hourly_scan_job, send)
 
-        created = []
-        for sig in scan["signals"]:
-            if record_virtual_signal(sig):
-                created.append({"symbol": sig["symbol"], "type": sig["type"]})
+    return {
+        "ok": True,
+        "started": True,
+        "job": "HOURLY_SCAN",
+        "message": "Hourly scan started in background"
+    }
 
-        evaluated = evaluate_virtual_signals()
-        observed_evaluated = evaluate_observations()
-        save_combined_scan()
+def hourly_scan_job(send: bool = False):
+    scan = run_scan("HOURLY")
+    save_scan_result("HOURLY", scan)
 
-        if send and scan["signals"]:
-            tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
+    created = []
+    for sig in scan.get("signals", []):
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
-        return {
-            "ok": True,
-            "scan_type": "HOURLY",
-            "signals_count": scan["signals_count"],
-            "ranked_count": scan["ranked_count"],
-            "errors_count": scan.get("errors_count", 0),
-            "created_virtual": len(created),
-            "evaluated": len(evaluated),
-            "observations_evaluated": len(observed_evaluated)
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
+    evaluate_virtual_signals()
+    evaluate_observations()
+    save_combined_scan()
+
+    if send and scan.get("signals"):
+        tg_main_send(format_scan_summary(scan, "Hourly 1H Short Swing"))
 
 @app.get("/api/cron/daily-scan")
 def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
@@ -1789,34 +1797,31 @@ def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
     if not is_uae_trading_day():
         return {"ok": True, "skipped": True, "reason": "UAE weekend - no daily scan"}
 
-    try:
-        scan = run_scan("DAILY")
-        save_scan_result("DAILY", scan)
+    run_background_job(daily_scan_job, send)
 
-        created = []
-        for sig in scan["signals"]:
-            if record_virtual_signal(sig):
-                created.append({"symbol": sig["symbol"], "type": sig["type"]})
+    return {
+        "ok": True,
+        "started": True,
+        "job": "DAILY_SCAN",
+        "message": "Daily scan started in background"
+    }
 
-        evaluated = evaluate_virtual_signals()
-        observed_evaluated = evaluate_observations()
-        save_combined_scan()
+def daily_scan_job(send: bool = True):
+    scan = run_scan("DAILY")
+    save_scan_result("DAILY", scan)
 
-        if send:
-            tg_main_send(format_daily_report())
+    created = []
+    for sig in scan.get("signals", []):
+        if record_virtual_signal(sig):
+            created.append({"symbol": sig["symbol"], "type": sig["type"]})
 
-        return {
-            "ok": True,
-            "scan_type": "DAILY",
-            "signals_count": scan["signals_count"],
-            "ranked_count": scan["ranked_count"],
-            "errors_count": scan.get("errors_count", 0),
-            "created_virtual": len(created),
-            "evaluated": len(evaluated),
-            "observations_evaluated": len(observed_evaluated)
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
+    evaluate_virtual_signals()
+    evaluate_observations()
+    save_combined_scan()
+
+    if send:
+        tg_main_send(format_daily_report())
+        
 
 def save_combined_scan():
     hourly = latest_scan_result("HOURLY") or {}
