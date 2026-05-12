@@ -1021,7 +1021,7 @@ def build_signal(symbol, kind, candles, d1):
     rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
 
     strength = "VERY STRONG" if score >= 85 else "STRONG" if score >= 70 else "MEDIUM" if score >= 55 else "WEAK"
-    model_action = "BUY" if score >= 70 and rr >= 0.9 and (risk_pct <= (4.5 if kind == "SHORT_SWING" else 11)) else "WATCH"
+    model_action = "BUY" if score >= 70 and rr >= 0.65 and (risk_pct <= (4.8 if kind == "SHORT_SWING" else 11)) else "WATCH"
 
     mode = get_ai_mode()
     if mode == "LEARNING":
