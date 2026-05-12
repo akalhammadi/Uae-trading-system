@@ -1617,6 +1617,37 @@ def learning_scan():
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
 
+@app.get("/api/cron/learning-scan")
+def cron_learning_scan(secret: Optional[str] = None):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    run_background_job(learning_scan_job)
+
+    return {
+        "ok": True,
+        "started": True,
+        "job": "LEARNING_SCAN",
+        "message": "Learning scan started in background"
+    }
+
+
+def learning_scan_job():
+    hourly = latest_scan_result("HOURLY")
+    daily = latest_scan_result("DAILY")
+    signals = []
+
+    if hourly:
+        signals.extend(hourly.get("signals", []))
+    if daily:
+        signals.extend(daily.get("signals", []))
+
+    for sig in signals:
+        record_virtual_signal(sig)
+
+    evaluate_virtual_signals()
+    evaluate_observations()
+
 @app.get("/api/ai/observations")
 def api_observations(limit: int = 100):
     evaluated = evaluate_observations()
