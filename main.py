@@ -299,6 +299,28 @@ def init_db():
         )
     """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_trend_decisions (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            decision_key TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL,
+            trend_phase TEXT,
+            decision TEXT,
+            confidence TEXT,
+            score DOUBLE PRECISION,
+            price DOUBLE PRECISION,
+            expected_move_pct DOUBLE PRECISION,
+            horizon TEXT,
+            invalidation DOUBLE PRECISION,
+            target_base DOUBLE PRECISION,
+            target_bull DOUBLE PRECISION,
+            thesis TEXT,
+            payload TEXT
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_trend_decisions_symbol_id ON ai_trend_decisions(symbol, id DESC)")
+
     conn.commit()
     conn.close()
 
@@ -2592,3 +2614,321 @@ def dashboard():
     </body>
     </html>
     """
+
+# ============================================================
+# V15 TREND INTELLIGENCE ENGINE
+# ============================================================
+
+def pct_change(a, b):
+    try:
+        if not a or a == 0:
+            return 0
+        return ((b - a) / a) * 100
+    except Exception:
+        return 0
+
+
+def trend_structure_score(candles):
+    if len(candles) < 30:
+        return 0, "INSUFFICIENT"
+
+    closes = [safe_float(x["close"]) for x in candles]
+    highs = [safe_float(x["high"]) for x in candles]
+    lows = [safe_float(x["low"]) for x in candles]
+    volumes = [safe_float(x.get("volume"), 0) or 0 for x in candles]
+
+    closes = [x for x in closes if x is not None]
+    highs = [x for x in highs if x is not None]
+    lows = [x for x in lows if x is not None]
+
+    if len(closes) < 30:
+        return 0, "INSUFFICIENT"
+
+    price = closes[-1]
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
+    r = rsi(closes, 14)
+
+    recent_low = min(lows[-20:])
+    previous_low = min(lows[-50:-20]) if len(lows) >= 50 else recent_low
+    recent_high = max(highs[-20:])
+    previous_high = max(highs[-50:-20]) if len(highs) >= 50 else recent_high
+
+    avg_vol_20 = sma(volumes, 20) or 1
+    avg_vol_50 = sma(volumes, 50) or avg_vol_20
+    vol_expansion = avg_vol_20 / avg_vol_50 if avg_vol_50 else 1
+
+    score = 0
+    reasons = []
+
+    if ma20 and price > ma20:
+        score += 15
+        reasons.append("price above MA20")
+
+    if ma50 and price > ma50:
+        score += 15
+        reasons.append("price above MA50")
+
+    if ma20 and ma50 and ma20 >= ma50:
+        score += 15
+        reasons.append("MA20 above or equal MA50")
+
+    if recent_low > previous_low:
+        score += 15
+        reasons.append("higher low structure")
+
+    if recent_high > previous_high:
+        score += 15
+        reasons.append("higher high breakout")
+
+    if r is not None and 45 <= r <= 70:
+        score += 10
+        reasons.append("healthy RSI")
+
+    if vol_expansion >= 1.15:
+        score += 15
+        reasons.append("volume expansion")
+
+    if score >= 75:
+        phase = "EARLY_EXPANSION"
+    elif score >= 60:
+        phase = "ACCUMULATION_BREAKOUT"
+    elif score >= 45:
+        phase = "BASE_BUILDING"
+    else:
+        phase = "NO_TREND_CHANGE"
+
+    return score, phase
+
+
+def build_trend_thesis(symbol: str):
+    symbol = normalize_symbol(symbol)
+
+    h1 = get_candles(symbol, "60", 120)
+    d1 = get_candles(symbol, "1D", 120)
+
+    if len(d1) >= 30:
+        base_tf = "1D"
+        candles = d1
+    elif len(h1) >= 50:
+        base_tf = "60"
+        candles = h1
+    else:
+        return None
+
+    closes = [safe_float(x["close"]) for x in candles]
+    lows = [safe_float(x["low"]) for x in candles]
+    highs = [safe_float(x["high"]) for x in candles]
+    closes = [x for x in closes if x is not None]
+    lows = [x for x in lows if x is not None]
+    highs = [x for x in highs if x is not None]
+
+    if len(closes) < 30:
+        return None
+
+    price = closes[-1]
+    score, phase = trend_structure_score(candles)
+
+    structure_low = min(lows[-20:])
+    structure_high = max(highs[-30:])
+
+    expected_move = 0
+    confidence = "LOW"
+    decision = "NO_ACTION"
+
+    if score >= 80:
+        expected_move = 50
+        confidence = "HIGH"
+        decision = "CONFIRMED_TREND_BUY"
+    elif score >= 70:
+        expected_move = 35
+        confidence = "MEDIUM_HIGH"
+        decision = "TREND_CHANGE_CANDIDATE"
+    elif score >= 60:
+        expected_move = 25
+        confidence = "MEDIUM"
+        decision = "ACCUMULATION_WATCH"
+    else:
+        expected_move = 0
+        confidence = "LOW"
+        decision = "WATCH_ONLY"
+
+    invalidation = structure_low * 0.985
+    target_base = price * (1 + expected_move / 100) if expected_move else None
+    target_bull = price * (1 + (expected_move * 1.5) / 100) if expected_move else None
+
+    horizon = "2-5 months" if base_tf == "1D" else "4-10 weeks"
+
+    thesis = (
+        f"{symbol}: {phase}. Decision={decision}. "
+        f"Score={score}. Expected move={expected_move}% over {horizon}. "
+        f"Invalidation below {round(invalidation, 3)}."
+    )
+
+    return {
+        "symbol": symbol,
+        "has_data": True,
+        "base_timeframe": base_tf,
+        "price": round(price, 3),
+        "trend_phase": phase,
+        "decision": decision,
+        "confidence": confidence,
+        "score": round(score, 2),
+        "expected_move_pct": expected_move,
+        "horizon": horizon,
+        "invalidation": round(invalidation, 3),
+        "target_base": round(target_base, 3) if target_base else None,
+        "target_bull": round(target_bull, 3) if target_bull else None,
+        "structure_low": round(structure_low, 3),
+        "structure_high": round(structure_high, 3),
+        "thesis": thesis,
+        "created_at": utc_now()
+    }
+
+
+def save_trend_decision(item):
+    if not item:
+        return False
+
+    symbol = item["symbol"]
+    decision = item["decision"]
+    price = item["price"]
+    score = item["score"]
+
+    decision_key = f"{symbol}-{decision}-{round(price, 3)}-{round(score, 1)}"
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO ai_trend_decisions
+            (symbol, decision_key, created_at, trend_phase, decision, confidence,
+             score, price, expected_move_pct, horizon, invalidation,
+             target_base, target_bull, thesis, payload)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+        """, (
+            symbol,
+            decision_key,
+            utc_now(),
+            item.get("trend_phase"),
+            item.get("decision"),
+            item.get("confidence"),
+            item.get("score"),
+            item.get("price"),
+            item.get("expected_move_pct"),
+            item.get("horizon"),
+            item.get("invalidation"),
+            item.get("target_base"),
+            item.get("target_bull"),
+            item.get("thesis"),
+            json.dumps(item)
+        ))
+
+        inserted = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return inserted
+
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return False
+
+
+def format_trend_alert(item):
+    return f"""
+<b>V15 Trend Intelligence</b>
+
+Symbol: <b>{item.get('symbol')}</b>
+Decision: <b>{item.get('decision')}</b>
+Confidence: <b>{item.get('confidence')}</b>
+Phase: <b>{item.get('trend_phase')}</b>
+
+Price: <b>{item.get('price')}</b>
+Expected Move: <b>{item.get('expected_move_pct')}%</b>
+Horizon: <b>{item.get('horizon')}</b>
+
+Base Target: <b>{item.get('target_base')}</b>
+Bull Target: <b>{item.get('target_bull')}</b>
+Invalidation: <b>{item.get('invalidation')}</b>
+
+Score: <b>{item.get('score')}</b>
+
+Thesis:
+{esc(item.get('thesis'))}
+
+Dashboard:
+{DASHBOARD_URL}
+""".strip()
+
+
+def run_trend_scan(send: bool = True):
+    results = []
+    alerts = []
+
+    for symbol in WATCHLIST:
+        try:
+            item = build_trend_thesis(symbol)
+            if not item:
+                continue
+
+            results.append(item)
+
+            if item["decision"] in ["CONFIRMED_TREND_BUY", "TREND_CHANGE_CANDIDATE"]:
+                inserted = save_trend_decision(item)
+                if inserted:
+                    alerts.append(item)
+
+        except Exception as e:
+            results.append({
+                "symbol": symbol,
+                "error": str(e)
+            })
+
+    results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
+
+    payload = {
+        "ok": True,
+        "version": "V15_TREND_INTELLIGENCE",
+        "created_at": utc_now(),
+        "count": len(results),
+        "alerts_count": len(alerts),
+        "results": results[:50],
+        "alerts": alerts[:10]
+    }
+
+    save_scan_result("TREND", payload)
+
+    if send:
+        for item in alerts[:5]:
+            tg_main_send(format_trend_alert(item))
+
+    return payload
+
+
+@app.get("/api/ai/trend-scan")
+def api_trend_scan(run: bool = False):
+    if run:
+        return run_trend_scan(send=False)
+
+    data = latest_scan_result("TREND")
+    if not data:
+        return {"ok": True, "message": "No TREND scan yet", "results": []}
+    return data
+
+
+@app.get("/api/cron/trend-scan")
+def cron_trend_scan(secret: Optional[str] = None, send: bool = True):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    run_background_job(run_trend_scan, send)
+
+    return {
+        "ok": True,
+        "started": True,
+        "job": "V15_TREND_SCAN",
+        "message": "V15 trend scan started in background"
+    }
