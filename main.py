@@ -2932,3 +2932,24 @@ def cron_trend_scan(secret: Optional[str] = None, send: bool = True):
         "job": "V15_TREND_SCAN",
         "message": "V15 trend scan started in background"
     }
+
+@app.get("/api/cron/reversal-scan")
+def cron_reversal_scan(secret: Optional[str] = None, send: bool = True):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    run_background_job(run_reversal_scan, send)
+
+    return {
+        "ok": True,
+        "started": True,
+        "job": "REVERSAL_SCAN",
+        "message": "Reversal scan started in background"
+    }
+
+def run_reversal_scan(send=True):
+    return {
+        "ok": True,
+        "message": "Reversal engine placeholder"
+    }
+
