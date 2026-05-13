@@ -299,7 +299,7 @@ def init_db():
         )
     """)
 
-        cur.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS ai_trend_decisions (
             id SERIAL PRIMARY KEY,
             symbol TEXT NOT NULL,
