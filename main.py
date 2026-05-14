@@ -2586,6 +2586,41 @@ def cron_end_of_day(secret: Optional[str] = None):
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
 
+@app.get("/api/cron/portfolio-monitor")
+def cron_portfolio_monitor(secret: Optional[str] = None):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    data = portfolio_monitor(secret)
+
+    positions = data.get("positions", [])
+
+    if not positions:
+        return {"ok": True, "message": "No positions"}
+
+    lines = [
+        "<b>Portfolio Monitor</b>",
+        ""
+    ]
+
+    for p in positions:
+        lines.append(
+            f"{p['symbol']} | "
+            f"{p['action']} | "
+            f"PnL {p['pnl_pct']}% | "
+            f"Target {p.get('trend_target')} | "
+            f"Reason: {p['reason']}"
+        )
+
+    tg = tg_main_send("\n".join(lines))
+
+    return {
+        "ok": True,
+        "count": len(positions),
+        "telegram": tg
+    }
+
+
 # ============================================================
 # PORTFOLIO + WATCHLIST POSITIONS
 # ============================================================
