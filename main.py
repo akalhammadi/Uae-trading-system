@@ -321,6 +321,51 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_trend_decisions_symbol_id ON ai_trend_decisions(symbol, id DESC)")
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio_positions (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT UNIQUE NOT NULL,
+            qty DOUBLE PRECISION NOT NULL,
+            entry_price DOUBLE PRECISION NOT NULL,
+            position_type TEXT DEFAULT 'HOLDING',
+            status TEXT DEFAULT 'OPEN',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watch_positions (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT UNIQUE NOT NULL,
+            watch_type TEXT DEFAULT 'WATCH',
+            status TEXT DEFAULT 'ACTIVE',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v15_learning_log (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            setup_type TEXT,
+            decision TEXT,
+            entry_price DOUBLE PRECISION,
+            current_price DOUBLE PRECISION,
+            target_price DOUBLE PRECISION,
+            invalidation DOUBLE PRECISION,
+            status TEXT DEFAULT 'OPEN',
+            outcome TEXT,
+            return_pct DOUBLE PRECISION,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -2541,6 +2586,164 @@ def cron_end_of_day(secret: Optional[str] = None):
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-2000:]}
 
+# ============================================================
+# PORTFOLIO + WATCHLIST POSITIONS
+# ============================================================
+
+@app.get("/api/portfolio/add")
+def portfolio_add(
+    secret: Optional[str] = None,
+    symbol: str = "",
+    qty: float = 0,
+    entry: float = 0,
+    position_type: str = "HOLDING",
+    notes: str = ""
+):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    symbol = normalize_symbol(symbol)
+
+    if not symbol or qty <= 0 or entry <= 0:
+        return {"ok": False, "error": "symbol, qty, entry required"}
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO portfolio_positions
+        (symbol, qty, entry_price, position_type, status, notes, created_at, updated_at)
+        VALUES (%s,%s,%s,%s,'OPEN',%s,%s,%s)
+        ON CONFLICT(symbol) DO UPDATE SET
+            qty=EXCLUDED.qty,
+            entry_price=EXCLUDED.entry_price,
+            position_type=EXCLUDED.position_type,
+            notes=EXCLUDED.notes,
+            status='OPEN',
+            updated_at=EXCLUDED.updated_at
+    """, (symbol, qty, entry, position_type, notes, utc_now(), utc_now()))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "saved": True, "symbol": symbol, "qty": qty, "entry": entry}
+
+
+@app.get("/api/watch/add")
+def watch_add(
+    secret: Optional[str] = None,
+    symbol: str = "",
+    watch_type: str = "WATCH",
+    notes: str = ""
+):
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    symbol = normalize_symbol(symbol)
+
+    if not symbol:
+        return {"ok": False, "error": "symbol required"}
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO watch_positions
+        (symbol, watch_type, status, notes, created_at, updated_at)
+        VALUES (%s,%s,'ACTIVE',%s,%s,%s)
+        ON CONFLICT(symbol) DO UPDATE SET
+            watch_type=EXCLUDED.watch_type,
+            notes=EXCLUDED.notes,
+            status='ACTIVE',
+            updated_at=EXCLUDED.updated_at
+    """, (symbol, watch_type, notes, utc_now(), utc_now()))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "saved": True, "symbol": symbol, "watch_type": watch_type}
+
+
+@app.get("/api/portfolio")
+def portfolio_list():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+    rows = cur.fetchall()
+    conn.close()
+    return {"ok": True, "count": len(rows), "positions": rows}
+
+
+@app.get("/api/watch")
+def watch_list():
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM watch_positions WHERE status='ACTIVE' ORDER BY symbol")
+    rows = cur.fetchall()
+    conn.close()
+    return {"ok": True, "count": len(rows), "watchlist": rows}
+
+
+@app.get("/api/portfolio/monitor")
+def portfolio_monitor(secret: Optional[str] = None):
+    if secret is not None and not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+    positions = cur.fetchall()
+    conn.close()
+
+    out = []
+
+    for p in positions:
+        symbol = p["symbol"]
+        entry = float(p["entry_price"])
+        qty = float(p["qty"])
+
+        candles = get_candles(symbol, "60", 5)
+        last_price = float(candles[-1]["close"]) if candles else None
+
+        trend = build_trend_thesis(symbol) if "build_trend_thesis" in globals() else None
+        sigs = analyze_symbol(symbol, "ALL")
+        best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
+
+        pnl_pct = None
+        pnl_aed = None
+
+        if last_price:
+            pnl_pct = ((last_price - entry) / entry) * 100
+            pnl_aed = (last_price - entry) * qty
+
+        action = "HOLD"
+        reason = "No exit reason"
+
+        if trend and trend.get("invalidation") and last_price and last_price < trend["invalidation"]:
+            action = "EXIT_ALERT"
+            reason = "Price below V15 invalidation"
+        elif best and best.get("strength") == "WEAK":
+            action = "REVIEW"
+            reason = "Short-term signal weakened"
+        elif pnl_pct is not None and pnl_pct <= -8:
+            action = "RISK_REVIEW"
+            reason = "Loss exceeded -8%"
+
+        out.append({
+            "symbol": symbol,
+            "qty": qty,
+            "entry_price": entry,
+            "last_price": last_price,
+            "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "pnl_aed": round(pnl_aed, 2) if pnl_aed is not None else None,
+            "action": action,
+            "reason": reason,
+            "trend_decision": trend.get("decision") if trend else None,
+            "trend_confidence": trend.get("confidence") if trend else None,
+            "trend_target": trend.get("target_base") if trend else None,
+            "trend_invalidation": trend.get("invalidation") if trend else None,
+            "short_signal": best.get("display_action") if best else None,
+            "short_strength": best.get("strength") if best else None,
+            "short_score": best.get("score") if best else None
+        })
+
+    return {"ok": True, "count": len(out), "positions": out}
 
 # ============================================================
 # DASHBOARD
