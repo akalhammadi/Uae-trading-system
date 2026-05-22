@@ -1138,6 +1138,7 @@ def build_signal(symbol, kind, candles, d1):
         reasons.append("Positive momentum")
 
     score += get_learning_adjustment(symbol)
+    score += failure_penalty(symbol)
 
     entry = price
     entry_low = entry * 0.995
