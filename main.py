@@ -3106,7 +3106,7 @@ def build_trend_thesis(symbol: str):
         "structure_low": round(structure_low, 3),
         "structure_high": round(structure_high, 3),
         "thesis": thesis,
-        "created_at": utc_now()
+        "created_at": utc_now(),
         "ideal_entry": ideal_entry,
         "aggressive_entry": aggressive_entry,
         "safe_entry": safe_entry,
