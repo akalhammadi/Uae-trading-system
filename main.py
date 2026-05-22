@@ -1596,6 +1596,22 @@ def evaluate_virtual_signals():
 
             if status == "CLOSED":
                 update_learning(symbol, ret_pct, sig["signal_type"], is_virtual=True)
+
+                try:
+                    payload = json.loads(sig["payload"]) if sig.get("payload") else {}
+                    if ret_pct < 0:
+                        failure_reason, lesson = classify_failure(payload, ret_pct)
+                        record_failure_memory(
+                            symbol=symbol,
+                            setup_type=sig["signal_type"],
+                            failure_reason=failure_reason,
+                            loss_pct=round(ret_pct, 2),
+                            lesson=lesson,
+                            payload=payload
+                        )
+                except Exception:
+                    pass
+
                 evaluated.append({
                     "id": sig["id"],
                     "symbol": symbol,
@@ -2931,6 +2947,104 @@ def failure_penalty(symbol):
 
     return max(-20, penalty)
 
+@app.get("/api/ai/self-evaluation")
+def ai_self_evaluation(secret: Optional[str] = None):
+    if secret is not None and not cron_ok(secret):
+        return {"ok": False, "error": "bad_cron_secret"}
+
+    rep = readiness_report()
+
+    win_rate = float(rep.get("win_rate") or 0)
+    avg_return = float(rep.get("avg_return_pct") or 0)
+    evaluated = int(rep.get("evaluated_signals") or 0)
+
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("SELECT COUNT(*) c FROM ai_failure_memory")
+    lessons_count = int(cur.fetchone()["c"])
+
+    cur.execute("""
+        SELECT AVG(rr) avg_rr
+        FROM ai_virtual_signals
+        WHERE status='CLOSED'
+    """)
+    rr_row = cur.fetchone()
+    conn.close()
+
+    rr_quality = float(rr_row["avg_rr"] or 0) if rr_row else 0
+
+    confidence = 0
+
+    if evaluated >= 20:
+        confidence += 20
+    if evaluated >= 50:
+        confidence += 15
+    if win_rate >= 55:
+        confidence += 20
+    if win_rate >= 65:
+        confidence += 15
+    if avg_return > 0:
+        confidence += 15
+    if rr_quality >= 1.5:
+        confidence += 15
+
+    confidence = min(100, confidence)
+
+    if confidence < 40:
+        state = "LEARNING"
+        ready = False
+        recommendation = "Shadow mode only. Do not trade real capital."
+    elif confidence < 65:
+        state = "STABILIZING"
+        ready = False
+        recommendation = "Small observation trades only."
+    elif confidence < 80:
+        state = "STABLE"
+        ready = True
+        recommendation = "Can use small controlled capital."
+    else:
+        state = "HIGH_CONFIDENCE"
+        ready = True
+        recommendation = "System is statistically stronger, but still use risk control."
+
+    payload = {
+        "ok": True,
+        "system_state": state,
+        "confidence_score": confidence,
+        "ready_for_trading": ready,
+        "evaluated_signals": evaluated,
+        "win_rate": win_rate,
+        "avg_return_pct": avg_return,
+        "rr_quality": round(rr_quality, 2),
+        "lessons_count": lessons_count,
+        "recommendation": recommendation
+    }
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ai_self_evaluation
+        (created_at, system_state, confidence_score, ready_for_trading,
+         win_rate, avg_return_pct, rr_quality, lessons_count, recommendation, payload)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        utc_now(),
+        state,
+        confidence,
+        ready,
+        win_rate,
+        avg_return,
+        rr_quality,
+        lessons_count,
+        recommendation,
+        json.dumps(payload)
+    ))
+    conn.commit()
+    conn.close()
+
+    return payload
+    
 # ============================================================
 # DASHBOARD
 # ============================================================
