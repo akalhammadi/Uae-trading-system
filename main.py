@@ -365,7 +365,46 @@ def init_db():
             payload TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v15_active_thesis (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT UNIQUE NOT NULL,
 
+            status TEXT DEFAULT 'ACTIVE',
+
+            first_created_at TEXT NOT NULL,
+            last_updated_at TEXT NOT NULL,
+
+            trend_phase TEXT,
+            decision TEXT,
+            confidence TEXT,
+
+            score DOUBLE PRECISION,
+
+            entry_price DOUBLE PRECISION,
+            ideal_entry DOUBLE PRECISION,
+            aggressive_entry DOUBLE PRECISION,
+            safe_entry DOUBLE PRECISION,
+
+            invalidation DOUBLE PRECISION,
+
+            target_base DOUBLE PRECISION,
+            target_bull DOUBLE PRECISION,
+
+            expected_move_pct DOUBLE PRECISION,
+            expected_horizon TEXT,
+
+            hold_days INTEGER DEFAULT 0,
+            min_hold_days INTEGER DEFAULT 7,
+
+            thesis_strength DOUBLE PRECISION DEFAULT 0,
+
+            last_price DOUBLE PRECISION,
+
+            notes TEXT,
+            payload TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -2857,6 +2896,14 @@ def dashboard():
 # V15 TREND INTELLIGENCE ENGINE
 # ============================================================
 
+V15_MIN_DECISION_HOLD_DAYS = 7
+
+V15_ENABLE_DECISION_STABILITY = True
+
+V15_ENABLE_DYNAMIC_HORIZON = True
+
+V15_ENABLE_DYNAMIC_ENTRY = True
+
 def pct_change(a, b):
     try:
         if not a or a == 0:
@@ -2938,6 +2985,36 @@ def trend_structure_score(candles):
 
     return score, phase
 
+def dynamic_horizon(volatility_pct, score):
+
+    if volatility_pct >= 12:
+        return "2-4 weeks"
+
+    if volatility_pct >= 8:
+        return "1-2 months"
+
+    if score >= 80:
+        return "3-6 months"
+
+    return "2-4 months"
+
+
+def dynamic_entry_levels(price, atr_value):
+
+    if not atr_value:
+        atr_value = price * 0.03
+
+    ideal_entry = price - (atr_value * 0.8)
+
+    aggressive_entry = price
+
+    safe_entry = price + (atr_value * 0.3)
+
+    return (
+        round(ideal_entry, 3),
+        round(aggressive_entry, 3),
+        round(safe_entry, 3),
+    )    
 
 def build_trend_thesis(symbol: str):
     symbol = normalize_symbol(symbol)
@@ -2995,7 +3072,16 @@ def build_trend_thesis(symbol: str):
     target_base = price * (1 + expected_move / 100) if expected_move else None
     target_bull = price * (1 + (expected_move * 1.5) / 100) if expected_move else None
 
-    horizon = "2-5 months" if base_tf == "1D" else "4-10 weeks"
+    atr_value = atr(candles, 14) or (price * 0.03)
+
+    volatility_pct = ((atr_value / price) * 100) if price else 0
+
+    horizon = dynamic_horizon(volatility_pct, score)
+
+    ideal_entry, aggressive_entry, safe_entry = dynamic_entry_levels(
+        price,
+        atr_value
+    )
 
     thesis = (
         f"{symbol}: {phase}. Decision={decision}. "
@@ -3021,58 +3107,170 @@ def build_trend_thesis(symbol: str):
         "structure_high": round(structure_high, 3),
         "thesis": thesis,
         "created_at": utc_now()
+        "ideal_entry": ideal_entry,
+        "aggressive_entry": aggressive_entry,
+        "safe_entry": safe_entry,
+        "volatility_pct": round(volatility_pct, 2),
     }
 
 
 def save_trend_decision(item):
+
     if not item:
         return False
 
     symbol = item["symbol"]
-    decision = item["decision"]
-    price = item["price"]
-    score = item["score"]
-
-    decision_key = f"{symbol}-{decision}-{round(price, 3)}-{round(score, 1)}"
 
     conn = db()
-    cur = conn.cursor()
 
-    try:
+    cur = conn.cursor(
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+
+    cur.execute("""
+        SELECT *
+        FROM v15_active_thesis
+        WHERE symbol=%s
+    """, (symbol,))
+
+    existing = cur.fetchone()
+
+    now = utc_now()
+
+    if existing:
+
+        hold_days = business_days_between(
+            parse_dt(existing["first_created_at"]),
+            utc_now_dt()
+        )
+
+        existing_decision = existing["decision"]
+
+        existing_score = float(existing["score"] or 0)
+
+        new_score = float(item["score"] or 0)
+
+        score_delta = abs(new_score - existing_score)
+
+        should_keep_existing = (
+            V15_ENABLE_DECISION_STABILITY
+            and hold_days < V15_MIN_DECISION_HOLD_DAYS
+            and score_delta < 15
+        )
+
+        if should_keep_existing:
+
+            cur.execute("""
+                UPDATE v15_active_thesis
+                SET
+                    last_updated_at=%s,
+                    last_price=%s,
+                    hold_days=%s
+                WHERE symbol=%s
+            """, (
+                now,
+                item["price"],
+                hold_days,
+                symbol
+            ))
+
+            conn.commit()
+            conn.close()
+
+            return False
+
         cur.execute("""
-            INSERT INTO ai_trend_decisions
-            (symbol, decision_key, created_at, trend_phase, decision, confidence,
-             score, price, expected_move_pct, horizon, invalidation,
-             target_base, target_bull, thesis, payload)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT DO NOTHING
+            UPDATE v15_active_thesis
+            SET
+                last_updated_at=%s,
+                trend_phase=%s,
+                decision=%s,
+                confidence=%s,
+                score=%s,
+                entry_price=%s,
+                ideal_entry=%s,
+                aggressive_entry=%s,
+                safe_entry=%s,
+                invalidation=%s,
+                target_base=%s,
+                target_bull=%s,
+                expected_move_pct=%s,
+                expected_horizon=%s,
+                last_price=%s,
+                payload=%s
+            WHERE symbol=%s
         """, (
-            symbol,
-            decision_key,
-            utc_now(),
+            now,
             item.get("trend_phase"),
             item.get("decision"),
             item.get("confidence"),
             item.get("score"),
             item.get("price"),
-            item.get("expected_move_pct"),
-            item.get("horizon"),
+            item.get("ideal_entry"),
+            item.get("aggressive_entry"),
+            item.get("safe_entry"),
             item.get("invalidation"),
             item.get("target_base"),
             item.get("target_bull"),
-            item.get("thesis"),
+            item.get("expected_move_pct"),
+            item.get("horizon"),
+            item.get("price"),
+            json.dumps(item),
+            symbol
+        ))
+
+    else:
+
+        cur.execute("""
+            INSERT INTO v15_active_thesis (
+                symbol,
+                first_created_at,
+                last_updated_at,
+                trend_phase,
+                decision,
+                confidence,
+                score,
+                entry_price,
+                ideal_entry,
+                aggressive_entry,
+                safe_entry,
+                invalidation,
+                target_base,
+                target_bull,
+                expected_move_pct,
+                expected_horizon,
+                last_price,
+                payload
+            )
+            VALUES(
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s
+            )
+        """, (
+            symbol,
+            now,
+            now,
+            item.get("trend_phase"),
+            item.get("decision"),
+            item.get("confidence"),
+            item.get("score"),
+            item.get("price"),
+            item.get("ideal_entry"),
+            item.get("aggressive_entry"),
+            item.get("safe_entry"),
+            item.get("invalidation"),
+            item.get("target_base"),
+            item.get("target_bull"),
+            item.get("expected_move_pct"),
+            item.get("horizon"),
+            item.get("price"),
             json.dumps(item)
         ))
 
-        inserted = cur.rowcount > 0
-        conn.commit()
-        conn.close()
-        return inserted
+    conn.commit()
+    conn.close()
 
-    except Exception:
-        conn.rollback()
-        conn.close()
-        return False
+    return True
 
 
 def format_trend_alert(item):
@@ -3087,6 +3285,10 @@ Phase: <b>{item.get('trend_phase')}</b>
 Price: <b>{item.get('price')}</b>
 Expected Move: <b>{item.get('expected_move_pct')}%</b>
 Horizon: <b>{item.get('horizon')}</b>
+
+Ideal Entry: <b>{item.get('ideal_entry')}</b>
+Aggressive Entry: <b>{item.get('aggressive_entry')}</b>
+Safe Entry: <b>{item.get('safe_entry')}</b>
 
 Base Target: <b>{item.get('target_base')}</b>
 Bull Target: <b>{item.get('target_bull')}</b>
