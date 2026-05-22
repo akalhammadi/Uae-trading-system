@@ -405,6 +405,36 @@ def init_db():
             payload TEXT
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_failure_memory (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            setup_type TEXT,
+            failure_reason TEXT,
+            loss_pct DOUBLE PRECISION,
+            market_state TEXT,
+            lesson TEXT,
+            created_at TEXT NOT NULL,
+            payload TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_self_evaluation (
+            id SERIAL PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            system_state TEXT,
+            confidence_score DOUBLE PRECISION,
+            ready_for_trading BOOLEAN,
+            win_rate DOUBLE PRECISION,
+            avg_return_pct DOUBLE PRECISION,
+            rr_quality DOUBLE PRECISION,
+            lessons_count INTEGER,
+            recommendation TEXT,
+            payload TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -2818,6 +2848,87 @@ def portfolio_monitor(secret: Optional[str] = None):
         })
 
     return {"ok": True, "count": len(out), "positions": out}
+
+# ============================================================
+# SELF LEARNING AUDITOR
+# ============================================================
+
+def classify_failure(signal, return_pct):
+    strength = signal.get("strength")
+    volume_ratio = float(signal.get("volume_ratio") or 0)
+    rsi_v = float(signal.get("rsi") or 0)
+    rr = float(signal.get("rr") or 0)
+
+    if volume_ratio < 1:
+        return "LOW_VOLUME_REVERSAL", "Avoid reversal setups without volume confirmation."
+
+    if rsi_v > 72:
+        return "LATE_ENTRY_OVERBOUGHT", "Avoid entries after extended RSI."
+
+    if rr < 1.2:
+        return "POOR_RISK_REWARD", "Reject setups with weak reward/risk."
+
+    if strength in ["WEAK", "MEDIUM"]:
+        return "LOW_QUALITY_SETUP", "Require stronger confirmation before entry."
+
+    if return_pct <= -5:
+        return "STRUCTURE_FAILED", "Trend thesis failed; reduce confidence on similar setups."
+
+    return "NORMAL_LOSS", "Loss accepted. Do not change model unless repeated."
+
+
+def record_failure_memory(symbol, setup_type, failure_reason, loss_pct, lesson, payload=None):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ai_failure_memory
+        (symbol, setup_type, failure_reason, loss_pct, market_state, lesson, created_at, payload)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        normalize_symbol(symbol),
+        setup_type,
+        failure_reason,
+        loss_pct,
+        "UNKNOWN",
+        lesson,
+        utc_now(),
+        json.dumps(payload or {})
+    ))
+    conn.commit()
+    conn.close()
+
+
+def failure_penalty(symbol):
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT failure_reason, COUNT(*) AS c
+        FROM ai_failure_memory
+        WHERE symbol=%s
+          AND created_at >= %s
+        GROUP BY failure_reason
+    """, (
+        normalize_symbol(symbol),
+        (utc_now_dt() - timedelta(days=45)).isoformat()
+    ))
+    rows = cur.fetchall()
+    conn.close()
+
+    penalty = 0
+
+    for r in rows:
+        c = int(r["c"] or 0)
+        reason = r["failure_reason"]
+
+        if c >= 3:
+            if reason in ["LOW_VOLUME_REVERSAL", "STRUCTURE_FAILED"]:
+                penalty -= 8
+            elif reason in ["POOR_RISK_REWARD", "LATE_ENTRY_OVERBOUGHT"]:
+                penalty -= 5
+            else:
+                penalty -= 3
+
+    return max(-20, penalty)
 
 # ============================================================
 # DASHBOARD
