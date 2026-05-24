@@ -3239,19 +3239,3 @@ def dashboard():
 </body>
 </html>"""
 
-@app.get("/api/admin/fix-now")
-def fix_now_no_auth():
-    """مؤقت — لإصلاح الكاندلز اليومية بدون secret"""
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE candles
-                SET timeframe = '1D'
-                WHERE timeframe IN ('1', 'D', 'DAILY')
-                   OR (timeframe = '60' AND exchange ILIKE '%DLY%')
-            """)
-            updated = cur.rowcount
-        return {"ok": True, "updated": updated}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
