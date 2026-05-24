@@ -171,10 +171,10 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 def normalize_tf(tf: str) -> str:
-    t = str(tf or "").strip()
-    if t in ["1h", "1H", "60m", "60M", "H1", "60"]:
+    t = str(tf or "").strip().upper()
+    if t in ["1H", "60M", "H1", "60"]:
         return "60"
-    if t in ["D", "1d", "1D", "daily", "DAY"]:
+    if t in ["D", "1D", "DAILY", "DAY", "1440", "1DAY", "W", "1W", "WEEK"]:
         return "1D"
     return t
 
@@ -896,7 +896,7 @@ def get_pattern_adjustment(symbol: str, setup_type: str, market_phase: str,
                 FROM v20_pattern_learning
                 WHERE symbol=%s AND setup_type=%s
                   AND market_phase=%s AND rsi_bucket=%s
-                  AND created_at > NOW() - INTERVAL '60 days'
+                  AND created_at::timestamp > NOW() - INTERVAL '60 days'
                 GROUP BY outcome
             """, (symbol, setup_type, market_phase, rsi_bucket))
             rows = cur.fetchall()
@@ -956,7 +956,7 @@ def failure_penalty(symbol: str) -> float:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute("""
                 SELECT failure_reason, COUNT(*) AS c FROM ai_failure_memory
-                WHERE symbol=%s AND created_at >= %s GROUP BY failure_reason
+                WHERE symbol=%s AND created_at::timestamp >= %s GROUP BY failure_reason
             """, (normalize_symbol(symbol),
                   (utc_now_dt() - timedelta(days=45)).isoformat()))
             rows = cur.fetchall()
@@ -1972,13 +1972,13 @@ def run_self_evaluation() -> Dict:
             cur.execute("SELECT COUNT(*) c FROM ai_failure_memory")
             lessons_count = int(cur.fetchone()["c"])
 
-            # Pattern win rates
+            # Pattern win rates - fix timestamp comparison
             cur.execute("""
                 SELECT market_phase,
                        SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
                        COUNT(*) as total
                 FROM v20_pattern_learning
-                WHERE created_at > NOW() - INTERVAL '30 days'
+                WHERE created_at::timestamp > NOW() - INTERVAL '30 days'
                 GROUP BY market_phase
             """)
             phase_stats = cur.fetchall()
@@ -2520,30 +2520,45 @@ async def price_webhook(request: Request, secret: Optional[str] = None):
         except Exception:
             data = dict(request.query_params)
 
+        # قبول SECRET أو CRON_SECRET
         if sec != SECRET and sec != CRON_SECRET:
             return {"ok": False, "error": "bad_secret"}
 
-        symbol = normalize_symbol(data.get("symbol") or data.get("ticker") or "")
-        tf     = normalize_tf(data.get("timeframe") or data.get("interval") or "60")
+        symbol   = normalize_symbol(data.get("symbol") or data.get("ticker") or "")
+        exchange = str(data.get("exchange") or data.get("source") or "TRADINGVIEW").upper()
+        tf_raw   = str(data.get("timeframe") or data.get("interval") or "60")
+        tf       = normalize_tf(tf_raw)
+
+        # ✅ الإصلاح الرئيسي: DFM_DLY أو أي exchange يومي = 1D تلقائياً
+        if any(x in exchange for x in ["DLY", "DAILY", "DAY", "1D"]):
+            tf = "1D"
+        # إذا الـ timeframe نفسه يدل على يومي
+        if tf_raw in ["1440", "D", "1D", "DAY", "DAILY"]:
+            tf = "1D"
+
         o = safe_float(data.get("open")   or data.get("o"))
         h = safe_float(data.get("high")   or data.get("h"))
         l = safe_float(data.get("low")    or data.get("l"))
         c = safe_float(data.get("close")  or data.get("price") or data.get("c"))
         v = safe_float(data.get("volume") or data.get("v"), 0)
 
-        if not symbol:       return {"ok": False, "error": "missing_symbol"}
-        if tf not in ["60", "1D"]: return {"ok": False, "error": "bad_timeframe", "tf": tf}
-        if None in [o, h, l, c]:  return {"ok": False, "error": "missing_ohlc"}
+        if not symbol:
+            return {"ok": False, "error": "missing_symbol"}
+        if tf not in ["60", "1D"]:
+            # لا نرفض — نحفظ كـ 60 افتراضياً
+            tf = "60"
+        if None in [o, h, l, c]:
+            return {"ok": False, "error": "missing_ohlc"}
 
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (symbol, data.get("exchange","TRADINGVIEW"), tf,
+            """, (symbol, exchange, tf,
                   parse_bar_time(data.get("time") or data.get("timenow")),
                   o, h, l, c, v, utc_now()))
-        return {"ok": True, "symbol": symbol, "timeframe": tf, "close": c}
+        return {"ok": True, "symbol": symbol, "timeframe": tf, "exchange": exchange, "close": c}
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1000:]}
 
@@ -2559,6 +2574,72 @@ def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None
         cur.execute(q, tuple(params))
         rows = cur.fetchall()
     return {"ok": True, "count": len(rows), "candles": rows}
+
+@app.get("/api/admin/fix-daily-candles")
+def fix_daily_candles(secret: Optional[str] = None):
+    """
+    إصلاح الكاندلز اليومية المحفوظة بـ timeframe=60 بدلاً من 1D
+    يحول كل كاندلز DFM_DLY و ADX_DLY من 60 إلى 1D
+    """
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_secret"}
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE candles
+                SET timeframe = '1D'
+                WHERE timeframe = '60'
+                  AND (
+                    exchange ILIKE '%DLY%'
+                    OR exchange ILIKE '%DAILY%'
+                    OR exchange ILIKE '%DAY%'
+                  )
+            """)
+            updated = cur.rowcount
+        return {"ok": True, "updated_rows": updated, "message": f"تم تحويل {updated} كاندل يومي من 60 إلى 1D"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/admin/candle-stats")
+def candle_stats():
+    """إحصائيات الكاندلز في الداتابيز"""
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT timeframe, exchange, COUNT(*) as count,
+                   MIN(bar_time) as oldest, MAX(bar_time) as newest
+            FROM candles
+            GROUP BY timeframe, exchange
+            ORDER BY count DESC
+        """)
+        rows = cur.fetchall()
+        cur.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='1D'")
+        d1_symbols = cur.fetchone()["count"]
+        cur.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='60'")
+        h1_symbols = cur.fetchone()["count"]
+    return {
+        "ok": True,
+        "h1_symbols": h1_symbols,
+        "d1_symbols": d1_symbols,
+        "breakdown": rows
+    }
+
+@app.get("/api/admin/reset-learning-start")
+def reset_learning_start(secret: Optional[str] = None):
+    """إعادة ضبط تاريخ بداية التعلم للتاريخ الفعلي للبيانات"""
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_secret"}
+    try:
+        with get_db() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT MIN(created_at) as oldest FROM ai_virtual_signals")
+            row = cur.fetchone()
+        oldest = row["oldest"] if row and row["oldest"] else utc_now()
+        set_setting("learning_started_at", str(oldest))
+        return {"ok": True, "learning_started_at": str(oldest)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/api/watchlist/coverage")
 @app.get("/api/coverage")
