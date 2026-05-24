@@ -174,9 +174,13 @@ def normalize_tf(tf: str) -> str:
     t = str(tf or "").strip().upper()
     if t in ["1H", "60M", "H1", "60"]:
         return "60"
-    if t in ["D", "1D", "DAILY", "DAY", "1440", "1DAY", "W", "1W", "WEEK"]:
+    if t in ["D", "1D", "DAILY", "DAY", "1440", "1DAY", "W", "1W", "WEEK", "1"]:
         return "1D"
     return t
+
+def is_daily_exchange(exchange: str) -> bool:
+    ex = str(exchange or "").upper()
+    return any(x in ex for x in ["DLY", "DAILY", "DAY"])
 
 def safe_float(value, default=None):
     try:
@@ -2530,10 +2534,10 @@ async def price_webhook(request: Request, secret: Optional[str] = None):
         tf       = normalize_tf(tf_raw)
 
         # ✅ الإصلاح الرئيسي: DFM_DLY أو أي exchange يومي = 1D تلقائياً
-        if any(x in exchange for x in ["DLY", "DAILY", "DAY", "1D"]):
+        if is_daily_exchange(exchange):
             tf = "1D"
-        # إذا الـ timeframe نفسه يدل على يومي
-        if tf_raw in ["1440", "D", "1D", "DAY", "DAILY"]:
+        # إذا الـ timeframe نفسه يدل على يومي (شامل "1" من DFM)
+        if tf_raw.strip() in ["1440", "D", "1D", "DAY", "DAILY", "1"] or is_daily_exchange(exchange):
             tf = "1D"
 
         o = safe_float(data.get("open")   or data.get("o"))
@@ -2589,12 +2593,14 @@ def fix_daily_candles(secret: Optional[str] = None):
             cur.execute("""
                 UPDATE candles
                 SET timeframe = '1D'
-                WHERE timeframe = '60'
-                  AND (
+                WHERE (
+                    timeframe IN ('60', '1', 'D', 'DAILY', 'DAY', '1440')
+                )
+                AND (
                     exchange ILIKE '%DLY%'
                     OR exchange ILIKE '%DAILY%'
                     OR exchange ILIKE '%DAY%'
-                  )
+                )
             """)
             updated = cur.rowcount
         return {"ok": True, "updated_rows": updated, "message": f"تم تحويل {updated} كاندل يومي من 60 إلى 1D"}
