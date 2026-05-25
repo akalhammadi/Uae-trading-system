@@ -2929,8 +2929,10 @@ async def telegram_webhook(secret: str, request: Request):
 def send_alerts(secret: Optional[str] = None, force: bool = False):
     if secret is not None and not cron_ok(secret):
         return {"ok": False, "error": "bad_secret"}
+    
     scan = latest_scan_result("COMBINED")
     if not scan: return {"ok": False, "message": "No scan yet"}
+    
     signals = scan.get("signals", [])
     sent, skipped, errors = [], [], []
 
@@ -2938,22 +2940,43 @@ def send_alerts(secret: Optional[str] = None, force: bool = False):
         cur = conn.cursor()
         for sig in signals[:5]:
             try:
-                symbol = sig.get("symbol","")
-                key = f"{symbol}-{sig.get('type')}-{sig.get('price')}-{sig.get('target1')}"
+                symbol = sig.get("symbol", "")
+                
+                # ✅ تحقق من Decision Lock
+                lock = get_locked_decision(symbol)
+                if not lock:
+                    skipped.append(f"{symbol}:no_lock")
+                    continue
+                
+                # ✅ لا ترسل إذا القرار AVOID
+                if lock.get("decision") == "AVOID":
+                    skipped.append(f"{symbol}:avoid")
+                    continue
+                
+                # ✅ لا ترسل إذا أُرسل نفس القرار قبل كذا
+                lock_time = str(lock.get("locked_at",""))[:10]
+                key = f"{symbol}-{lock.get('decision')}-{lock_time}"
+                
                 if not force:
-                    cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
+                    cur.execute(
+                        "SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,)
+                    )
                     if cur.fetchone():
-                        skipped.append(symbol); continue
+                        skipped.append(f"{symbol}:already_sent")
+                        continue
+                
                 tg_main_send(format_signal_v20(sig), signal_keyboard(symbol))
                 cur.execute("""
                     INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
                     VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
                 """, (key, symbol, sig.get("type"), utc_now(), json.dumps(sig)))
                 sent.append(symbol)
+                
             except Exception as e:
                 errors.append({"symbol": sig.get("symbol",""), "error": str(e)})
 
     return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors}
+
 
 # ============================================================
 # CRON ENDPOINTS — جدول التشغيل المقترح
