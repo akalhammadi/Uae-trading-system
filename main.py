@@ -2533,11 +2533,14 @@ async def price_webhook(request: Request, secret: Optional[str] = None):
         tf_raw   = str(data.get("timeframe") or data.get("interval") or "60")
         tf       = normalize_tf(tf_raw)
 
-        # ✅ الإصلاح الرئيسي: DFM_DLY أو أي exchange يومي = 1D تلقائياً
-        if is_daily_exchange(exchange):
+        # ✅ الـ timeframe في الـ JSON هو المرجع الوحيد
+        # الـ indicator يرسل "1D" أو "60" صريحاً
+        if tf_raw.strip() in ["1D", "1440", "D", "DAY", "DAILY"]:
             tf = "1D"
-        # إذا الـ timeframe نفسه يدل على يومي (شامل "1" من DFM)
-        if tf_raw.strip() in ["1440", "D", "1D", "DAY", "DAILY", "1"] or is_daily_exchange(exchange):
+        elif tf_raw.strip() in ["60", "1H", "H1", "1h"]:
+            tf = "60"
+        # fallback: إذا exchange يحتوي DLY وما في timeframe صريح
+        elif is_daily_exchange(exchange) and tf_raw.strip() not in ["60", "1H", "H1"]:
             tf = "1D"
 
         o = safe_float(data.get("open")   or data.get("o"))
@@ -2630,6 +2633,34 @@ def candle_stats():
         "d1_symbols": d1_symbols,
         "breakdown": rows
     }
+
+@app.get("/api/admin/fix-dfm-hourly")
+def fix_dfm_hourly(secret: Optional[str] = None):
+    """
+    إصلاح الكاندلز الساعية من DFM_DLY المحفوظة خطأ كـ 1D
+    الكاندلز اليومية الحقيقية تكون bar_time = 10:00:00 فقط (وقت الإغلاق اليومي)
+    الكاندلز الساعية تكون bar_time في ساعات مختلفة
+    """
+    if not cron_ok(secret):
+        return {"ok": False, "error": "bad_secret"}
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            # أي كاندل 1D من DFM_DLY ليس وقتها 10:00:00 هو ساعي محفوظ خطأ
+            cur.execute("""
+                UPDATE candles
+                SET timeframe = '60'
+                WHERE timeframe = '1D'
+                  AND exchange = 'DFM_DLY'
+                  AND (
+                    bar_time NOT LIKE '%T10:00:00%'
+                    AND bar_time NOT LIKE '%10:00:00+00:00%'
+                  )
+            """)
+            fixed = cur.rowcount
+        return {"ok": True, "fixed_rows": fixed, "message": f"تم إصلاح {fixed} كاندل ساعي كان محفوظاً كـ 1D"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/api/admin/reset-learning-start")
 def reset_learning_start(secret: Optional[str] = None):
@@ -2929,10 +2960,8 @@ async def telegram_webhook(secret: str, request: Request):
 def send_alerts(secret: Optional[str] = None, force: bool = False):
     if secret is not None and not cron_ok(secret):
         return {"ok": False, "error": "bad_secret"}
-    
     scan = latest_scan_result("COMBINED")
     if not scan: return {"ok": False, "message": "No scan yet"}
-    
     signals = scan.get("signals", [])
     sent, skipped, errors = [], [], []
 
@@ -2941,42 +2970,38 @@ def send_alerts(secret: Optional[str] = None, force: bool = False):
         for sig in signals[:5]:
             try:
                 symbol = sig.get("symbol", "")
-                
-                # ✅ تحقق من Decision Lock
+
+                # ✅ تحقق من Decision Lock — لا ترسل إلا إذا القرار مقفل
                 lock = get_locked_decision(symbol)
                 if not lock:
                     skipped.append(f"{symbol}:no_lock")
                     continue
-                
+
                 # ✅ لا ترسل إذا القرار AVOID
                 if lock.get("decision") == "AVOID":
                     skipped.append(f"{symbol}:avoid")
                     continue
-                
-                # ✅ لا ترسل إذا أُرسل نفس القرار قبل كذا
-                lock_time = str(lock.get("locked_at",""))[:10]
-                key = f"{symbol}-{lock.get('decision')}-{lock_time}"
-                
+
+                # ✅ مفتاح فريد مبني على تاريخ القفل — يمنع التكرار اليومي
+                lock_date = str(lock.get("locked_at", ""))[:10]
+                key = f"{symbol}-{lock.get('decision')}-{lock_date}"
+
                 if not force:
-                    cur.execute(
-                        "SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,)
-                    )
+                    cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
                     if cur.fetchone():
-                        skipped.append(f"{symbol}:already_sent")
+                        skipped.append(f"{symbol}:already_sent_today")
                         continue
-                
+
                 tg_main_send(format_signal_v20(sig), signal_keyboard(symbol))
                 cur.execute("""
                     INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
                     VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
                 """, (key, symbol, sig.get("type"), utc_now(), json.dumps(sig)))
                 sent.append(symbol)
-                
             except Exception as e:
-                errors.append({"symbol": sig.get("symbol",""), "error": str(e)})
+                errors.append({"symbol": sig.get("symbol", ""), "error": str(e)})
 
     return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors}
-
 
 # ============================================================
 # CRON ENDPOINTS — جدول التشغيل المقترح
@@ -3261,4 +3286,3 @@ def dashboard():
 </div>
 </body>
 </html>"""
-
