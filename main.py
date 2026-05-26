@@ -1654,20 +1654,64 @@ def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
 
 @app.get("/dashboard",response_class=HTMLResponse)
 def dashboard():
+    # FIX: كل البيانات من DB في query واحدة لكل section — لا live queries لكل سهم
     scan=latest_scan_result("COMBINED") or {"signals":[],"coverage":[],"ranked":[],"signals_count":0}
-    ev=run_self_evaluation(); sigs=ev.get("signals",{})
-    gc={"A":"#22c55e","B":"#86efac","C":"#fbbf24","D":"#f97316","F":"#ef4444"}.get(ev.get("readiness_grade","F"),"#9ca3af")
     pc={"ACCUMULATION":"#3b82f6","MARKUP":"#22c55e","DISTRIBUTION":"#ef4444","MARKDOWN":"#7f1d1d","NEUTRAL":"#6b7280"}
 
-    # بورتفوليو
+    # self evaluation من آخر نتيجة محفوظة (بدل run_self_evaluation() الثقيلة)
+    ev={}
+    try:
+        with get_db() as conn:
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT payload FROM ai_self_evaluation ORDER BY id DESC LIMIT 1")
+            r=c.fetchone()
+            if r and r["payload"]: ev=json.loads(r["payload"])
+    except: pass
+    if not ev: ev={"readiness_grade":"F","recommendation":"لا يوجد تقييم بعد","confidence_score":0,"signals":{},"learning_progress_pct":0,"decision_locks":{}}
+    sigs=ev.get("signals",{})
+    gc={"A":"#22c55e","B":"#86efac","C":"#fbbf24","D":"#f97316","F":"#ef4444"}.get(ev.get("readiness_grade","F"),"#9ca3af")
+
+    # جلب أسعار كل الأسهم في query واحدة
+    price_map={}
+    try:
+        symbols_needed=list({s.get("symbol","") for s in scan.get("ranked",[])[:30]})
+        if symbols_needed:
+            with get_db() as conn:
+                c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                # آخر كاندل لكل سهم من H1 و 1D معاً
+                c.execute("""
+                    SELECT DISTINCT ON (symbol, timeframe) symbol, timeframe, close, bar_time
+                    FROM candles WHERE symbol=ANY(%s) AND timeframe IN ('60','1D')
+                    ORDER BY symbol, timeframe, id DESC
+                """, (symbols_needed,))
+                rows=c.fetchall()
+            # نبني map: symbol -> (price, tf, bar_time) — أحدث timeframe
+            tmp={}
+            for r in rows:
+                sym=r["symbol"]; tf=r["timeframe"]
+                bt=parse_dt(str(r.get("bar_time") or ""))
+                existing=tmp.get(sym)
+                if not existing:
+                    tmp[sym]=(safe_float(r["close"]),tf,str(r.get("bar_time","")))
+                else:
+                    ebt=parse_dt(str(existing[2]))
+                    if bt and ebt and bt>ebt:
+                        tmp[sym]=(safe_float(r["close"]),tf,str(r.get("bar_time","")))
+            price_map=tmp
+    except: pass
+
+    # بورتفوليو — query واحدة
     port_rows=""
     try:
         with get_db() as conn:
             c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol"); pp=c.fetchall()
+            c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+            pp=c.fetchall()
         for p in pp:
             sym=p["symbol"]; entry=float(p["entry_price"]); qty=float(p["qty"])
-            lp,ltf,lbt=get_latest_price(sym)
+            # السعر من price_map أو None
+            pm=price_map.get(sym)
+            lp=pm[0] if pm else None; ltf=pm[1] if pm else None; lbt=pm[2] if pm else None
             pnl_pct=((lp-entry)/entry*100) if lp else None
             pnl_aed=((lp-entry)*qty) if lp else None
             stale_warn=""; pst=""
@@ -1684,22 +1728,24 @@ def dashboard():
             <td style="color:{pc_}">{round(pnl_aed,0) if pnl_aed is not None else '-'} AED</td></tr>"""
     except: pass
 
-    # قرارات مقفلة
+    # قرارات مقفلة — query واحدة
     lock_rows=""
     try:
         with get_db() as conn:
             c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            c.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED' ORDER BY locked_at DESC"); locks=c.fetchall()
+            c.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED' ORDER BY locked_at DESC")
+            locks=c.fetchall()
         for lk in locks:
             ph=lk.get("market_phase",""); phc=pc.get(ph,"#6b7280")
-            lp,ltf,_=get_latest_price(lk.get("symbol",""))
+            sym=lk.get("symbol","")
+            pm=price_map.get(sym); lp=pm[0] if pm else None; ltf=pm[1] if pm else None
             ep=safe_float(lk.get("entry_price"))
             diff_txt=""
             if lp and ep:
                 d=((lp-ep)/ep)*100; dc="#22c55e" if d>=0 else "#ef4444"
                 diff_txt=f'<span style="color:{dc}"> ({round(d,1):+.1f}%)</span>'
             lock_rows+=f"""<tr>
-            <td><b>{esc(lk.get('symbol',''))}</b></td><td>{esc(lk.get('decision',''))}</td>
+            <td><b>{esc(sym)}</b></td><td>{esc(lk.get('decision',''))}</td>
             <td style="color:{phc}">{esc(ph)}</td><td>{esc(lk.get('score',''))}</td>
             <td>{esc(lp or lk.get('entry_price',''))} <small>✓{esc(ltf or '')}</small>{diff_txt}</td>
             <td>{esc(lk.get('stop_loss',''))}</td><td>{esc(lk.get('target1',''))}</td>
@@ -1707,13 +1753,13 @@ def dashboard():
             <td>{esc(lk.get('lock_reason',''))}</td><td>{esc(str(lk.get('locked_at',''))[:16])}</td></tr>"""
     except: pass
 
-    # جدول الأسهم
+    # جدول الأسهم — السعر من price_map (بدون query لكل سهم)
     sig_rows=""
     for s in scan.get("ranked",[])[:30]:
         ph=s.get("market_phase","NEUTRAL"); phc=pc.get(ph,"#6b7280")
         rev=s.get("reversal_signals") or []; ri="⚠️" if rev else ""
-        # FIX: جلب أحدث سعر مباشرة
-        lp,ltf,lbt=get_latest_price(s.get("symbol",""))
+        sym=s.get("symbol","")
+        pm=price_map.get(sym); lp=pm[0] if pm else None; ltf=pm[1] if pm else None; lbt=pm[2] if pm else None
         dp=lp if lp else s.get("price","")
         pan=""; pst=""
         if lbt:
@@ -1723,7 +1769,7 @@ def dashboard():
                 if age>MAX_CANDLE_AGE_HOURS: pan=f"⚠️{round(age,0):.0f}h"; pst="color:#f97316"
                 else: pan=f"✓{ltf}"
         sig_rows+=f"""<tr>
-        <td><b>{esc(s.get('symbol',''))}</b></td><td>{esc(s.get('type',''))}</td>
+        <td><b>{esc(sym)}</b></td><td>{esc(s.get('type',''))}</td>
         <td style="color:{phc}">{esc(ph)}</td><td><b>{esc(s.get('display_action',''))}</b></td>
         <td>{esc(s.get('strength',''))}</td><td>{esc(s.get('score',''))}</td>
         <td style="{pst}"><b>{esc(dp)}</b> <small>{pan}</small></td>
