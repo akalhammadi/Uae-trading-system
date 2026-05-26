@@ -1,76 +1,47 @@
 """
 UAE Market PRO AI — V20 INTELLIGENT CORE
-=========================================
-التغييرات الجوهرية عن V14:
-1. كشف التجميع والتصريف (Wyckoff + OBV + CMF)
-2. كشف عكس المسار (Divergence + Volume Climax + Exhaustion)
-3. أهداف ديناميكية مبنية على ATR الفعلي
-4. نظام ثبات القرار — القرار يُقفَل ولا يتغير إلا بمبرر قوي
-5. تعلم متقدم بالـ Pattern لا مجرد Win/Loss
-6. تقييم ذاتي شامل مع تقارير جاهزية تفصيلية
-7. إصلاح connection leaks
-8. Cron jobs محسّنة
+V20.1 FIXES:
+- get_latest_price(): أحدث سعر من H1 أو 1D أيهما أحدث
+- portfolio_monitor: يستخدم get_latest_price
+- dashboard: أسعار صحيحة + قسم بورتفوليو + auto-refresh
+- build_signal_v20: لا BUY إذا البيانات قديمة
+- check_decision_exits: يستخدم get_latest_price
 """
 
-import os
-import json
-import math
-import traceback
-import requests
-import psycopg2
-import psycopg2.extras
+import os, json, math, traceback, requests, psycopg2, psycopg2.extras
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from threading import Thread
-
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-# ============================================================
-# APP
-# ============================================================
+app = FastAPI(title="UAE Market PRO AI V20")
 
-app = FastAPI(title="UAE Market PRO AI V20 Intelligent Core")
-
-# ============================================================
-# ENV CONFIG
-# ============================================================
-
-DATABASE_URL             = os.getenv("DATABASE_URL")
-SECRET                   = os.getenv("SECRET", "abc123")
-CRON_SECRET              = os.getenv("CRON_SECRET", "cron123")
-
-TELEGRAM_BOT_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID         = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_WEBHOOK_SECRET  = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
-
-BASE_URL                 = os.getenv("API_BASE", "https://uae-market-production.up.railway.app").rstrip("/")
-DASHBOARD_URL            = os.getenv("DASHBOARD_URL", f"{BASE_URL}/dashboard")
-
-AI_MODE                  = os.getenv("AI_MODE", "PAPER").upper().strip()
-LEARNING_DAYS            = int(os.getenv("LEARNING_DAYS", "21"))
-CAPITAL                  = float(os.getenv("CAPITAL", "200000"))
-
-TELEGRAM_TOP_N           = int(os.getenv("TELEGRAM_TOP_N", "5"))
-MIN_H1_CANDLES           = int(os.getenv("MIN_H1_CANDLES", "30"))
-MIN_D1_CANDLES           = int(os.getenv("MIN_D1_CANDLES", "10"))
-SCAN_MAX_ERRORS          = int(os.getenv("SCAN_MAX_ERRORS", "100"))
-
-# Decision stability
-DECISION_MIN_HOLD_DAYS   = int(os.getenv("DECISION_MIN_HOLD_DAYS", "3"))
-DECISION_CHANGE_DELTA    = float(os.getenv("DECISION_CHANGE_DELTA", "18"))
-
-# Signal quality gates
-MIN_SCORE_BUY            = float(os.getenv("MIN_SCORE_BUY", "72"))
-MIN_RR_BUY               = float(os.getenv("MIN_RR_BUY", "1.2"))
-MIN_CONFIDENCE_LIVE      = float(os.getenv("MIN_CONFIDENCE_LIVE", "70"))
-
-# Observation targets
-OBSERVATION_TARGET_PCT   = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
-OBSERVATION_DROP_PCT     = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
-
-UAE_TZ_OFFSET            = timedelta(hours=4)
+DATABASE_URL            = os.getenv("DATABASE_URL")
+SECRET                  = os.getenv("SECRET", "abc123")
+CRON_SECRET             = os.getenv("CRON_SECRET", "cron123")
+TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "tgsecret123")
+BASE_URL                = os.getenv("API_BASE", "https://uae-market-production.up.railway.app").rstrip("/")
+DASHBOARD_URL           = os.getenv("DASHBOARD_URL", f"{BASE_URL}/dashboard")
+AI_MODE                 = os.getenv("AI_MODE", "PAPER").upper().strip()
+LEARNING_DAYS           = int(os.getenv("LEARNING_DAYS", "21"))
+CAPITAL                 = float(os.getenv("CAPITAL", "200000"))
+TELEGRAM_TOP_N          = int(os.getenv("TELEGRAM_TOP_N", "5"))
+MIN_H1_CANDLES          = int(os.getenv("MIN_H1_CANDLES", "30"))
+MIN_D1_CANDLES          = int(os.getenv("MIN_D1_CANDLES", "10"))
+SCAN_MAX_ERRORS         = int(os.getenv("SCAN_MAX_ERRORS", "100"))
+DECISION_MIN_HOLD_DAYS  = int(os.getenv("DECISION_MIN_HOLD_DAYS", "3"))
+DECISION_CHANGE_DELTA   = float(os.getenv("DECISION_CHANGE_DELTA", "18"))
+MIN_SCORE_BUY           = float(os.getenv("MIN_SCORE_BUY", "72"))
+MIN_RR_BUY              = float(os.getenv("MIN_RR_BUY", "1.2"))
+MIN_CONFIDENCE_LIVE     = float(os.getenv("MIN_CONFIDENCE_LIVE", "70"))
+OBSERVATION_TARGET_PCT  = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
+OBSERVATION_DROP_PCT    = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
+UAE_TZ_OFFSET           = timedelta(hours=4)
+MAX_CANDLE_AGE_HOURS    = int(os.getenv("MAX_CANDLE_AGE_HOURS", "72"))
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
@@ -83,3205 +54,1747 @@ WATCHLIST = [
     "ALDAR","FERTIGLB","DANA","DFM","AJMANBANK","DIC"
 ]
 
-# ============================================================
-# BACKGROUND JOBS
-# ============================================================
+def run_background_job(f, *a, **kw):
+    def w():
+        try: f(*a, **kw)
+        except: print(traceback.format_exc())
+    Thread(target=w, daemon=True).start()
 
-def run_background_job(job_func, *args, **kwargs):
-    def wrapper():
-        try:
-            job_func(*args, **kwargs)
-        except Exception:
-            print("BACKGROUND JOB ERROR:")
-            print(traceback.format_exc())
-    t = Thread(target=wrapper, daemon=True)
-    t.start()
+def utc_now_dt(): return datetime.now(timezone.utc)
+def utc_now(): return utc_now_dt().isoformat()
+def uae_now_dt(): return utc_now_dt() + UAE_TZ_OFFSET
 
-# ============================================================
-# TIME HELPERS
-# ============================================================
+def is_uae_trading_day(dt=None):
+    return (dt or uae_now_dt()).weekday() in [0,1,2,3,4]
 
-def utc_now_dt() -> datetime:
-    return datetime.now(timezone.utc)
-
-def utc_now() -> str:
-    return utc_now_dt().isoformat()
-
-def uae_now_dt() -> datetime:
-    return utc_now_dt() + UAE_TZ_OFFSET
-
-def is_uae_trading_day(dt: Optional[datetime] = None) -> bool:
-    d = dt or uae_now_dt()
-    return d.weekday() in [0, 1, 2, 3, 4]
-
-def is_uae_market_time(dt: Optional[datetime] = None) -> bool:
+def is_uae_market_time(dt=None):
     d = dt or uae_now_dt()
     return is_uae_trading_day(d) and 10 <= d.hour < 15
 
-def business_days_between(start: datetime, end: datetime) -> int:
-    if not start or not end or start > end:
-        return 0
+def business_days_between(start, end):
+    if not start or not end or start > end: return 0
     count = 0
-    cur = (start + UAE_TZ_OFFSET).date() if start.tzinfo else start.date()
-    end_date = (end + UAE_TZ_OFFSET).date() if end.tzinfo else end.date()
-    while cur <= end_date:
-        if cur.weekday() in [0, 1, 2, 3, 4]:
-            count += 1
+    cur = (start+UAE_TZ_OFFSET).date() if start.tzinfo else start.date()
+    ed  = (end+UAE_TZ_OFFSET).date()   if end.tzinfo   else end.date()
+    while cur <= ed:
+        if cur.weekday() in [0,1,2,3,4]: count += 1
         cur += timedelta(days=1)
     return count
 
-def parse_dt(value: str):
+def parse_dt(value):
     try:
-        if not value:
-            return None
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
+        if not value: return None
+        dt = datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except: return None
 
-def parse_bar_time(value) -> str:
-    if value is None:
-        return utc_now()
+def parse_bar_time(value):
+    if value is None: return utc_now()
     s = str(value).strip()
     try:
         if s.isdigit():
             n = int(s)
-            if n > 10_000_000_000:
-                return datetime.fromtimestamp(n / 1000, timezone.utc).isoformat()
-            return datetime.fromtimestamp(n, timezone.utc).isoformat()
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-    except Exception:
-        return s
+            return datetime.fromtimestamp(n/1000 if n>10_000_000_000 else n, timezone.utc).isoformat()
+        dt = datetime.fromisoformat(s.replace("Z","+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+    except: return s
 
-# ============================================================
-# UTILITY HELPERS
-# ============================================================
+def candle_age_hours(candle):
+    bt = parse_dt(str(candle.get("bar_time") or candle.get("received_at") or ""))
+    if not bt: return 9999
+    return (utc_now_dt() - bt).total_seconds() / 3600
 
-def normalize_symbol(symbol: str) -> str:
-    s = str(symbol or "").upper().replace(" ", "").strip()
-    if ":" in s:
-        s = s.split(":")[-1]
-    if "." in s:
-        s = s.split(".")[0]
+def normalize_symbol(s):
+    s = str(s or "").upper().replace(" ","").strip()
+    if ":" in s: s = s.split(":")[-1]
+    if "." in s: s = s.split(".")[0]
     return s
 
-def normalize_tf(tf: str) -> str:
+def normalize_tf(tf):
     t = str(tf or "").strip().upper()
-    if t in ["1H", "60M", "H1", "60"]:
-        return "60"
-    if t in ["D", "1D", "DAILY", "DAY", "1440", "1DAY", "W", "1W", "WEEK", "1"]:
-        return "1D"
+    if t in ["1H","60M","H1","60"]: return "60"
+    if t in ["D","1D","DAILY","DAY","1440","1DAY","W","1W","WEEK","1"]: return "1D"
     return t
 
-def is_daily_exchange(exchange: str) -> bool:
-    ex = str(exchange or "").upper()
-    return any(x in ex for x in ["DLY", "DAILY", "DAY"])
+def is_daily_exchange(exchange):
+    return any(x in str(exchange or "").upper() for x in ["DLY","DAILY","DAY"])
 
-def safe_float(value, default=None):
+def safe_float(v, default=None):
     try:
-        if value is None or value == "":
-            return default
-        x = float(str(value).replace(",", ""))
-        if math.isnan(x) or math.isinf(x):
-            return default
-        return x
-    except Exception:
-        return default
+        if v is None or v == "": return default
+        x = float(str(v).replace(",",""))
+        return default if (math.isnan(x) or math.isinf(x)) else x
+    except: return default
 
-def esc(x) -> str:
-    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-def cron_ok(secret: Optional[str]) -> bool:
-    return secret == CRON_SECRET
-
-# ============================================================
-# DATABASE — context manager prevents connection leaks
-# ============================================================
+def esc(x): return str(x).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def cron_ok(s): return s == CRON_SECRET
 
 @contextmanager
 def get_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
+    if not DATABASE_URL: raise RuntimeError("DATABASE_URL missing")
     conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-def db_query(sql: str, params=None, fetchall=False, fetchone=False, dict_cursor=False):
-    """Helper for simple read queries"""
-    with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if dict_cursor else None)
-        cur.execute(sql, params or ())
-        if fetchall:
-            return list(cur.fetchall())
-        if fetchone:
-            return cur.fetchone()
-        return None
-
-# ============================================================
-# DATABASE INIT — V20 SCHEMA
-# ============================================================
+    try: yield conn; conn.commit()
+    except: conn.rollback(); raise
+    finally: conn.close()
 
 def init_db():
     with get_db() as conn:
-        cur = conn.cursor()
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS system_settings (
-            key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS candles (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT NOT NULL, exchange TEXT, timeframe TEXT NOT NULL,
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS system_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS candles (
+            id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, exchange TEXT, timeframe TEXT NOT NULL,
             bar_time TEXT NOT NULL, open DOUBLE PRECISION, high DOUBLE PRECISION,
-            low DOUBLE PRECISION, close DOUBLE PRECISION, volume DOUBLE PRECISION,
-            received_at TEXT NOT NULL
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_id ON candles(symbol, timeframe, id DESC)")
-
-        # V20: pattern-based learning per symbol
-        cur.execute("""CREATE TABLE IF NOT EXISTS v20_pattern_learning (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            setup_type TEXT NOT NULL,        -- SHORT_SWING / LONG_SWING
-            market_phase TEXT,               -- ACCUMULATION / MARKUP / DISTRIBUTION / MARKDOWN / NEUTRAL
-            rsi_bucket TEXT,                 -- LOW<40 / HEALTHY 40-65 / EXTENDED 65-75 / OVERBOUGHT>75
-            volume_bucket TEXT,              -- LOW<1.0 / NORMAL 1.0-1.4 / HIGH>1.4
-            trend_alignment TEXT,            -- ALIGNED / MIXED / AGAINST
-            outcome TEXT,                    -- WIN / LOSS / TIME_EXIT
-            return_pct DOUBLE PRECISION,
-            score_at_entry DOUBLE PRECISION,
-            rr_at_entry DOUBLE PRECISION,
-            created_at TEXT NOT NULL
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_v20_pattern_symbol ON v20_pattern_learning(symbol, setup_type)")
-
-        # V20: decision lock table — one active thesis per symbol
-        cur.execute("""CREATE TABLE IF NOT EXISTS v20_decision_lock (
-            symbol TEXT PRIMARY KEY,
-            decision TEXT NOT NULL,          -- BUY / WATCH / AVOID
-            confidence DOUBLE PRECISION,
-            score DOUBLE PRECISION,
-            entry_price DOUBLE PRECISION,
-            entry_low DOUBLE PRECISION,
-            entry_high DOUBLE PRECISION,
-            stop_loss DOUBLE PRECISION,
-            target1 DOUBLE PRECISION,
-            target2 DOUBLE PRECISION,
-            target3 DOUBLE PRECISION,
-            estimated_days INTEGER,
-            market_phase TEXT,
-            signal_type TEXT,
-            lock_reason TEXT,
-            locked_at TEXT NOT NULL,
-            last_checked_at TEXT,
-            status TEXT DEFAULT 'LOCKED',    -- LOCKED / RELEASED / HIT_TARGET / HIT_STOP
-            unlock_reason TEXT,
-            payload TEXT
-        )""")
-
-        # V20: reversal alerts log
-        cur.execute("""CREATE TABLE IF NOT EXISTS v20_reversal_alerts (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            alert_type TEXT NOT NULL,        -- BEARISH_DIVERGENCE / VOLUME_CLIMAX / EXHAUSTION / DISTRIBUTION_DETECTED
-            severity TEXT,                   -- WARNING / STRONG / CRITICAL
-            price DOUBLE PRECISION,
-            details TEXT,
-            created_at TEXT NOT NULL,
-            sent_telegram BOOLEAN DEFAULT FALSE
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_scan_results (
-            id SERIAL PRIMARY KEY,
-            scan_type TEXT NOT NULL, mode TEXT NOT NULL,
-            created_at TEXT NOT NULL, watchlist_count INTEGER,
-            scanned_count INTEGER, signals_count INTEGER, payload TEXT
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_scan_results_type_id ON ai_scan_results(scan_type, id DESC)")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_alerts_log (
+            low DOUBLE PRECISION, close DOUBLE PRECISION, volume DOUBLE PRECISION, received_at TEXT NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_id ON candles(symbol,timeframe,id DESC)")
+        c.execute("""CREATE TABLE IF NOT EXISTS v20_pattern_learning (
+            id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, setup_type TEXT NOT NULL,
+            market_phase TEXT, rsi_bucket TEXT, volume_bucket TEXT, trend_alignment TEXT,
+            outcome TEXT, return_pct DOUBLE PRECISION, score_at_entry DOUBLE PRECISION,
+            rr_at_entry DOUBLE PRECISION, created_at TEXT NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_v20_pattern_symbol ON v20_pattern_learning(symbol,setup_type)")
+        c.execute("""CREATE TABLE IF NOT EXISTS v20_decision_lock (
+            symbol TEXT PRIMARY KEY, decision TEXT NOT NULL, confidence DOUBLE PRECISION,
+            score DOUBLE PRECISION, entry_price DOUBLE PRECISION, entry_low DOUBLE PRECISION,
+            entry_high DOUBLE PRECISION, stop_loss DOUBLE PRECISION, target1 DOUBLE PRECISION,
+            target2 DOUBLE PRECISION, target3 DOUBLE PRECISION, estimated_days INTEGER,
+            market_phase TEXT, signal_type TEXT, lock_reason TEXT, locked_at TEXT NOT NULL,
+            last_checked_at TEXT, status TEXT DEFAULT 'LOCKED', unlock_reason TEXT, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS v20_reversal_alerts (
+            id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, alert_type TEXT NOT NULL,
+            severity TEXT, price DOUBLE PRECISION, details TEXT, created_at TEXT NOT NULL,
+            sent_telegram BOOLEAN DEFAULT FALSE)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_scan_results (
+            id SERIAL PRIMARY KEY, scan_type TEXT NOT NULL, mode TEXT NOT NULL,
+            created_at TEXT NOT NULL, watchlist_count INTEGER, scanned_count INTEGER,
+            signals_count INTEGER, payload TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ai_scan_results_type_id ON ai_scan_results(scan_type,id DESC)")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_alerts_log (
             id SERIAL PRIMARY KEY, alert_key TEXT UNIQUE NOT NULL,
-            symbol TEXT, signal_type TEXT, created_at TEXT NOT NULL, payload TEXT
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_virtual_signals (
-            id SERIAL PRIMARY KEY, signal_key TEXT UNIQUE NOT NULL,
-            mode TEXT NOT NULL, symbol TEXT NOT NULL, signal_type TEXT,
-            timeframe TEXT, action TEXT, price DOUBLE PRECISION,
-            entry_low DOUBLE PRECISION, entry_high DOUBLE PRECISION,
-            stop_loss DOUBLE PRECISION, target1 DOUBLE PRECISION,
-            target2 DOUBLE PRECISION, target3 DOUBLE PRECISION,
-            score DOUBLE PRECISION, strength TEXT, rr DOUBLE PRECISION,
-            risk_pct DOUBLE PRECISION, target_pct DOUBLE PRECISION,
-            max_hold_days INTEGER, estimated_days INTEGER,
-            market_phase TEXT,
-            created_at TEXT NOT NULL, status TEXT NOT NULL,
-            outcome TEXT, outcome_at TEXT,
-            max_high DOUBLE PRECISION, min_low DOUBLE PRECISION,
-            bars_checked INTEGER DEFAULT 0, payload TEXT
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_observations (
-            id SERIAL PRIMARY KEY, obs_key TEXT UNIQUE NOT NULL,
-            symbol TEXT NOT NULL, scan_type TEXT, timeframe TEXT,
-            action TEXT, model_action TEXT, strength TEXT, score DOUBLE PRECISION,
-            rank_score DOUBLE PRECISION, price DOUBLE PRECISION,
-            observed_at TEXT NOT NULL, status TEXT NOT NULL,
-            outcome TEXT, outcome_at TEXT, max_high DOUBLE PRECISION,
-            min_low DOUBLE PRECISION, return_pct DOUBLE PRECISION, payload TEXT
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_learning_stats (
-            symbol TEXT PRIMARY KEY,
-            trades_count INTEGER DEFAULT 0, wins_count INTEGER DEFAULT 0,
-            losses_count INTEGER DEFAULT 0,
-            virtual_short_count INTEGER DEFAULT 0, virtual_short_wins INTEGER DEFAULT 0,
-            virtual_short_losses INTEGER DEFAULT 0,
+            symbol TEXT, signal_type TEXT, created_at TEXT NOT NULL, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_virtual_signals (
+            id SERIAL PRIMARY KEY, signal_key TEXT UNIQUE NOT NULL, mode TEXT NOT NULL,
+            symbol TEXT NOT NULL, signal_type TEXT, timeframe TEXT, action TEXT,
+            price DOUBLE PRECISION, entry_low DOUBLE PRECISION, entry_high DOUBLE PRECISION,
+            stop_loss DOUBLE PRECISION, target1 DOUBLE PRECISION, target2 DOUBLE PRECISION,
+            target3 DOUBLE PRECISION, score DOUBLE PRECISION, strength TEXT, rr DOUBLE PRECISION,
+            risk_pct DOUBLE PRECISION, target_pct DOUBLE PRECISION, max_hold_days INTEGER,
+            estimated_days INTEGER, market_phase TEXT, created_at TEXT NOT NULL,
+            status TEXT NOT NULL, outcome TEXT, outcome_at TEXT, max_high DOUBLE PRECISION,
+            min_low DOUBLE PRECISION, bars_checked INTEGER DEFAULT 0, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_observations (
+            id SERIAL PRIMARY KEY, obs_key TEXT UNIQUE NOT NULL, symbol TEXT NOT NULL,
+            scan_type TEXT, timeframe TEXT, action TEXT, model_action TEXT, strength TEXT,
+            score DOUBLE PRECISION, rank_score DOUBLE PRECISION, price DOUBLE PRECISION,
+            observed_at TEXT NOT NULL, status TEXT NOT NULL, outcome TEXT, outcome_at TEXT,
+            max_high DOUBLE PRECISION, min_low DOUBLE PRECISION, return_pct DOUBLE PRECISION, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_learning_stats (
+            symbol TEXT PRIMARY KEY, trades_count INTEGER DEFAULT 0, wins_count INTEGER DEFAULT 0,
+            losses_count INTEGER DEFAULT 0, virtual_short_count INTEGER DEFAULT 0,
+            virtual_short_wins INTEGER DEFAULT 0, virtual_short_losses INTEGER DEFAULT 0,
             virtual_long_count INTEGER DEFAULT 0, virtual_long_wins INTEGER DEFAULT 0,
-            virtual_long_losses INTEGER DEFAULT 0,
-            avg_return_pct DOUBLE PRECISION DEFAULT 0,
-            score_adjustment DOUBLE PRECISION DEFAULT 0,
-            pattern_win_rate DOUBLE PRECISION DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_failure_memory (
+            virtual_long_losses INTEGER DEFAULT 0, avg_return_pct DOUBLE PRECISION DEFAULT 0,
+            score_adjustment DOUBLE PRECISION DEFAULT 0, pattern_win_rate DOUBLE PRECISION DEFAULT 0,
+            updated_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_failure_memory (
             id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, setup_type TEXT,
-            failure_reason TEXT, loss_pct DOUBLE PRECISION,
-            market_state TEXT, lesson TEXT, created_at TEXT NOT NULL, payload TEXT
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS ai_self_evaluation (
-            id SERIAL PRIMARY KEY, created_at TEXT NOT NULL,
-            system_state TEXT, confidence_score DOUBLE PRECISION,
-            ready_for_trading BOOLEAN, win_rate DOUBLE PRECISION,
-            avg_return_pct DOUBLE PRECISION, rr_quality DOUBLE PRECISION,
-            lessons_count INTEGER, pattern_quality DOUBLE PRECISION,
-            recommendation TEXT, payload TEXT
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS portfolio_positions (
-            id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL,
-            qty DOUBLE PRECISION NOT NULL, entry_price DOUBLE PRECISION NOT NULL,
-            position_type TEXT DEFAULT 'HOLDING', status TEXT DEFAULT 'OPEN',
-            notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS batch_scan_state (
-            key TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS v15_active_thesis (
-            id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL,
-            status TEXT DEFAULT 'ACTIVE', first_created_at TEXT NOT NULL,
-            last_updated_at TEXT NOT NULL, trend_phase TEXT, decision TEXT,
-            confidence TEXT, score DOUBLE PRECISION, entry_price DOUBLE PRECISION,
+            failure_reason TEXT, loss_pct DOUBLE PRECISION, market_state TEXT,
+            lesson TEXT, created_at TEXT NOT NULL, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ai_self_evaluation (
+            id SERIAL PRIMARY KEY, created_at TEXT NOT NULL, system_state TEXT,
+            confidence_score DOUBLE PRECISION, ready_for_trading BOOLEAN, win_rate DOUBLE PRECISION,
+            avg_return_pct DOUBLE PRECISION, rr_quality DOUBLE PRECISION, lessons_count INTEGER,
+            pattern_quality DOUBLE PRECISION, recommendation TEXT, payload TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS portfolio_positions (
+            id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL, qty DOUBLE PRECISION NOT NULL,
+            entry_price DOUBLE PRECISION NOT NULL, position_type TEXT DEFAULT 'HOLDING',
+            status TEXT DEFAULT 'OPEN', notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS batch_scan_state (
+            key TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS v15_active_thesis (
+            id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'ACTIVE',
+            first_created_at TEXT NOT NULL, last_updated_at TEXT NOT NULL, trend_phase TEXT,
+            decision TEXT, confidence TEXT, score DOUBLE PRECISION, entry_price DOUBLE PRECISION,
             ideal_entry DOUBLE PRECISION, aggressive_entry DOUBLE PRECISION,
             safe_entry DOUBLE PRECISION, invalidation DOUBLE PRECISION,
             target_base DOUBLE PRECISION, target_bull DOUBLE PRECISION,
             expected_move_pct DOUBLE PRECISION, expected_horizon TEXT,
             hold_days INTEGER DEFAULT 0, min_hold_days INTEGER DEFAULT 7,
             thesis_strength DOUBLE PRECISION DEFAULT 0, last_price DOUBLE PRECISION,
-            notes TEXT, payload TEXT
-        )""")
+            notes TEXT, payload TEXT)""")
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
-def get_setting(key: str, default=None):
+def get_setting(key, default=None):
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT value FROM system_settings WHERE key=%s", (key,))
-        row = cur.fetchone()
-    return row["value"] if row else default
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT value FROM system_settings WHERE key=%s",(key,))
+        r = c.fetchone()
+    return r["value"] if r else default
 
-def set_setting(key: str, value: str):
+def set_setting(key, value):
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO system_settings(key,value,updated_at) VALUES(%s,%s,%s)
-            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
-        """, (key, value, utc_now()))
+        c = conn.cursor()
+        c.execute("INSERT INTO system_settings(key,value,updated_at) VALUES(%s,%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at",(key,value,utc_now()))
 
 def ensure_learning_start():
-    if not get_setting("learning_started_at"):
-        set_setting("learning_started_at", utc_now())
+    if not get_setting("learning_started_at"): set_setting("learning_started_at",utc_now())
 
 def get_ai_mode():
     return os.getenv("AI_MODE", get_setting("ai_mode", AI_MODE) or "PAPER").upper().strip()
 
 def learning_age_days():
-    start = parse_dt(get_setting("learning_started_at"))
-    if not start:
-        return 0
-    return max(0, business_days_between(start, utc_now_dt()) - 1)
+    s = parse_dt(get_setting("learning_started_at"))
+    return max(0, business_days_between(s, utc_now_dt())-1) if s else 0
 
 def learning_remaining_days():
     return max(0, LEARNING_DAYS - learning_age_days())
 
 @app.on_event("startup")
-def startup():
-    init_db()
-    ensure_learning_start()
+def startup(): init_db(); ensure_learning_start()
 
-# ============================================================
-# CANDLES
-# ============================================================
+# ── CANDLES ──────────────────────────────────────────────────
 
-def get_candles(symbol: str, timeframe: str, limit: int = 220) -> List[Dict]:
-    timeframe = normalize_tf(timeframe)
+def get_candles(symbol, timeframe, limit=220):
+    tf = normalize_tf(timeframe)
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT * FROM candles WHERE symbol=%s AND timeframe=%s
-            ORDER BY id DESC LIMIT %s
-        """, (normalize_symbol(symbol), timeframe, limit))
-        rows = list(reversed(cur.fetchall()))
-    return rows
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM candles WHERE symbol=%s AND timeframe=%s ORDER BY id DESC LIMIT %s",(normalize_symbol(symbol),tf,limit))
+        return list(reversed(c.fetchall()))
 
-def get_all_candles_for_scan(limit_per_symbol_tf: int = 220) -> Dict:
+def get_all_candles_for_scan(limit=220):
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY symbol, timeframe ORDER BY id DESC
-                ) AS rn FROM candles
-                WHERE symbol = ANY(%s) AND timeframe IN ('60', '1D')
-            ) x WHERE rn <= %s ORDER BY symbol, timeframe, id ASC
-        """, (WATCHLIST, limit_per_symbol_tf))
-        rows = cur.fetchall()
-
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("""SELECT * FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY symbol,timeframe ORDER BY id DESC) AS rn
+            FROM candles WHERE symbol=ANY(%s) AND timeframe IN ('60','1D')) x
+            WHERE rn<=%s ORDER BY symbol,timeframe,id ASC""",(WATCHLIST,limit))
+        rows = c.fetchall()
     data = {}
     for r in rows:
-        s = normalize_symbol(r["symbol"])
-        tf = normalize_tf(r["timeframe"])
-        data.setdefault(s, {"60": [], "1D": []})
-        data[s][tf].append(r)
+        s=normalize_symbol(r["symbol"]); tf=normalize_tf(r["timeframe"])
+        data.setdefault(s,{"60":[],"1D":[]}); data[s][tf].append(r)
     return data
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
+# ── FIX V20.1: LATEST PRICE ──────────────────────────────────
 
-def sma(values, n):
-    vals = [x for x in values if x is not None]
-    if len(vals) < n:
-        return None
-    return sum(vals[-n:]) / n
+def get_latest_price(symbol):
+    """أحدث سعر من H1 أو 1D — أيهما أحدث. Returns (price, tf, bar_time)"""
+    symbol = normalize_symbol(symbol)
+    h1 = get_candles(symbol,"60",3); d1 = get_candles(symbol,"1D",3)
+    h = h1[-1] if h1 else None; d = d1[-1] if d1 else None
+    if not h and not d: return None,None,None
+    if h and d:
+        ht = parse_dt(str(h.get("bar_time") or h.get("received_at") or ""))
+        dt_ = parse_dt(str(d.get("bar_time") or d.get("received_at") or ""))
+        if ht and dt_:
+            if ht >= dt_: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+            else:         return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
+        if ht: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+        return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
+    if h: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+    return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
 
-def ema(values, n):
-    vals = [x for x in values if x is not None]
-    if len(vals) < n:
-        return None
-    k = 2 / (n + 1)
-    e = sum(vals[:n]) / n
-    for price in vals[n:]:
-        e = price * k + e * (1 - k)
+def get_latest_price_from_cache(symbol, cache):
+    symbol = normalize_symbol(symbol)
+    h1 = cache.get(symbol,{}).get("60",[]); d1 = cache.get(symbol,{}).get("1D",[])
+    h = h1[-1] if h1 else None; d = d1[-1] if d1 else None
+    if not h and not d: return None,None,None
+    if h and d:
+        ht = parse_dt(str(h.get("bar_time") or h.get("received_at") or ""))
+        dt_ = parse_dt(str(d.get("bar_time") or d.get("received_at") or ""))
+        if ht and dt_:
+            if ht >= dt_: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+            else:         return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
+        if ht: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+        return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
+    if h: return safe_float(h["close"]),"H1",str(h.get("bar_time",""))
+    return safe_float(d["close"]),"1D",str(d.get("bar_time",""))
+
+# ── INDICATORS ───────────────────────────────────────────────
+
+def sma(values,n):
+    v=[x for x in values if x is not None]
+    return sum(v[-n:])/n if len(v)>=n else None
+
+def ema(values,n):
+    v=[x for x in values if x is not None]
+    if len(v)<n: return None
+    k=2/(n+1); e=sum(v[:n])/n
+    for p in v[n:]: e=p*k+e*(1-k)
     return e
 
-def rsi(values, n=14):
-    vals = [x for x in values if x is not None]
-    if len(vals) < n + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(vals)):
-        d = vals[i] - vals[i - 1]
-        gains.append(max(d, 0))
-        losses.append(abs(min(d, 0)))
-    ag = sum(gains[-n:]) / n
-    al = sum(losses[-n:]) / n
-    if al == 0:
-        return 100
-    return 100 - (100 / (1 + ag / al))
+def rsi(values,n=14):
+    v=[x for x in values if x is not None]
+    if len(v)<n+1: return None
+    g,l=[],[]
+    for i in range(1,len(v)):
+        d=v[i]-v[i-1]; g.append(max(d,0)); l.append(abs(min(d,0)))
+    ag=sum(g[-n:])/n; al=sum(l[-n:])/n
+    return 100 if al==0 else 100-(100/(1+ag/al))
 
-def atr(candles, n=14):
-    if len(candles) < n + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        h = safe_float(candles[i]["high"])
-        l = safe_float(candles[i]["low"])
-        pc = safe_float(candles[i - 1]["close"])
-        if h is None or l is None or pc is None:
-            continue
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if len(trs) < n:
-        return None
-    return sum(trs[-n:]) / n
+def atr(candles,n=14):
+    if len(candles)<n+1: return None
+    trs=[]
+    for i in range(1,len(candles)):
+        h=safe_float(candles[i]["high"]); l=safe_float(candles[i]["low"]); pc=safe_float(candles[i-1]["close"])
+        if None in [h,l,pc]: continue
+        trs.append(max(h-l,abs(h-pc),abs(l-pc)))
+    return sum(trs[-n:])/n if len(trs)>=n else None
 
-def support_resistance(candles, lookback=30):
-    valid = [x for x in candles if safe_float(x.get("low")) is not None and safe_float(x.get("high")) is not None]
-    if not valid:
-        return None, None
-    recent = valid[-lookback:] if len(valid) >= lookback else valid
-    return min(float(x["low"]) for x in recent), max(float(x["high"]) for x in recent)
+def support_resistance(candles,lookback=30):
+    v=[x for x in candles if safe_float(x.get("low")) and safe_float(x.get("high"))]
+    if not v: return None,None
+    r=v[-lookback:] if len(v)>=lookback else v
+    return min(float(x["low"]) for x in r),max(float(x["high"]) for x in r)
 
-def recent_momentum(candles, lookback=8):
-    if len(candles) < lookback + 1:
-        return 0
-    start = safe_float(candles[-lookback]["close"])
-    end = safe_float(candles[-1]["close"])
-    return ((end - start) / start) * 100 if start else 0
+def recent_momentum(candles,lookback=8):
+    if len(candles)<lookback+1: return 0
+    s=safe_float(candles[-lookback]["close"]); e=safe_float(candles[-1]["close"])
+    return ((e-s)/s)*100 if s else 0
 
-# ============================================================
-# V20: ON-BALANCE VOLUME (OBV)
-# ============================================================
+def compute_obv(candles):
+    obv=0.0; series=[]
+    for i,c in enumerate(candles):
+        vol=safe_float(c.get("volume"),0) or 0
+        if i==0: series.append(obv); continue
+        pc=safe_float(candles[i-1]["close"]); cc=safe_float(c["close"])
+        if cc and pc:
+            if cc>pc: obv+=vol
+            elif cc<pc: obv-=vol
+        series.append(obv)
+    return series
 
-def compute_obv(candles) -> List[float]:
-    obv = 0.0
-    obv_series = []
-    for i, c in enumerate(candles):
-        vol = safe_float(c.get("volume"), 0) or 0
-        if i == 0:
-            obv_series.append(obv)
-            continue
-        prev_close = safe_float(candles[i - 1]["close"])
-        curr_close = safe_float(c["close"])
-        if curr_close is None or prev_close is None:
-            obv_series.append(obv)
-            continue
-        if curr_close > prev_close:
-            obv += vol
-        elif curr_close < prev_close:
-            obv -= vol
-        obv_series.append(obv)
-    return obv_series
+def compute_cmf(candles,period=14):
+    if len(candles)<period: return 0.0
+    mfv=vol=0.0
+    for c in candles[-period:]:
+        h=safe_float(c.get("high")); l=safe_float(c.get("low")); cl=safe_float(c.get("close")); v=safe_float(c.get("volume"),0) or 0
+        if None in [h,l,cl] or (h-l)==0: continue
+        mfv+=((cl-l)-(h-cl))/(h-l)*v; vol+=v
+    return mfv/vol if vol>0 else 0.0
 
-# ============================================================
-# V20: CHAIKIN MONEY FLOW (CMF)
-# ============================================================
+def detect_market_phase(candles):
+    if len(candles)<30: return "NEUTRAL",0.0,{}
+    closes=[safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+    highs=[safe_float(c["high"]) for c in candles if safe_float(c["high"])]
+    lows=[safe_float(c["low"]) for c in candles if safe_float(c["low"])]
+    volumes=[safe_float(c.get("volume"),0) or 0 for c in candles]
+    if len(closes)<20: return "NEUTRAL",0.0,{}
+    price=closes[-1]
+    rh=max(highs[-20:]); rl=min(lows[-20:])
+    prange=((rh-rl)/rl*100) if rl else 10
+    obv=compute_obv(candles)
+    obv_r=len(obv)>=10 and obv[-1]>obv[-10]; obv_f=len(obv)>=10 and obv[-1]<obv[-10]
+    cmf=compute_cmf(candles,14)
+    av20=sma(volumes,20) or 1; av10=sma(volumes,10) or 1
+    vexp=av10>av20*1.1; vcon=av10<av20*0.9
+    ma20=sma(closes,20); ma50=sma(closes,50) if len(closes)>=50 else ma20
+    pma20=ma20 and price>ma20; pma50=ma50 and price>ma50; m2050=ma20 and ma50 and ma20>=ma50
+    mid=len(highs)//2
+    hh=max(highs[mid:])>max(highs[:mid]) if mid>0 else False
+    hl=min(lows[mid:])>min(lows[:mid]) if mid>0 else False
+    ll=min(lows[mid:])<min(lows[:mid]) if mid>0 else False
+    lh=max(highs[mid:])<max(highs[:mid]) if mid>0 else False
+    details={"price_range_pct":round(prange,2),"cmf":round(cmf,3),"obv_rising":obv_r,"obv_falling":obv_f,
+             "vol_expanding":vexp,"vol_contracting":vcon,"higher_highs":hh,"higher_lows":hl,
+             "lower_lows":ll,"lower_highs":lh,"price_above_ma20":pma20,"price_above_ma50":pma50,"ma20_above_ma50":m2050}
+    a=mk=di=md=0
+    if prange<8 and cmf>0.05: a+=3
+    if obv_r and vcon: a+=2
+    if pma20 and not pma50: a+=1
+    if hh and hl: mk+=3
+    if pma20 and pma50: mk+=2
+    if m2050 and obv_r: mk+=2
+    if vexp and cmf>0.1: mk+=2
+    if pma20 and cmf<-0.05: di+=3
+    if obv_f and vexp: di+=2
+    if hh and not hl: di+=2
+    if ll and lh: md+=3
+    if not pma20 and not pma50: md+=2
+    if obv_f and cmf<-0.1: md+=2
+    scores={"ACCUMULATION":a,"MARKUP":mk,"DISTRIBUTION":di,"MARKDOWN":md}
+    best=max(scores,key=scores.get)
+    return ("NEUTRAL",cmf,details) if scores[best]<3 else (best,cmf,details)
 
-def compute_cmf(candles, period=14) -> float:
-    if len(candles) < period:
-        return 0.0
-    recent = candles[-period:]
-    mf_vol_sum = 0.0
-    vol_sum = 0.0
-    for c in recent:
-        h = safe_float(c.get("high"))
-        l = safe_float(c.get("low"))
-        cl = safe_float(c.get("close"))
-        v = safe_float(c.get("volume"), 0) or 0
-        if h is None or l is None or cl is None:
-            continue
-        if (h - l) == 0:
-            continue
-        mfm = ((cl - l) - (h - cl)) / (h - l)
-        mf_vol_sum += mfm * v
-        vol_sum += v
-    return mf_vol_sum / vol_sum if vol_sum > 0 else 0.0
+def detect_reversal_signals(candles):
+    sigs=[]
+    if len(candles)<20: return sigs
+    closes=[safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+    volumes=[safe_float(c.get("volume"),0) or 0 for c in candles]
+    if len(closes)<15: return sigs
+    rsi_r=[]
+    for i in range(max(0,len(closes)-10),len(closes)):
+        r=rsi(closes[:i+1],14)
+        if r is not None: rsi_r.append(r)
+    if len(rsi_r)>=6 and len(closes)>=6 and closes[-1]>closes[-6] and len(rsi_r)>=2 and rsi_r[-1]<rsi_r[-3] and closes[-1]>0:
+        sigs.append({"type":"BEARISH_DIVERGENCE","severity":"STRONG","score_penalty":-20,"message":"سعر يصنع highs جديدة لكن RSI يضعف"})
+    avg_vol=sma(volumes,20) or 1
+    if volumes[-1]>avg_vol*2.5:
+        lc=candles[-1]; body=abs(safe_float(lc["close"])-safe_float(lc["open"]) or 0)
+        fr=(safe_float(lc["high"]) or 0)-(safe_float(lc["low"]) or 0)
+        if fr>0 and body/fr<0.35:
+            sigs.append({"type":"VOLUME_CLIMAX","severity":"CRITICAL","score_penalty":-25,"message":"حجم ضخم مع شمعة ضعيفة"})
+    if len(closes)>=10:
+        run=((closes[-1]-closes[-10])/closes[-10])*100 if closes[-10] else 0
+        lc=candles[-1]; body=abs(safe_float(lc["close"])-safe_float(lc["open"]) or 0)
+        fr=(safe_float(lc["high"]) or 0)-(safe_float(lc["low"]) or 0)
+        if run>8 and fr>0 and body/fr<0.25:
+            sigs.append({"type":"EXHAUSTION_DOJI","severity":"WARNING","score_penalty":-10,"message":"شمعة تردد بعد صعود"})
+    cmf=compute_cmf(candles,14)
+    if cmf<-0.15:
+        sigs.append({"type":"DISTRIBUTION_DETECTED","severity":"STRONG","score_penalty":-15,"message":f"CMF={round(cmf,3)} — مؤسسات تبيع"})
+    return sigs
 
-# ============================================================
-# V20: MARKET PHASE DETECTION (Wyckoff-inspired)
-# ============================================================
+def dynamic_targets_atr(entry,atr_v,kind,phase):
+    if not atr_v or atr_v<=0: atr_v=entry*0.015
+    atr_pct=(atr_v/entry)*100
+    pm={"MARKUP":1.3,"ACCUMULATION":1.1,"NEUTRAL":1.0,"DISTRIBUTION":0.7,"MARKDOWN":0.5}.get(phase,1.0)
+    if kind=="SHORT_SWING":
+        t1=entry+atr_v*1.5*pm; t2=entry+atr_v*2.5*pm; t3=entry+atr_v*3.5*pm; stop=entry-atr_v
+        tpct=((t1-entry)/entry)*100; ed=max(2,min(8,round(tpct/max(atr_pct,0.1)))); mh=7
+    else:
+        t1=entry+atr_v*3.0*pm; t2=entry+atr_v*5.0*pm; t3=entry+atr_v*7.0*pm; stop=entry-atr_v*1.8
+        tpct=((t1-entry)/entry)*100; ed=max(5,min(30,round(tpct/max(atr_pct*0.3,0.1)))); mh=28
+    rpct=((entry-stop)/entry)*100 if entry else 0
+    rr=((t1-entry)/(entry-stop)) if entry>stop else 0
+    return {"entry_low":round(entry*0.995,3),"entry_high":round(entry*1.005,3),
+            "stop_loss":round(stop,3),"target1":round(t1,3),"target2":round(t2,3),"target3":round(t3,3),
+            "target_pct":round(tpct,2),"risk_pct":round(rpct,2),"rr":round(rr,2),
+            "atr_value":round(atr_v,4),"atr_pct":round(atr_pct,2),"estimated_days":ed,"max_hold_days":mh}
 
-def detect_market_phase(candles) -> Tuple[str, float, Dict]:
-    """
-    يكشف مرحلة السوق:
-    ACCUMULATION  — مؤسسات تشتري بهدوء
-    MARKUP        — صعود مدعوم بحجم
-    DISTRIBUTION  — مؤسسات تبيع في القمة
-    MARKDOWN      — هبوط مدعوم
-    NEUTRAL       — لا اتجاه واضح
-    """
-    if len(candles) < 30:
-        return "NEUTRAL", 0.0, {}
+def position_sizing(entry,stop,kind):
+    rp=0.01 if kind=="SHORT_SWING" else 0.015; mp=0.18 if kind=="SHORT_SWING" else 0.25
+    rs=max(entry-stop,0); mra=CAPITAL*rp
+    if rs<=0 or entry<=0: return {"qty":0,"position_value":0,"max_risk_aed":round(mra,2)}
+    q=max(0,min(mra/rs,(CAPITAL*mp)/entry))
+    return {"qty":round(q,2),"position_value":round(q*entry,2),"max_risk_aed":round(mra,2),"max_position_value":round(CAPITAL*mp,2)}
 
-    closes  = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
-    highs   = [safe_float(c["high"])  for c in candles if safe_float(c["high"])]
-    lows    = [safe_float(c["low"])   for c in candles if safe_float(c["low"])]
-    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
-
-    if len(closes) < 20:
-        return "NEUTRAL", 0.0, {}
-
-    price = closes[-1]
-
-    # Range tightness (last 20 candles)
-    recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
-    recent_low  = min(lows[-20:])  if len(lows) >= 20 else min(lows)
-    price_range_pct = ((recent_high - recent_low) / recent_low * 100) if recent_low else 10
-
-    # OBV trend
-    obv_series = compute_obv(candles)
-    obv_rising = len(obv_series) >= 10 and obv_series[-1] > obv_series[-10]
-    obv_falling = len(obv_series) >= 10 and obv_series[-1] < obv_series[-10]
-
-    # CMF
-    cmf = compute_cmf(candles, 14)
-
-    # Volume expansion vs contraction
-    avg_vol_20 = sma(volumes, 20) or 1
-    avg_vol_10 = sma(volumes, 10) or 1
-    vol_expanding = avg_vol_10 > avg_vol_20 * 1.1
-    vol_contracting = avg_vol_10 < avg_vol_20 * 0.9
-
-    # Price direction
-    ma20 = sma(closes, 20)
-    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
-    price_above_ma20 = ma20 and price > ma20
-    price_above_ma50 = ma50 and price > ma50
-    ma20_above_ma50  = ma20 and ma50 and ma20 >= ma50
-
-    # Higher highs / higher lows structure
-    mid = len(highs) // 2
-    recent_hh  = max(highs[mid:])  > max(highs[:mid])  if mid > 0 else False
-    recent_hl  = min(lows[mid:])   > min(lows[:mid])   if mid > 0 else False
-
-    # Lower lows / lower highs (downtrend structure)
-    recent_ll  = min(lows[mid:])   < min(lows[:mid])   if mid > 0 else False
-    recent_lh  = max(highs[mid:])  < max(highs[:mid])  if mid > 0 else False
-
-    details = {
-        "price_range_pct": round(price_range_pct, 2),
-        "cmf": round(cmf, 3),
-        "obv_rising": obv_rising,
-        "obv_falling": obv_falling,
-        "vol_expanding": vol_expanding,
-        "vol_contracting": vol_contracting,
-        "higher_highs": recent_hh,
-        "higher_lows": recent_hl,
-        "lower_lows": recent_ll,
-        "lower_highs": recent_lh,
-        "price_above_ma20": price_above_ma20,
-        "price_above_ma50": price_above_ma50,
-        "ma20_above_ma50": ma20_above_ma50,
-    }
-
-    # Phase scoring
-    acc_score  = 0
-    mkup_score = 0
-    dist_score = 0
-    mkdn_score = 0
-
-    # ACCUMULATION: tight range + money flowing in quietly
-    if price_range_pct < 8 and cmf > 0.05:  acc_score += 3
-    if obv_rising and vol_contracting:        acc_score += 2
-    if price_above_ma20 and not price_above_ma50: acc_score += 1
-
-    # MARKUP: price breaking up with volume
-    if recent_hh and recent_hl:               mkup_score += 3
-    if price_above_ma20 and price_above_ma50: mkup_score += 2
-    if ma20_above_ma50 and obv_rising:        mkup_score += 2
-    if vol_expanding and cmf > 0.1:           mkup_score += 2
-
-    # DISTRIBUTION: high price + money flowing out
-    if price_above_ma20 and cmf < -0.05:     dist_score += 3
-    if obv_falling and vol_expanding:         dist_score += 2
-    if recent_hh and not recent_hl:           dist_score += 2  # new highs without higher lows = weak
-
-    # MARKDOWN: falling price + volume
-    if recent_ll and recent_lh:               mkdn_score += 3
-    if not price_above_ma20 and not price_above_ma50: mkdn_score += 2
-    if obv_falling and cmf < -0.1:           mkdn_score += 2
-
-    scores = {
-        "ACCUMULATION": acc_score,
-        "MARKUP": mkup_score,
-        "DISTRIBUTION": dist_score,
-        "MARKDOWN": mkdn_score,
-    }
-
-    best_phase = max(scores, key=scores.get)
-    best_score = scores[best_phase]
-
-    if best_score < 3:
-        return "NEUTRAL", cmf, details
-
-    return best_phase, cmf, details
-
-# ============================================================
-# V20: REVERSAL SIGNAL DETECTION
-# ============================================================
-
-def detect_reversal_signals(candles) -> List[Dict]:
-    """
-    يكشف إشارات عكس المسار:
-    - Bearish Divergence: سعر يصنع highs جديدة لكن RSI ينزل
-    - Volume Climax: حجم ضخم عند القمة مع candle ذيل طويل
-    - Exhaustion: شمعة doji بعد صعود طويل
-    - Distribution: CMF سلبي رغم السعر العالي
-    """
-    signals = []
-    if len(candles) < 20:
-        return signals
-
-    closes  = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
-    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
-
-    if len(closes) < 15:
-        return signals
-
-    # RSI values for last 10 candles
-    rsi_recent = []
-    for i in range(max(0, len(closes) - 10), len(closes)):
-        r = rsi(closes[:i + 1], 14)
-        if r is not None:
-            rsi_recent.append(r)
-
-    # Bearish Divergence: price makes higher high but RSI makes lower high
-    if len(rsi_recent) >= 6 and len(closes) >= 6:
-        price_higher_high = closes[-1] > closes[-6]
-        rsi_lower_high    = len(rsi_recent) >= 2 and rsi_recent[-1] < rsi_recent[-3]
-        if price_higher_high and rsi_lower_high and closes[-1] > 0:
-            signals.append({
-                "type": "BEARISH_DIVERGENCE",
-                "severity": "STRONG",
-                "score_penalty": -20,
-                "message": "سعر يصنع highs جديدة لكن RSI يضعف — خطر انعكاس"
-            })
-
-    # Volume Climax: حجم أكبر بـ 3x من المتوسط مع شمعة ضعيفة الإغلاق
-    avg_vol = sma(volumes, 20) or 1
-    last_vol = volumes[-1]
-    if last_vol > avg_vol * 2.5:
-        last_c = candles[-1]
-        body = abs(safe_float(last_c["close"]) - safe_float(last_c["open"]) or 0)
-        full_range = (safe_float(last_c["high"]) or 0) - (safe_float(last_c["low"]) or 0)
-        if full_range > 0 and body / full_range < 0.35:
-            signals.append({
-                "type": "VOLUME_CLIMAX",
-                "severity": "CRITICAL",
-                "score_penalty": -25,
-                "message": "حجم ضخم مع شمعة ضعيفة — علامة توزيع أو إرهاق"
-            })
-
-    # Exhaustion Doji after long run
-    if len(closes) >= 10:
-        run_pct = ((closes[-1] - closes[-10]) / closes[-10]) * 100 if closes[-10] else 0
-        last_c = candles[-1]
-        body = abs(safe_float(last_c["close"]) - safe_float(last_c["open"]) or 0)
-        full_range = (safe_float(last_c["high"]) or 0) - (safe_float(last_c["low"]) or 0)
-        if run_pct > 8 and full_range > 0 and body / full_range < 0.25:
-            signals.append({
-                "type": "EXHAUSTION_DOJI",
-                "severity": "WARNING",
-                "score_penalty": -10,
-                "message": "شمعة تردد بعد صعود — مراقبة دخول جديد"
-            })
-
-    # CMF Distribution Signal
-    cmf = compute_cmf(candles, 14)
-    if cmf < -0.15:
-        signals.append({
-            "type": "DISTRIBUTION_DETECTED",
-            "severity": "STRONG",
-            "score_penalty": -15,
-            "message": f"تدفق مال سلبي (CMF={round(cmf, 3)}) — مؤسسات تبيع"
-        })
-
-    return signals
-
-# ============================================================
-# V20: DYNAMIC TARGETS (ATR-Based)
-# ============================================================
-
-def dynamic_targets_atr(entry: float, atr_value: float, kind: str, market_phase: str) -> Dict:
-    """
-    الأهداف مبنية على ATR الفعلي لكل سهم
-    وليست أرقاماً ثابتة
-    """
-    if not atr_value or atr_value <= 0:
-        atr_value = entry * 0.015
-
-    atr_pct = (atr_value / entry) * 100
-
-    # Phase multipliers — في مرحلة MARKUP الأهداف أبعد
-    phase_mult = {
-        "MARKUP": 1.3,
-        "ACCUMULATION": 1.1,
-        "NEUTRAL": 1.0,
-        "DISTRIBUTION": 0.7,
-        "MARKDOWN": 0.5,
-    }.get(market_phase, 1.0)
-
-    if kind == "SHORT_SWING":
-        t1 = entry + (atr_value * 1.5 * phase_mult)
-        t2 = entry + (atr_value * 2.5 * phase_mult)
-        t3 = entry + (atr_value * 3.5 * phase_mult)
-        stop = entry - (atr_value * 1.0)
-        # تقدير الأيام: كم يوم يحتاج ATR للوصول للهدف
-        target_pct = ((t1 - entry) / entry) * 100
-        est_days = max(2, min(8, round(target_pct / max(atr_pct, 0.1))))
-        max_hold  = 7
-
-    else:  # LONG_SWING
-        t1 = entry + (atr_value * 3.0 * phase_mult)
-        t2 = entry + (atr_value * 5.0 * phase_mult)
-        t3 = entry + (atr_value * 7.0 * phase_mult)
-        stop = entry - (atr_value * 1.8)
-        target_pct = ((t1 - entry) / entry) * 100
-        est_days = max(5, min(30, round(target_pct / max(atr_pct * 0.3, 0.1))))
-        max_hold  = 28
-
-    risk_pct = ((entry - stop) / entry) * 100 if entry else 0
-    rr = ((t1 - entry) / (entry - stop)) if entry > stop else 0
-
-    return {
-        "entry_low":  round(entry * 0.995, 3),
-        "entry_high": round(entry * 1.005, 3),
-        "stop_loss":  round(stop, 3),
-        "target1":    round(t1, 3),
-        "target2":    round(t2, 3),
-        "target3":    round(t3, 3),
-        "target_pct": round(target_pct, 2),
-        "risk_pct":   round(risk_pct, 2),
-        "rr":         round(rr, 2),
-        "atr_value":  round(atr_value, 4),
-        "atr_pct":    round(atr_pct, 2),
-        "estimated_days": est_days,
-        "max_hold_days":  max_hold,
-    }
-
-# ============================================================
-# V20: POSITION SIZING
-# ============================================================
-
-def position_sizing(entry, stop, kind):
-    risk_pct_per_trade = 0.01 if kind == "SHORT_SWING" else 0.015
-    max_position_pct   = 0.18 if kind == "SHORT_SWING" else 0.25
-    risk_per_share     = max(entry - stop, 0)
-    max_risk_aed       = CAPITAL * risk_pct_per_trade
-    if risk_per_share <= 0 or entry <= 0:
-        return {"qty": 0, "position_value": 0, "max_risk_aed": round(max_risk_aed, 2)}
-    qty_by_risk = max_risk_aed / risk_per_share
-    max_pos_val = CAPITAL * max_position_pct
-    qty         = max(0, min(qty_by_risk, max_pos_val / entry))
-    return {
-        "qty": round(qty, 2),
-        "position_value": round(qty * entry, 2),
-        "max_risk_aed": round(max_risk_aed, 2),
-        "max_position_value": round(max_pos_val, 2)
-    }
-
-# ============================================================
-# V20: PATTERN LEARNING ADJUSTMENTS
-# ============================================================
-
-def get_rsi_bucket(r: Optional[float]) -> str:
+def get_rsi_bucket(r):
     if r is None: return "UNKNOWN"
-    if r < 40:    return "LOW"
-    if r < 65:    return "HEALTHY"
-    if r < 75:    return "EXTENDED"
+    if r<40: return "LOW"
+    if r<65: return "HEALTHY"
+    if r<75: return "EXTENDED"
     return "OVERBOUGHT"
 
-def get_volume_bucket(vol_ratio: float) -> str:
-    if vol_ratio < 1.0: return "LOW"
-    if vol_ratio < 1.4: return "NORMAL"
+def get_volume_bucket(vr):
+    if vr<1.0: return "LOW"
+    if vr<1.4: return "NORMAL"
     return "HIGH"
 
-def get_pattern_adjustment(symbol: str, setup_type: str, market_phase: str,
-                           rsi_bucket: str, volume_bucket: str) -> float:
-    """
-    يجلب التعديل المبني على الـ patterns التاريخية لهذا السهم
-    إذا هذا النمط أعطى خسائر متكررة — ينزل الـ score
-    إذا هذا النمط نجح تاريخياً — يرفع الـ score
-    """
+def get_pattern_adjustment(symbol,setup_type,phase,rsi_bucket,vol_bucket):
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT outcome, COUNT(*) as cnt,
-                       AVG(return_pct) as avg_ret
-                FROM v20_pattern_learning
-                WHERE symbol=%s AND setup_type=%s
-                  AND market_phase=%s AND rsi_bucket=%s
-                  AND created_at::timestamp > NOW() - INTERVAL '60 days'
-                GROUP BY outcome
-            """, (symbol, setup_type, market_phase, rsi_bucket))
-            rows = cur.fetchall()
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT outcome,COUNT(*) cnt,AVG(return_pct) avg_ret FROM v20_pattern_learning
+                WHERE symbol=%s AND setup_type=%s AND market_phase=%s AND rsi_bucket=%s
+                AND created_at::timestamp>NOW()-INTERVAL '60 days' GROUP BY outcome""",
+                (symbol,setup_type,phase,rsi_bucket))
+            rows=c.fetchall()
+        if not rows: return 0.0
+        wins=sum(int(r["cnt"]) for r in rows if r["outcome"]=="WIN")
+        losses=sum(int(r["cnt"]) for r in rows if r["outcome"]=="LOSS")
+        total=wins+losses
+        if total<5: return 0.0
+        wr=wins/total; ar=sum(float(r["avg_ret"] or 0)*int(r["cnt"]) for r in rows)/total
+        return max(-20,min(15,(wr-0.5)*25+max(-5,min(5,ar))))
+    except: return 0.0
 
-        if not rows:
-            return 0.0
-
-        wins   = sum(int(r["cnt"]) for r in rows if r["outcome"] == "WIN")
-        losses = sum(int(r["cnt"]) for r in rows if r["outcome"] == "LOSS")
-        total  = wins + losses
-        if total < 5:
-            return 0.0
-
-        win_rate = wins / total
-        avg_ret  = sum(float(r["avg_ret"] or 0) * int(r["cnt"]) for r in rows) / total
-
-        # تعديل ما بين -20 و+15
-        adj = (win_rate - 0.5) * 25 + max(-5, min(5, avg_ret))
-        return max(-20, min(15, adj))
-    except Exception:
-        return 0.0
-
-def record_pattern_outcome(symbol: str, setup_type: str, market_phase: str,
-                           rsi_bucket: str, volume_bucket: str, trend_alignment: str,
-                           outcome: str, return_pct: float, score: float, rr: float):
+def record_pattern_outcome(symbol,setup_type,phase,rsi_bucket,vol_bucket,trend_align,outcome,ret_pct,score,rr):
     try:
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO v20_pattern_learning
-                (symbol, setup_type, market_phase, rsi_bucket, volume_bucket,
-                 trend_alignment, outcome, return_pct, score_at_entry, rr_at_entry, created_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (normalize_symbol(symbol), setup_type, market_phase, rsi_bucket,
-                  volume_bucket, trend_alignment, outcome, return_pct, score, rr, utc_now()))
-    except Exception as e:
-        print(f"Pattern record error: {e}")
+            c=conn.cursor()
+            c.execute("""INSERT INTO v20_pattern_learning
+                (symbol,setup_type,market_phase,rsi_bucket,volume_bucket,trend_alignment,outcome,return_pct,score_at_entry,rr_at_entry,created_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (normalize_symbol(symbol),setup_type,phase,rsi_bucket,vol_bucket,trend_align,outcome,ret_pct,score,rr,utc_now()))
+    except Exception as e: print(f"pattern error:{e}")
 
-# ============================================================
-# V20: CLASSIC LEARNING (fallback)
-# ============================================================
-
-def get_learning_adjustment(symbol: str) -> float:
+def get_learning_adjustment(symbol):
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT score_adjustment FROM ai_learning_stats WHERE symbol=%s",
-                        (normalize_symbol(symbol),))
-            row = cur.fetchone()
-        return float(row["score_adjustment"] or 0) if row else 0.0
-    except Exception:
-        return 0.0
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT score_adjustment FROM ai_learning_stats WHERE symbol=%s",(normalize_symbol(symbol),))
+            r=c.fetchone()
+        return float(r["score_adjustment"] or 0) if r else 0.0
+    except: return 0.0
 
-def failure_penalty(symbol: str) -> float:
+def failure_penalty(symbol):
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT failure_reason, COUNT(*) AS c FROM ai_failure_memory
-                WHERE symbol=%s AND created_at::timestamp >= %s GROUP BY failure_reason
-            """, (normalize_symbol(symbol),
-                  (utc_now_dt() - timedelta(days=45)).isoformat()))
-            rows = cur.fetchall()
-
-        penalty = 0.0
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT failure_reason,COUNT(*) c FROM ai_failure_memory
+                WHERE symbol=%s AND created_at::timestamp>=%s GROUP BY failure_reason""",
+                (normalize_symbol(symbol),(utc_now_dt()-timedelta(days=45)).isoformat()))
+            rows=c.fetchall()
+        pen=0.0
         for r in rows:
-            c = int(r["c"] or 0)
-            if c >= 3:
-                reason = r["failure_reason"]
-                if reason in ["LOW_VOLUME_REVERSAL", "STRUCTURE_FAILED", "DISTRIBUTION_ENTRY"]:
-                    penalty -= 10
-                elif reason in ["POOR_RISK_REWARD", "LATE_ENTRY_OVERBOUGHT"]:
-                    penalty -= 6
-                else:
-                    penalty -= 3
-        return max(-25, penalty)
-    except Exception:
-        return 0.0
+            cnt=int(r["c"] or 0)
+            if cnt>=3:
+                if r["failure_reason"] in ["LOW_VOLUME_REVERSAL","STRUCTURE_FAILED","DISTRIBUTION_ENTRY"]: pen-=10
+                elif r["failure_reason"] in ["POOR_RISK_REWARD","LATE_ENTRY_OVERBOUGHT"]: pen-=6
+                else: pen-=3
+        return max(-25,pen)
+    except: return 0.0
 
-def update_learning(symbol: str, ret_pct: float, signal_type: str, is_virtual: bool):
-    symbol = normalize_symbol(symbol)
-    ret_pct = safe_float(ret_pct, 0) or 0
-
+def update_learning(symbol,ret_pct,signal_type,is_virtual):
+    symbol=normalize_symbol(symbol); ret_pct=safe_float(ret_pct,0) or 0
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT * FROM ai_learning_stats WHERE symbol=%s", (symbol,))
-            row = cur.fetchone()
-
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM ai_learning_stats WHERE symbol=%s",(symbol,))
+            row=c.fetchone()
             if row:
-                t  = int(row["trades_count"] or 0)
-                w  = int(row["wins_count"] or 0)
-                l  = int(row["losses_count"] or 0)
-                vs = int(row["virtual_short_count"] or 0)
-                vsw= int(row["virtual_short_wins"] or 0)
-                vsl= int(row["virtual_short_losses"] or 0)
-                vl = int(row["virtual_long_count"] or 0)
-                vlw= int(row["virtual_long_wins"] or 0)
-                vll= int(row["virtual_long_losses"] or 0)
-
-                st = str(signal_type or "").upper()
-                if is_virtual and "SHORT" in st:
-                    vs+=1; vsw+=(1 if ret_pct>0 else 0); vsl+=(1 if ret_pct<=0 else 0)
-                elif is_virtual and "LONG" in st:
-                    vl+=1; vlw+=(1 if ret_pct>0 else 0); vll+=(1 if ret_pct<=0 else 0)
-                else:
-                    t+=1; w+=(1 if ret_pct>0 else 0); l+=(1 if ret_pct<=0 else 0)
-
-                total_ev = max(t + vs + vl, 1)
-                old_avg  = float(row["avg_return_pct"] or 0)
-                avg_ret  = ((old_avg * max(total_ev - 1, 0)) + ret_pct) / total_ev
-
-                total_w  = w + vsw + vlw
-                total_l  = l + vsl + vll
-                closed   = total_w + total_l
-                wr       = total_w / closed if closed else 0
-                adj      = max(-20, min(15, (wr - 0.5) * 30 + avg_ret))
-
-                cur.execute("""
-                    UPDATE ai_learning_stats SET
-                        trades_count=%s,wins_count=%s,losses_count=%s,
-                        virtual_short_count=%s,virtual_short_wins=%s,virtual_short_losses=%s,
-                        virtual_long_count=%s,virtual_long_wins=%s,virtual_long_losses=%s,
-                        avg_return_pct=%s,score_adjustment=%s,updated_at=%s
-                    WHERE symbol=%s
-                """, (t,w,l,vs,vsw,vsl,vl,vlw,vll,avg_ret,adj,utc_now(),symbol))
+                t=int(row["trades_count"] or 0); w=int(row["wins_count"] or 0); l=int(row["losses_count"] or 0)
+                vs=int(row["virtual_short_count"] or 0); vsw=int(row["virtual_short_wins"] or 0); vsl=int(row["virtual_short_losses"] or 0)
+                vl=int(row["virtual_long_count"] or 0); vlw=int(row["virtual_long_wins"] or 0); vll=int(row["virtual_long_losses"] or 0)
+                st=str(signal_type or "").upper()
+                if is_virtual and "SHORT" in st: vs+=1; vsw+=(1 if ret_pct>0 else 0); vsl+=(1 if ret_pct<=0 else 0)
+                elif is_virtual and "LONG" in st: vl+=1; vlw+=(1 if ret_pct>0 else 0); vll+=(1 if ret_pct<=0 else 0)
+                else: t+=1; w+=(1 if ret_pct>0 else 0); l+=(1 if ret_pct<=0 else 0)
+                tev=max(t+vs+vl,1); oa=float(row["avg_return_pct"] or 0)
+                ar=((oa*max(tev-1,0))+ret_pct)/tev
+                tw=w+vsw+vlw; tl=l+vsl+vll; cl=tw+tl
+                wr=tw/cl if cl else 0; adj=max(-20,min(15,(wr-0.5)*30+ar))
+                c.execute("""UPDATE ai_learning_stats SET trades_count=%s,wins_count=%s,losses_count=%s,
+                    virtual_short_count=%s,virtual_short_wins=%s,virtual_short_losses=%s,
+                    virtual_long_count=%s,virtual_long_wins=%s,virtual_long_losses=%s,
+                    avg_return_pct=%s,score_adjustment=%s,updated_at=%s WHERE symbol=%s""",
+                    (t,w,l,vs,vsw,vsl,vl,vlw,vll,ar,adj,utc_now(),symbol))
             else:
-                adj = 5 if ret_pct > 0 else -5
-                cur.execute("""
-                    INSERT INTO ai_learning_stats
-                    (symbol,trades_count,wins_count,losses_count,
-                     virtual_short_count,virtual_short_wins,virtual_short_losses,
-                     virtual_long_count,virtual_long_wins,virtual_long_losses,
-                     avg_return_pct,score_adjustment,updated_at)
-                    VALUES(%s,1,%s,%s,0,0,0,0,0,0,%s,%s,%s)
-                """, (symbol, 1 if ret_pct>0 else 0, 1 if ret_pct<=0 else 0,
-                      ret_pct, adj, utc_now()))
-    except Exception as e:
-        print(f"update_learning error: {e}")
-
-# ============================================================
-# V20: DAILY TREND SCORE
-# ============================================================
+                adj=5 if ret_pct>0 else -5
+                c.execute("""INSERT INTO ai_learning_stats
+                    (symbol,trades_count,wins_count,losses_count,virtual_short_count,virtual_short_wins,
+                    virtual_short_losses,virtual_long_count,virtual_long_wins,virtual_long_losses,
+                    avg_return_pct,score_adjustment,updated_at) VALUES(%s,1,%s,%s,0,0,0,0,0,0,%s,%s,%s)""",
+                    (symbol,1 if ret_pct>0 else 0,1 if ret_pct<=0 else 0,ret_pct,adj,utc_now()))
+    except Exception as e: print(f"update_learning:{e}")
 
 def daily_trend_score(d1):
-    closes = [safe_float(x["close"]) for x in d1 if safe_float(x["close"])]
-    if len(closes) < MIN_D1_CANDLES:
-        return "UNKNOWN", 0
+    closes=[safe_float(x["close"]) for x in d1 if safe_float(x["close"])]
+    if len(closes)<MIN_D1_CANDLES: return "UNKNOWN",0
+    ma20=sma(closes,20); ma50=sma(closes,50) if len(closes)>=50 else ma20
+    score=0
+    if ma20 and closes[-1]>ma20: score+=12
+    if ma50 and closes[-1]>ma50: score+=12
+    if ma20 and ma50 and ma20>=ma50: score+=8
+    return ("UP" if score>=20 else "MIXED" if score>=10 else "DOWN"),score
 
-    ma20 = sma(closes, 20)
-    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
-    score = 0
-    if ma20 and closes[-1] > ma20: score += 12
-    if ma50 and closes[-1] > ma50: score += 12
-    if ma20 and ma50 and ma20 >= ma50: score += 8
-    trend = "UP" if score >= 20 else "MIXED" if score >= 10 else "DOWN"
-    return trend, score
+# ── BUILD SIGNAL V20.1 ───────────────────────────────────────
 
-# ============================================================
-# V20: CORE SIGNAL BUILDER
-# ============================================================
+def build_signal_v20(symbol,kind,candles,d1):
+    symbol=normalize_symbol(symbol); req=MIN_H1_CANDLES if kind=="SHORT_SWING" else MIN_D1_CANDLES
+    if len(candles)<req: return None
+    closes=[safe_float(x["close"]) for x in candles if safe_float(x["close"])]
+    volumes=[safe_float(x.get("volume"),0) or 0 for x in candles]
+    if len(closes)<req: return None
+    price=closes[-1]
+    if not price or price<=0: return None
 
-def build_signal_v20(symbol: str, kind: str, candles: List, d1: List) -> Optional[Dict]:
-    symbol   = normalize_symbol(symbol)
-    required = MIN_H1_CANDLES if kind == "SHORT_SWING" else MIN_D1_CANDLES
+    # FIX: عمر الكاندل
+    last_c=candles[-1]; c_age=candle_age_hours(last_c); stale=c_age>MAX_CANDLE_AGE_HOURS
 
-    if len(candles) < required:
-        return None
+    ma20=sma(closes,20); ma50=sma(closes,50) if len(closes)>=50 else ma20
+    ema20v=ema(closes,20); r=rsi(closes,14); a=atr(candles,14)
+    sup,res=support_resistance(candles,30 if kind=="SHORT_SWING" else 60)
+    avg_vol=sma(volumes,20) or 1; vr=volumes[-1]/avg_vol if avg_vol else 1
+    mom=recent_momentum(candles,8 if kind=="SHORT_SWING" else 15)
+    trend,_=daily_trend_score(d1)
+    phase,cmf,phase_d=detect_market_phase(candles)
+    rev_sigs=detect_reversal_signals(candles); rev_pen=sum(s["score_penalty"] for s in rev_sigs)
 
-    closes  = [safe_float(x["close"]) for x in candles if safe_float(x["close"])]
-    volumes = [safe_float(x.get("volume"), 0) or 0 for x in candles]
+    score=0; reasons=[]
+    if stale: reasons.append(f"⚠️ بيانات قديمة ({round(c_age,1)}h)")
+    if ma20 and price>ma20: score+=16 if kind=="SHORT_SWING" else 12; reasons.append("Price above MA20")
+    if ma50 and price>ma50: score+=14; reasons.append("Price above MA50")
+    if ema20v and price>ema20v: score+=8; reasons.append("Price above EMA20")
+    if trend=="UP": score+=22 if kind=="SHORT_SWING" else 28; reasons.append("Daily trend UP")
+    elif trend=="MIXED": score+=8; reasons.append("Daily trend mixed")
+    if r is not None:
+        if 40<=r<=65: score+=16; reasons.append(f"RSI healthy ({round(r,1)})")
+        elif 65<r<=73: score+=5; reasons.append(f"RSI extended ({round(r,1)})")
+        elif r>73: score-=10; reasons.append(f"RSI overbought ({round(r,1)})")
+    if vr>=1.5: score+=18; reasons.append(f"Strong volume ({round(vr,2)}x)")
+    elif vr>=1.2: score+=10; reasons.append(f"Volume improving ({round(vr,2)}x)")
+    elif vr<0.8: score-=8; reasons.append("Weak volume")
+    if res and price>=res*0.985: score+=10; reasons.append("Near breakout zone")
+    if mom>(1.0 if kind=="SHORT_SWING" else 2.5): score+=8; reasons.append("Positive momentum")
+    if phase=="ACCUMULATION": score+=15; reasons.append("ACCUMULATION — تجميع")
+    elif phase=="MARKUP": score+=20; reasons.append("MARKUP — صعود مدعوم")
+    elif phase=="DISTRIBUTION": score-=25; reasons.append("DISTRIBUTION — تصريف!")
+    elif phase=="MARKDOWN": score-=30; reasons.append("MARKDOWN — هبوط!")
+    if rev_pen: score+=rev_pen; [reasons.append(f"⚠️ {s['type']}") for s in rev_sigs]
 
-    if len(closes) < required:
-        return None
+    rb=get_rsi_bucket(r); vb=get_volume_bucket(vr)
+    ta="ALIGNED" if trend=="UP" else "MIXED" if trend=="MIXED" else "AGAINST"
+    score+=get_pattern_adjustment(symbol,kind,phase,rb,vb)+get_learning_adjustment(symbol)+failure_penalty(symbol)
 
-    price = closes[-1]
-    if not price or price <= 0:
-        return None
+    tg=dynamic_targets_atr(price,a or price*0.015,kind,phase)
+    strength=("VERY STRONG" if score>=88 else "STRONG" if score>=72 else "MEDIUM" if score>=55 else "WEAK")
+    bad=phase in ["DISTRIBUTION","MARKDOWN"]
+    has_rev=any(s["severity"] in ["STRONG","CRITICAL"] for s in rev_sigs)
 
-    # --- Indicators ---
-    ma20     = sma(closes, 20)
-    ma50     = sma(closes, 50) if len(closes) >= 50 else ma20
-    ema20_v  = ema(closes, 20)
-    r        = rsi(closes, 14)
-    a        = atr(candles, 14)
-    support, resistance = support_resistance(candles, 30 if kind == "SHORT_SWING" else 60)
-    avg_vol  = sma(volumes, 20) or 1
-    volume_ratio = volumes[-1] / avg_vol if avg_vol else 1
-    momentum = recent_momentum(candles, 8 if kind == "SHORT_SWING" else 15)
-    trend, _ = daily_trend_score(d1)
+    # FIX: لا BUY إذا البيانات قديمة
+    ma=("BUY" if score>=MIN_SCORE_BUY and tg["rr"]>=MIN_RR_BUY
+        and tg["risk_pct"]<=(5.5 if kind=="SHORT_SWING" else 12)
+        and not bad and not has_rev and not stale else "WATCH")
 
-    # --- V20: Market Phase & Reversal ---
-    market_phase, cmf, phase_details = detect_market_phase(candles)
-    reversal_signals = detect_reversal_signals(candles)
-    reversal_penalty = sum(s["score_penalty"] for s in reversal_signals)
+    mode=get_ai_mode()
+    action={"LEARNING":"LEARN_SIGNAL" if ma=="BUY" else "WATCH",
+            "PAPER":"PAPER_BUY" if ma=="BUY" else "WATCH",
+            "LIVE":"BUY" if ma=="BUY" else "WATCH"}.get(mode,"WATCH")
+    tf="60" if kind=="SHORT_SWING" else "1D"
 
-    # --- Base Scoring ---
-    score   = 0
-    reasons = []
-
-    if ma20 and price > ma20:
-        score += 16 if kind == "SHORT_SWING" else 12
-        reasons.append("Price above MA20")
-    if ma50 and price > ma50:
-        score += 14
-        reasons.append("Price above MA50")
-    if ema20_v and price > ema20_v:
-        score += 8
-        reasons.append("Price above EMA20")
-
-    if trend == "UP":
-        score += 22 if kind == "SHORT_SWING" else 28
-        reasons.append("Daily trend UP")
-    elif trend == "MIXED":
-        score += 8
-        reasons.append("Daily trend mixed")
-
-    if r is not None and 40 <= r <= 65:
-        score += 16
-        reasons.append(f"RSI healthy ({round(r, 1)})")
-    elif r is not None and 65 < r <= 73:
-        score += 5
-        reasons.append(f"RSI extended ({round(r, 1)})")
-    elif r is not None and r > 73:
-        score -= 10
-        reasons.append(f"RSI overbought ({round(r, 1)}) — risky entry")
-
-    if volume_ratio >= 1.5:
-        score += 18
-        reasons.append(f"Strong volume ({round(volume_ratio, 2)}x)")
-    elif volume_ratio >= 1.2:
-        score += 10
-        reasons.append(f"Volume improving ({round(volume_ratio, 2)}x)")
-    elif volume_ratio < 0.8:
-        score -= 8
-        reasons.append("Weak volume")
-
-    if resistance and price >= resistance * 0.985:
-        score += 10
-        reasons.append("Near breakout zone")
-
-    if momentum > (1.0 if kind == "SHORT_SWING" else 2.5):
-        score += 8
-        reasons.append("Positive momentum")
-
-    # --- V20: Phase bonuses ---
-    if market_phase == "ACCUMULATION":
-        score += 15
-        reasons.append("ACCUMULATION phase — تجميع")
-    elif market_phase == "MARKUP":
-        score += 20
-        reasons.append("MARKUP phase — صعود مدعوم")
-    elif market_phase == "DISTRIBUTION":
-        score -= 25
-        reasons.append("DISTRIBUTION phase — تصريف! ابتعد")
-    elif market_phase == "MARKDOWN":
-        score -= 30
-        reasons.append("MARKDOWN phase — هبوط! ابتعد")
-
-    # --- V20: Reversal penalty ---
-    if reversal_penalty:
-        score += reversal_penalty
-        for rs_sig in reversal_signals:
-            reasons.append(f"⚠️ {rs_sig['type']}")
-
-    # --- Learning adjustments ---
-    rsi_bucket  = get_rsi_bucket(r)
-    vol_bucket  = get_volume_bucket(volume_ratio)
-    trend_align = "ALIGNED" if trend == "UP" else "MIXED" if trend == "MIXED" else "AGAINST"
-
-    pattern_adj  = get_pattern_adjustment(symbol, kind, market_phase, rsi_bucket, vol_bucket)
-    learning_adj = get_learning_adjustment(symbol)
-    pen          = failure_penalty(symbol)
-
-    score += pattern_adj + learning_adj + pen
-
-    # --- V20: Dynamic targets ---
-    targets = dynamic_targets_atr(price, a or (price * 0.015), kind, market_phase)
-
-    # --- Strength & Decision ---
-    strength = (
-        "VERY STRONG" if score >= 88 else
-        "STRONG"      if score >= 72 else
-        "MEDIUM"      if score >= 55 else
-        "WEAK"
-    )
-
-    # Strict quality gates — لا BUY إلا بشروط صارمة
-    bad_phase    = market_phase in ["DISTRIBUTION", "MARKDOWN"]
-    has_reversal = any(s["severity"] in ["STRONG", "CRITICAL"] for s in reversal_signals)
-
-    model_action = (
-        "BUY" if (
-            score >= MIN_SCORE_BUY
-            and targets["rr"] >= MIN_RR_BUY
-            and targets["risk_pct"] <= (5.5 if kind == "SHORT_SWING" else 12)
-            and not bad_phase
-            and not has_reversal
-        ) else "WATCH"
-    )
-
-    mode   = get_ai_mode()
-    action = {
-        "LEARNING": "LEARN_SIGNAL" if model_action == "BUY" else "WATCH",
-        "PAPER":    "PAPER_BUY"    if model_action == "BUY" else "WATCH",
-        "LIVE":     "BUY"          if model_action == "BUY" else "WATCH",
-    }.get(mode, "WATCH")
-
-    timeframe = "60" if kind == "SHORT_SWING" else "1D"
-
-    result = {
-        "symbol":          symbol,
-        "has_data":        True,
-        "type":            kind,
-        "mode":            mode,
-        "action":          action,
-        "model_action":    model_action,
-        "timeframe":       timeframe,
-        "price":           round(price, 3),
-        "entry_zone":      [targets["entry_low"], targets["entry_high"]],
-        "stop_loss":       targets["stop_loss"],
-        "target1":         targets["target1"],
-        "target2":         targets["target2"],
-        "target3":         targets["target3"],
-        "target_pct":      targets["target_pct"],
-        "risk_pct":        targets["risk_pct"],
-        "rr":              targets["rr"],
-        "estimated_days":  targets["estimated_days"],
-        "max_hold_days":   targets["max_hold_days"],
-        "atr_value":       targets["atr_value"],
-        "atr_pct":         targets["atr_pct"],
-        "score":           round(score, 2),
-        "strength":        strength,
-        "trend":           trend,
-        "market_phase":    market_phase,
-        "cmf":             round(cmf, 3),
-        "reversal_signals":reversal_signals,
-        "support":         round(support, 3) if support else None,
-        "resistance":      round(resistance, 3) if resistance else None,
-        "rsi":             round(r, 2) if r is not None else None,
-        "rsi_bucket":      rsi_bucket,
-        "volume_ratio":    round(volume_ratio, 2),
-        "volume_bucket":   vol_bucket,
-        "trend_alignment": trend_align,
-        "momentum_pct":    round(momentum, 2),
-        "pattern_adj":     round(pattern_adj, 2),
-        "learning_adj":    round(learning_adj, 2),
-        "failure_pen":     round(pen, 2),
-        "position_sizing": position_sizing(price, targets["stop_loss"], kind),
-        "reason":          " + ".join(reasons) if reasons else "No strong setup",
-        "phase_details":   phase_details,
+    sig={
+        "symbol":symbol,"has_data":True,"type":kind,"mode":mode,"action":action,
+        "model_action":ma,"timeframe":tf,"price":round(price,3),
+        "entry_zone":[tg["entry_low"],tg["entry_high"]],"stop_loss":tg["stop_loss"],
+        "target1":tg["target1"],"target2":tg["target2"],"target3":tg["target3"],
+        "target_pct":tg["target_pct"],"risk_pct":tg["risk_pct"],"rr":tg["rr"],
+        "estimated_days":tg["estimated_days"],"max_hold_days":tg["max_hold_days"],
+        "atr_value":tg["atr_value"],"atr_pct":tg["atr_pct"],
+        "score":round(score,2),"strength":strength,"trend":trend,"market_phase":phase,
+        "cmf":round(cmf,3),"reversal_signals":rev_sigs,
+        "support":round(sup,3) if sup else None,"resistance":round(res,3) if res else None,
+        "rsi":round(r,2) if r is not None else None,"rsi_bucket":rb,
+        "volume_ratio":round(vr,2),"volume_bucket":vb,"trend_alignment":ta,
+        "momentum_pct":round(mom,2),"pattern_adj":0.0,"learning_adj":0.0,"failure_pen":0.0,
+        "position_sizing":position_sizing(price,tg["stop_loss"],kind),
+        "reason":" + ".join(reasons) if reasons else "No strong setup",
+        "phase_details":phase_d,
+        "data_is_stale":stale,
+        "candle_age_hours":round(c_age,1),
+        "last_bar_time":str(last_c.get("bar_time","")),
     }
+    sig["rank_score"]=ai_rank_score(sig)
+    sig["display_action"]=classify_action(sig)
+    sig["ai_comment"]=ai_comment_v20(sig)
+    return sig
 
-    result["rank_score"]    = ai_rank_score(result)
-    result["display_action"]= classify_action(result)
-    result["ai_comment"]    = ai_comment_v20(result)
-    return result
+def ai_rank_score(sig):
+    s=float(sig.get("score") or 0); rr=min(float(sig.get("rr") or 0),5)*5
+    vol=min(float(sig.get("volume_ratio") or 0),3)*3
+    pb={"MARKUP":15,"ACCUMULATION":10,"NEUTRAL":3,"DISTRIBUTION":-20,"MARKDOWN":-25}.get(sig.get("market_phase"),0)
+    sb={"VERY STRONG":12,"STRONG":7,"MEDIUM":3,"WEAK":0}.get(sig.get("strength"),0)
+    tb=10 if sig.get("trend")=="UP" else 3 if sig.get("trend")=="MIXED" else 0
+    rp=sum(x.get("score_penalty",0) for x in (sig.get("reversal_signals") or []))
+    return round(s+rr+vol+pb+sb+tb+rp,2)
 
-def ai_rank_score(sig: Dict) -> float:
-    score    = float(sig.get("score") or 0)
-    rr       = min(float(sig.get("rr") or 0), 5) * 5
-    vol      = min(float(sig.get("volume_ratio") or 0), 3) * 3
-    phase_b  = {"MARKUP": 15, "ACCUMULATION": 10, "NEUTRAL": 3, "DISTRIBUTION": -20, "MARKDOWN": -25}.get(
-                sig.get("market_phase"), 0)
-    str_b    = {"VERY STRONG": 12, "STRONG": 7, "MEDIUM": 3, "WEAK": 0}.get(sig.get("strength"), 0)
-    trend_b  = 10 if sig.get("trend") == "UP" else 3 if sig.get("trend") == "MIXED" else 0
-    rev_pen  = sum(s.get("score_penalty", 0) for s in (sig.get("reversal_signals") or []))
-    return round(score + rr + vol + phase_b + str_b + trend_b + rev_pen, 2)
-
-def classify_action(sig: Optional[Dict]) -> str:
+def classify_action(sig):
     if not sig: return "NO_DATA"
-    if sig.get("model_action") == "BUY":
-        phase = sig.get("market_phase", "")
-        if phase == "ACCUMULATION": return "BUY — تجميع"
-        if phase == "MARKUP":       return "BUY — صعود"
+    if sig.get("data_is_stale"): return "STALE_DATA"
+    if sig.get("model_action")=="BUY":
+        p=sig.get("market_phase","")
+        if p=="ACCUMULATION": return "BUY — تجميع"
+        if p=="MARKUP": return "BUY — صعود"
         return "BUY"
-    if sig.get("strength") == "VERY STRONG": return "STRONG WATCH"
-    if sig.get("strength") in ["STRONG", "MEDIUM"]: return "WATCH"
+    if sig.get("strength")=="VERY STRONG": return "STRONG WATCH"
+    if sig.get("strength") in ["STRONG","MEDIUM"]: return "WATCH"
     return "WEAK WATCH"
 
-def ai_comment_v20(sig: Optional[Dict]) -> str:
+def ai_comment_v20(sig):
     if not sig: return "No data"
-    phase = sig.get("market_phase", "NEUTRAL")
-    rev   = sig.get("reversal_signals") or []
-    if phase == "DISTRIBUTION": return "⚠️ تصريف — مؤسسات تبيع، تجنب الشراء"
-    if phase == "MARKDOWN":     return "❌ هبوط — ابتعد تماماً"
-    if any(s["severity"] == "CRITICAL" for s in rev): return "⚠️ إشارة انعكاس قوية — انتظر"
-    if sig.get("model_action") == "BUY":
-        return f"✅ فرصة {phase} — دخول متحكم به"
-    if sig.get("strength") == "VERY STRONG":
-        return f"👀 مراقبة قوية — {phase}"
-    return f"مراقبة — {phase}"
+    if sig.get("data_is_stale"): return f"⚠️ بيانات قديمة ({sig.get('candle_age_hours',0)}h) — انتظر تحديث"
+    p=sig.get("market_phase","NEUTRAL"); rev=sig.get("reversal_signals") or []
+    if p=="DISTRIBUTION": return "⚠️ تصريف — مؤسسات تبيع"
+    if p=="MARKDOWN": return "❌ هبوط — ابتعد"
+    if any(s["severity"]=="CRITICAL" for s in rev): return "⚠️ انعكاس قوي — انتظر"
+    if sig.get("model_action")=="BUY": return f"✅ فرصة {p}"
+    if sig.get("strength")=="VERY STRONG": return f"👀 مراقبة قوية — {p}"
+    return f"مراقبة — {p}"
 
-def no_data_result(symbol, reason, h1_count=0, d1_count=0):
-    return {
-        "symbol": normalize_symbol(symbol), "has_data": False,
-        "action": "NO_DATA", "model_action": "NO_DATA",
-        "display_action": "NO_DATA", "reason": reason,
-        "ai_comment": reason, "score": None, "rank_score": None,
-        "strength": None, "price": None, "rr": None,
-        "market_phase": None, "h1_count": h1_count, "d1_count": d1_count,
-    }
+def no_data_result(symbol,reason,h1=0,d1=0):
+    return {"symbol":normalize_symbol(symbol),"has_data":False,"action":"NO_DATA",
+            "model_action":"NO_DATA","display_action":"NO_DATA","reason":reason,
+            "ai_comment":reason,"score":None,"rank_score":None,"strength":None,
+            "price":None,"rr":None,"market_phase":None,"h1_count":h1,"d1_count":d1}
 
-def analyze_symbol(symbol: str, scan_type: str = "ALL") -> List[Dict]:
-    symbol    = normalize_symbol(symbol)
-    scan_type = scan_type.upper()
-    if scan_type == "COMBINED": scan_type = "ALL"
+def analyze_symbol(symbol,scan_type="ALL"):
+    symbol=normalize_symbol(symbol); st=scan_type.upper()
+    if st=="COMBINED": st="ALL"
+    h1=get_candles(symbol,"60",100); d1=get_candles(symbol,"1D",100); sigs=[]
+    if st in ["ALL","HOURLY"]:
+        s=build_signal_v20(symbol,"SHORT_SWING",h1,d1)
+        if s: sigs.append(s)
+    if st in ["ALL","DAILY"]:
+        s=build_signal_v20(symbol,"LONG_SWING",d1,d1)
+        if s: sigs.append(s)
+    return sigs
 
-    h1 = get_candles(symbol, "60", 100)
-    d1 = get_candles(symbol, "1D", 100)
-    signals = []
+def analyze_symbol_from_cache(symbol,scan_type,cache):
+    symbol=normalize_symbol(symbol); st=scan_type.upper()
+    if st=="COMBINED": st="ALL"
+    h1=cache.get(symbol,{}).get("60",[]); d1=cache.get(symbol,{}).get("1D",[]); sigs=[]
+    if st in ["ALL","HOURLY"]:
+        s=build_signal_v20(symbol,"SHORT_SWING",h1,d1)
+        if s: sigs.append(s)
+    if st in ["ALL","DAILY"]:
+        s=build_signal_v20(symbol,"LONG_SWING",d1,d1)
+        if s: sigs.append(s)
+    return sigs
+# ── DECISION LOCK ─────────────────────────────────────────────
 
-    if scan_type in ["ALL", "HOURLY"]:
-        sig = build_signal_v20(symbol, "SHORT_SWING", h1, d1)
-        if sig: signals.append(sig)
-
-    if scan_type in ["ALL", "DAILY"]:
-        sig = build_signal_v20(symbol, "LONG_SWING", d1, d1)
-        if sig: signals.append(sig)
-
-    return signals
-
-def analyze_symbol_from_cache(symbol: str, scan_type: str, candle_cache: Dict) -> List[Dict]:
-    symbol    = normalize_symbol(symbol)
-    scan_type = scan_type.upper()
-    if scan_type == "COMBINED": scan_type = "ALL"
-
-    h1 = candle_cache.get(symbol, {}).get("60", [])
-    d1 = candle_cache.get(symbol, {}).get("1D", [])
-    signals = []
-
-    if scan_type in ["ALL", "HOURLY"]:
-        sig = build_signal_v20(symbol, "SHORT_SWING", h1, d1)
-        if sig: signals.append(sig)
-
-    if scan_type in ["ALL", "DAILY"]:
-        sig = build_signal_v20(symbol, "LONG_SWING", d1, d1)
-        if sig: signals.append(sig)
-
-    return signals
-
-# ============================================================
-# V20: DECISION LOCK SYSTEM
-# ============================================================
-
-def get_locked_decision(symbol: str) -> Optional[Dict]:
-    """يجلب القرار المقفل الحالي للسهم"""
+def get_locked_decision(symbol):
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT * FROM v20_decision_lock
-                WHERE symbol=%s AND status='LOCKED'
-            """, (normalize_symbol(symbol),))
-            return cur.fetchone()
-    except Exception:
-        return None
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v20_decision_lock WHERE symbol=%s AND status='LOCKED'",(normalize_symbol(symbol),))
+            return c.fetchone()
+    except: return None
 
-def should_override_decision(existing: Dict, new_score: float,
-                              new_phase: str, has_critical_reversal: bool) -> Tuple[bool, str]:
-    """
-    هل نغير القرار؟
-    القواعد:
-    1. إذا في انعكاس حرج (Volume Climax / Bearish Divergence CRITICAL) — نغير فوراً
-    2. إذا تغير المرحلة من MARKUP إلى DISTRIBUTION — نغير فوراً
-    3. خلال أول 3 أيام — لا تغيير إلا بفارق 20+ نقطة
-    4. غير ذلك — فارق 18+ نقطة مطلوب
-    """
-    old_score   = float(existing.get("score") or 0)
-    locked_at   = parse_dt(str(existing.get("locked_at") or ""))
-    hold_days   = business_days_between(locked_at, utc_now_dt()) if locked_at else 99
-    old_phase   = existing.get("market_phase", "NEUTRAL")
-    score_delta = abs(new_score - old_score)
+def should_override_decision(existing,new_score,new_phase,has_crit):
+    old=float(existing.get("score") or 0)
+    la=parse_dt(str(existing.get("locked_at") or ""))
+    hd=business_days_between(la,utc_now_dt()) if la else 99
+    op=existing.get("market_phase","NEUTRAL"); delta=abs(new_score-old)
+    if has_crit: return True,"critical_reversal_detected"
+    if new_phase in ["DISTRIBUTION","MARKDOWN"] and op not in ["DISTRIBUTION","MARKDOWN"]: return True,"phase_turned_negative"
+    if hd<DECISION_MIN_HOLD_DAYS:
+        return (True,"major_score_shift") if delta>=20 else (False,f"locked_{hd}d")
+    return (True,"score_delta_exceeded") if delta>=DECISION_CHANGE_DELTA else (False,f"stable_hold")
 
-    # الأولوية الأولى: انعكاس حرج
-    if has_critical_reversal:
-        return True, "critical_reversal_detected"
-
-    # الأولوية الثانية: تحول من مرحلة إيجابية لسلبية
-    bad_phases = ["DISTRIBUTION", "MARKDOWN"]
-    if new_phase in bad_phases and old_phase not in bad_phases:
-        return True, "phase_turned_negative"
-
-    # خلال فترة القفل الأساسية
-    if hold_days < DECISION_MIN_HOLD_DAYS:
-        if score_delta >= 20:
-            return True, "major_score_shift"
-        return False, f"locked_{hold_days}_days_delta_{round(score_delta, 1)}"
-
-    # بعد فترة القفل
-    if score_delta >= DECISION_CHANGE_DELTA:
-        return True, "score_delta_exceeded"
-
-    return False, f"stable_hold_delta_{round(score_delta, 1)}"
-
-def update_decision_lock(symbol: str, sig: Optional[Dict]):
-    """يحدث أو يُنشئ decision lock للسهم"""
-    if not sig or not sig.get("has_data"):
-        return
-
-    symbol    = normalize_symbol(symbol)
-    new_score = float(sig.get("score") or 0)
-    new_phase = sig.get("market_phase", "NEUTRAL")
-    has_crit  = any(
-        s.get("severity") in ["CRITICAL", "STRONG"]
-        for s in (sig.get("reversal_signals") or [])
-    )
-
-    existing = get_locked_decision(symbol)
-
-    if existing:
-        override, reason = should_override_decision(existing, new_score, new_phase, has_crit)
-        if not override:
-            # فقط نحدث السعر الحالي وآخر فحص
+def update_decision_lock(symbol,sig):
+    if not sig or not sig.get("has_data"): return
+    symbol=normalize_symbol(symbol); ns=float(sig.get("score") or 0)
+    np=sig.get("market_phase","NEUTRAL")
+    hc=any(s.get("severity") in ["CRITICAL","STRONG"] for s in (sig.get("reversal_signals") or []))
+    ex=get_locked_decision(symbol)
+    if ex:
+        ov,reason=should_override_decision(ex,ns,np,hc)
+        if not ov:
             try:
                 with get_db() as conn:
-                    cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE v20_decision_lock SET
-                            last_checked_at=%s,
-                            entry_price=(entry_price * 0.7 + %s * 0.3)
-                        WHERE symbol=%s AND status='LOCKED'
-                    """, (utc_now(), sig.get("price"), symbol))
-            except Exception:
-                pass
+                    conn.cursor().execute("UPDATE v20_decision_lock SET last_checked_at=%s,entry_price=(entry_price*0.7+%s*0.3) WHERE symbol=%s AND status='LOCKED'",(utc_now(),sig.get("price"),symbol))
+            except: pass
             return
-
-        lock_reason = reason
-    else:
-        lock_reason = "new_signal"
-
-    # نسجل القرار الجديد
-    decision = sig.get("model_action", "WATCH")
-    if new_phase in ["DISTRIBUTION", "MARKDOWN"]:
-        decision = "AVOID"
-
+        lr=reason
+    else: lr="new_signal"
+    dec=sig.get("model_action","WATCH")
+    if np in ["DISTRIBUTION","MARKDOWN"]: dec="AVOID"
     try:
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO v20_decision_lock (
-                    symbol, decision, confidence, score, entry_price,
-                    entry_low, entry_high, stop_loss, target1, target2, target3,
-                    estimated_days, market_phase, signal_type, lock_reason,
-                    locked_at, last_checked_at, status, payload
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'LOCKED',%s)
+            conn.cursor().execute("""INSERT INTO v20_decision_lock
+                (symbol,decision,confidence,score,entry_price,entry_low,entry_high,stop_loss,
+                target1,target2,target3,estimated_days,market_phase,signal_type,lock_reason,
+                locked_at,last_checked_at,status,payload)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'LOCKED',%s)
                 ON CONFLICT(symbol) DO UPDATE SET
-                    decision=EXCLUDED.decision, confidence=EXCLUDED.confidence,
-                    score=EXCLUDED.score, entry_price=EXCLUDED.entry_price,
-                    entry_low=EXCLUDED.entry_low, entry_high=EXCLUDED.entry_high,
-                    stop_loss=EXCLUDED.stop_loss, target1=EXCLUDED.target1,
-                    target2=EXCLUDED.target2, target3=EXCLUDED.target3,
-                    estimated_days=EXCLUDED.estimated_days,
-                    market_phase=EXCLUDED.market_phase, signal_type=EXCLUDED.signal_type,
-                    lock_reason=EXCLUDED.lock_reason, locked_at=EXCLUDED.locked_at,
-                    last_checked_at=EXCLUDED.last_checked_at, status='LOCKED',
-                    unlock_reason=NULL, payload=EXCLUDED.payload
-            """, (
-                symbol, decision, sig.get("score"), sig.get("score"),
-                sig.get("price"),
-                sig.get("entry_zone", [None, None])[0],
-                sig.get("entry_zone", [None, None])[1],
-                sig.get("stop_loss"), sig.get("target1"),
-                sig.get("target2"), sig.get("target3"),
-                sig.get("estimated_days"), new_phase, sig.get("type"),
-                lock_reason, utc_now(), utc_now(),
-                json.dumps(sig)
-            ))
-    except Exception as e:
-        print(f"Decision lock error: {e}")
+                decision=EXCLUDED.decision,confidence=EXCLUDED.confidence,score=EXCLUDED.score,
+                entry_price=EXCLUDED.entry_price,entry_low=EXCLUDED.entry_low,entry_high=EXCLUDED.entry_high,
+                stop_loss=EXCLUDED.stop_loss,target1=EXCLUDED.target1,target2=EXCLUDED.target2,
+                target3=EXCLUDED.target3,estimated_days=EXCLUDED.estimated_days,
+                market_phase=EXCLUDED.market_phase,signal_type=EXCLUDED.signal_type,
+                lock_reason=EXCLUDED.lock_reason,locked_at=EXCLUDED.locked_at,
+                last_checked_at=EXCLUDED.last_checked_at,status='LOCKED',unlock_reason=NULL,payload=EXCLUDED.payload""",
+                (symbol,dec,sig.get("score"),sig.get("score"),sig.get("price"),
+                sig.get("entry_zone",[None,None])[0],sig.get("entry_zone",[None,None])[1],
+                sig.get("stop_loss"),sig.get("target1"),sig.get("target2"),sig.get("target3"),
+                sig.get("estimated_days"),np,sig.get("type"),lr,utc_now(),utc_now(),json.dumps(sig)))
+    except Exception as e: print(f"lock error:{e}")
 
 def check_decision_exits():
-    """يفحص هل أي قرار مقفل وصل للهدف أو للـ stop"""
-    released = []
+    released=[]
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED'")
-            locks = cur.fetchall()
-
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED'")
+            locks=c.fetchall()
         for lock in locks:
-            symbol = lock["symbol"]
-            candles = get_candles(symbol, "60", 10)
-            if not candles:
-                continue
-            last_price = safe_float(candles[-1]["close"])
-            if not last_price:
-                continue
-
-            target1   = safe_float(lock.get("target1"))
-            stop_loss = safe_float(lock.get("stop_loss"))
-            status    = "LOCKED"
-            reason    = None
-
-            if target1 and last_price >= target1:
-                status = "HIT_TARGET"
-                reason = f"Price {last_price} reached T1 {target1}"
-            elif stop_loss and last_price <= stop_loss:
-                status = "HIT_STOP"
-                reason = f"Price {last_price} hit stop {stop_loss}"
-
-            if status != "LOCKED":
+            sym=lock["symbol"]
+            # FIX: استخدام get_latest_price
+            last_price,_,_=get_latest_price(sym)
+            if not last_price: continue
+            t1=safe_float(lock.get("target1")); sl=safe_float(lock.get("stop_loss"))
+            status="LOCKED"; reason=None
+            if t1 and last_price>=t1: status="HIT_TARGET"; reason=f"Price {last_price} hit T1 {t1}"
+            elif sl and last_price<=sl: status="HIT_STOP"; reason=f"Price {last_price} hit stop {sl}"
+            if status!="LOCKED":
                 with get_db() as conn2:
-                    cur2 = conn2.cursor()
-                    cur2.execute("""
-                        UPDATE v20_decision_lock
-                        SET status=%s, unlock_reason=%s, last_checked_at=%s
-                        WHERE symbol=%s
-                    """, (status, reason, utc_now(), symbol))
-                released.append({"symbol": symbol, "status": status, "reason": reason})
-    except Exception as e:
-        print(f"check_decision_exits error: {e}")
+                    conn2.cursor().execute("UPDATE v20_decision_lock SET status=%s,unlock_reason=%s,last_checked_at=%s WHERE symbol=%s",(status,reason,utc_now(),sym))
+                released.append({"symbol":sym,"status":status,"reason":reason})
+    except Exception as e: print(f"exits error:{e}")
     return released
 
-# ============================================================
-# SCAN ENGINE
-# ============================================================
+# ── SCAN ENGINE ───────────────────────────────────────────────
 
-def save_scan_result(scan_type: str, payload: Dict):
-    scan_type = scan_type.upper()
-    mode = get_ai_mode()
+def save_scan_result(scan_type,payload):
+    mode=get_ai_mode()
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO ai_scan_results(scan_type,mode,created_at,watchlist_count,scanned_count,signals_count,payload)
-            VALUES(%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            scan_type, mode, utc_now(),
-            len(WATCHLIST),
-            payload.get("scanned_count", 0),
-            payload.get("signals_count", 0),
-            json.dumps(payload)
-        ))
+        conn.cursor().execute("INSERT INTO ai_scan_results(scan_type,mode,created_at,watchlist_count,scanned_count,signals_count,payload) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+            (scan_type.upper(),mode,utc_now(),len(WATCHLIST),payload.get("scanned_count",0),payload.get("signals_count",0),json.dumps(payload)))
 
-def latest_scan_result(scan_type: str = "COMBINED") -> Optional[Dict]:
-    scan_type = scan_type.upper()
+def latest_scan_result(scan_type="COMBINED"):
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM ai_scan_results WHERE scan_type=%s ORDER BY id DESC LIMIT 1", (scan_type,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    return json.loads(row["payload"])
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM ai_scan_results WHERE scan_type=%s ORDER BY id DESC LIMIT 1",(scan_type.upper(),))
+        r=c.fetchone()
+    return json.loads(r["payload"]) if r else None
 
-def run_scan(scan_type: str) -> Dict:
-    scan_type = scan_type.upper()
-    if scan_type == "COMBINED": scan_type = "ALL"
-
-    ranked, signals, coverage_rows, errors = [], [], [], []
-    scanned = 0
-
-    candle_cache = get_all_candles_for_scan(220)
-
+def run_scan(scan_type):
+    st=scan_type.upper()
+    if st=="COMBINED": st="ALL"
+    ranked,signals,coverage,errors=[],[],[],[]
+    cache=get_all_candles_for_scan(220)
     for s in WATCHLIST:
-        scanned += 1
-        h1 = candle_cache.get(s, {}).get("60", [])
-        d1 = candle_cache.get(s, {}).get("1D", [])
-        h1_count = len(h1[-30:])
-        d1_count = len(d1[-10:])
-
+        h1=cache.get(s,{}).get("60",[]); d1=cache.get(s,{}).get("1D",[])
+        h1c=len(h1[-30:]); d1c=len(d1[-10:])
         try:
-            sigs = analyze_symbol_from_cache(s, scan_type, candle_cache)
-            best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
-
+            sigs=analyze_symbol_from_cache(s,st,cache)
+            best=max(sigs,key=lambda x:x.get("rank_score",0),default=None)
             if best:
                 ranked.append(best)
-                if best.get("model_action") == "BUY":
-                    signals.append(best)
-                # Update decision lock
-                update_decision_lock(s, best)
-                coverage_rows.append({
-                    "symbol": s, "has_data": True,
-                    "action": classify_action(best),
-                    "model_action": best.get("model_action"),
-                    "score": best.get("score"), "rank_score": best.get("rank_score"),
-                    "strength": best.get("strength"), "price": best.get("price"),
-                    "rr": best.get("rr"), "market_phase": best.get("market_phase"),
-                    "estimated_days": best.get("estimated_days"),
-                    "volume_ratio": best.get("volume_ratio"),
-                    "ai_comment": ai_comment_v20(best),
-                    "h1_count": h1_count, "d1_count": d1_count,
-                })
+                if best.get("model_action")=="BUY": signals.append(best)
+                update_decision_lock(s,best)
+                # FIX: أحدث سعر من cache
+                lp,ltf,lbt=get_latest_price_from_cache(s,cache)
+                coverage.append({"symbol":s,"has_data":True,"action":classify_action(best),
+                    "model_action":best.get("model_action"),"score":best.get("score"),
+                    "rank_score":best.get("rank_score"),"strength":best.get("strength"),
+                    "price":lp,"price_tf":ltf,"price_time":lbt,
+                    "rr":best.get("rr"),"market_phase":best.get("market_phase"),
+                    "estimated_days":best.get("estimated_days"),"volume_ratio":best.get("volume_ratio"),
+                    "ai_comment":ai_comment_v20(best),"data_is_stale":best.get("data_is_stale",False),
+                    "candle_age_hours":best.get("candle_age_hours"),"h1_count":h1c,"d1_count":d1c})
             else:
-                coverage_rows.append(no_data_result(
-                    s, f"insufficient data h1={h1_count} d1={d1_count}", h1_count, d1_count
-                ))
+                coverage.append(no_data_result(s,f"insufficient data h1={h1c} d1={d1c}",h1c,d1c))
         except Exception as e:
-            errors.append({"symbol": s, "error": str(e)})
-            coverage_rows.append(no_data_result(s, str(e), h1_count, d1_count))
-            if len(errors) >= SCAN_MAX_ERRORS:
-                break
-
-    ranked  = sorted(ranked,  key=lambda x: x.get("rank_score", 0), reverse=True)
-    signals = sorted(signals, key=lambda x: x.get("rank_score", 0), reverse=True)
-
-    # Record observations
-    payload = {
-        "ok": True,
-        "version": "V20_INTELLIGENT_CORE",
-        "mode": get_ai_mode(),
-        "scan_type": scan_type,
-        "created_at": utc_now(),
-        "learning_age_days": round(learning_age_days(), 2),
-        "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST),
-        "scanned_count": scanned,
-        "signals_count": len(signals),
-        "signals": signals[:20],
-        "ranked_count": len(ranked),
-        "ranked": ranked,
-        "errors_count": len(errors),
-        "errors": errors[:10],
-        "coverage": sorted(coverage_rows, key=lambda x: (x.get("rank_score") or -1), reverse=True)
-    }
-
-    try:
-        record_observations(payload)
-    except Exception as e:
-        payload["observation_error"] = str(e)
-
+            errors.append({"symbol":s,"error":str(e)}); coverage.append(no_data_result(s,str(e),h1c,d1c))
+            if len(errors)>=SCAN_MAX_ERRORS: break
+    ranked=sorted(ranked,key=lambda x:x.get("rank_score",0),reverse=True)
+    signals=sorted(signals,key=lambda x:x.get("rank_score",0),reverse=True)
+    payload={"ok":True,"version":"V20.1","mode":get_ai_mode(),"scan_type":st,
+        "created_at":utc_now(),"learning_age_days":round(learning_age_days(),2),
+        "learning_remaining_days":round(learning_remaining_days(),2),
+        "watchlist_count":len(WATCHLIST),"scanned_count":len(WATCHLIST),
+        "signals_count":len(signals),"signals":signals[:20],
+        "ranked_count":len(ranked),"ranked":ranked,
+        "errors_count":len(errors),"errors":errors[:10],
+        "coverage":sorted(coverage,key=lambda x:(x.get("rank_score") or -1),reverse=True)}
+    try: record_observations(payload)
+    except Exception as e: payload["observation_error"]=str(e)
     return payload
 
 def save_combined_scan():
-    hourly = latest_scan_result("HOURLY") or {}
-    daily  = latest_scan_result("DAILY") or {}
-
-    all_signals = sorted(
-        hourly.get("signals", []) + daily.get("signals", []),
-        key=lambda x: (x.get("score") or 0, x.get("rr") or 0),
-        reverse=True
-    )[:20]
-
-    all_ranked = sorted(
-        hourly.get("ranked", []) + daily.get("ranked", []),
-        key=lambda x: x.get("rank_score") or 0,
-        reverse=True
-    )
-
-    hcov = {x["symbol"]: x for x in hourly.get("coverage", [])}
-    dcov = {x["symbol"]: x for x in daily.get("coverage",  [])}
-    combined_coverage = []
+    hourly=latest_scan_result("HOURLY") or {}; daily=latest_scan_result("DAILY") or {}
+    all_sigs=sorted(hourly.get("signals",[])+daily.get("signals",[]),key=lambda x:(x.get("score") or 0,x.get("rr") or 0),reverse=True)[:20]
+    all_ranked=sorted(hourly.get("ranked",[])+daily.get("ranked",[]),key=lambda x:x.get("rank_score") or 0,reverse=True)
+    hcov={x["symbol"]:x for x in hourly.get("coverage",[])}; dcov={x["symbol"]:x for x in daily.get("coverage",[])}
+    cov=[]
     for s in WATCHLIST:
-        h = hcov.get(s)
-        d = dcov.get(s)
-        best = h if (h and (not d or (h.get("rank_score") or -1) >= (d.get("rank_score") or -1))) else d
-        combined_coverage.append(best or no_data_result(s, "no_scan"))
+        h=hcov.get(s); d=dcov.get(s)
+        best=h if (h and (not d or (h.get("rank_score") or -1)>=(d.get("rank_score") or -1))) else d
+        cov.append(best or no_data_result(s,"no_scan"))
+    save_scan_result("COMBINED",{"ok":True,"version":"V20.1","mode":get_ai_mode(),"scan_type":"COMBINED",
+        "created_at":utc_now(),"learning_age_days":round(learning_age_days(),2),
+        "learning_remaining_days":round(learning_remaining_days(),2),
+        "watchlist_count":len(WATCHLIST),"scanned_count":len(WATCHLIST),
+        "signals_count":len(all_sigs),"signals":all_sigs,"ranked_count":len(all_ranked),
+        "ranked":all_ranked,"coverage":cov})
 
-    combined = {
-        "ok": True, "version": "V20_INTELLIGENT_CORE",
-        "mode": get_ai_mode(), "scan_type": "COMBINED",
-        "created_at": utc_now(),
-        "learning_age_days": round(learning_age_days(), 2),
-        "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST),
-        "scanned_count": len(WATCHLIST),
-        "signals_count": len(all_signals),
-        "signals": all_signals, "ranked_count": len(all_ranked),
-        "ranked": all_ranked, "coverage": combined_coverage
-    }
-    save_scan_result("COMBINED", combined)
-
-# ============================================================
-# VIRTUAL SIGNALS + OBSERVATIONS
-# ============================================================
+# ── VIRTUAL SIGNALS ───────────────────────────────────────────
 
 def sig_key(sig):
     return f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['stop_loss']}"
 
-def record_virtual_signal(sig) -> bool:
-    if not sig or not sig.get("has_data"):
-        return False
-    key = sig_key(sig)
+def record_virtual_signal(sig):
+    if not sig or not sig.get("has_data"): return False
+    key=sig_key(sig)
     try:
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO ai_virtual_signals
-                (signal_key,mode,symbol,signal_type,timeframe,action,price,
-                 entry_low,entry_high,stop_loss,target1,target2,target3,
-                 score,strength,rr,risk_pct,target_pct,max_hold_days,
-                 estimated_days,market_phase,created_at,status,payload)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
-            """, (
-                key, sig["mode"], sig["symbol"], sig["type"], sig["timeframe"],
-                sig["action"], sig["price"],
-                sig.get("entry_zone", [None, None])[0],
-                sig.get("entry_zone", [None, None])[1],
-                sig["stop_loss"], sig["target1"], sig["target2"], sig["target3"],
-                sig["score"], sig["strength"], sig["rr"], sig["risk_pct"],
-                sig["target_pct"], sig["max_hold_days"],
-                sig.get("estimated_days"), sig.get("market_phase"),
-                utc_now(), json.dumps(sig)
-            ))
+            conn.cursor().execute("""INSERT INTO ai_virtual_signals
+                (signal_key,mode,symbol,signal_type,timeframe,action,price,entry_low,entry_high,
+                stop_loss,target1,target2,target3,score,strength,rr,risk_pct,target_pct,
+                max_hold_days,estimated_days,market_phase,created_at,status,payload)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)""",
+                (key,sig["mode"],sig["symbol"],sig["type"],sig["timeframe"],sig["action"],sig["price"],
+                sig.get("entry_zone",[None,None])[0],sig.get("entry_zone",[None,None])[1],
+                sig["stop_loss"],sig["target1"],sig["target2"],sig["target3"],
+                sig["score"],sig["strength"],sig["rr"],sig["risk_pct"],sig["target_pct"],
+                sig["max_hold_days"],sig.get("estimated_days"),sig.get("market_phase"),
+                utc_now(),json.dumps(sig)))
         return True
-    except psycopg2.errors.UniqueViolation:
-        return False
-    except Exception as e:
-        print(f"record_virtual_signal error: {e}")
-        return False
+    except psycopg2.errors.UniqueViolation: return False
+    except Exception as e: print(f"virtual signal error:{e}"); return False
 
-def evaluate_virtual_signals() -> List[Dict]:
-    if not is_uae_trading_day():
-        return []
-
-    evaluated = []
+def evaluate_virtual_signals():
+    if not is_uae_trading_day(): return []
+    evaluated=[]
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT * FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
-            rows = cur.fetchall()
-
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
+            rows=c.fetchall()
         for sig in rows:
             try:
-                symbol  = sig["symbol"]
-                tf      = normalize_tf(sig["timeframe"])
-                created = parse_dt(sig["created_at"])
-                candles = get_candles(symbol, tf, 400)
-
-                relevant = [
-                    c for c in candles
-                    if (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) and
-                       created and
-                       (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) >= created
-                ]
-                if not relevant:
-                    continue
-
-                max_high    = max(float(x["high"]) for x in relevant)
-                min_low     = min(float(x["low"])  for x in relevant)
-                latest_close= float(relevant[-1]["close"])
-                price       = float(sig["price"])
-                target1     = float(sig["target1"])
-                stop        = float(sig["stop_loss"])
-                max_hold    = int(sig["max_hold_days"] or 7)
-
-                target_hit  = max_high >= target1
-                stop_hit    = min_low <= stop
-
-                status, outcome = "OPEN", None
-                ret_pct = ((latest_close - price) / price) * 100
-
-                if target_hit and not stop_hit:
-                    status, outcome = "CLOSED", "TARGET1_HIT"
-                    ret_pct = ((target1 - price) / price) * 100
-                elif stop_hit and not target_hit:
-                    status, outcome = "CLOSED", "STOP_HIT"
-                    ret_pct = ((stop - price) / price) * 100
-                elif target_hit and stop_hit:
-                    status, outcome = "CLOSED", "BOTH_TOUCHED"
-                    ret_pct = ((stop - price) / price) * 100
-                elif created and business_days_between(created, utc_now_dt()) > max_hold:
-                    status, outcome = "CLOSED", "TIME_EXIT"
-                    ret_pct = ((latest_close - price) / price) * 100
-
+                sym=sig["symbol"]; tf=normalize_tf(sig["timeframe"]); created=parse_dt(sig["created_at"])
+                candles=get_candles(sym,tf,400)
+                rel=[c for c in candles if created and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"]))>=created]
+                if not rel: continue
+                mh=max(float(x["high"]) for x in rel); ml=min(float(x["low"]) for x in rel)
+                lc=float(rel[-1]["close"]); price=float(sig["price"]); t1=float(sig["target1"]); stop=float(sig["stop_loss"])
+                mxh=int(sig["max_hold_days"] or 7)
+                th=mh>=t1; sh=ml<=stop; status="OPEN"; outcome=None
+                ret=((lc-price)/price)*100
+                if th and not sh: status,outcome,ret="CLOSED","TARGET1_HIT",((t1-price)/price)*100
+                elif sh and not th: status,outcome,ret="CLOSED","STOP_HIT",((stop-price)/price)*100
+                elif th and sh: status,outcome,ret="CLOSED","BOTH_TOUCHED",((stop-price)/price)*100
+                elif created and business_days_between(created,utc_now_dt())>mxh: status,outcome="CLOSED","TIME_EXIT"
                 with get_db() as conn2:
-                    cur2 = conn2.cursor()
-                    cur2.execute("""
-                        UPDATE ai_virtual_signals SET
-                            max_high=%s, min_low=%s, bars_checked=%s,
-                            status=%s, outcome=%s, outcome_at=%s
-                        WHERE id=%s
-                    """, (
-                        max_high, min_low, len(relevant), status, outcome,
-                        utc_now() if status == "CLOSED" else None, sig["id"]
-                    ))
-
-                if status == "CLOSED":
-                    update_learning(symbol, ret_pct, sig["signal_type"], is_virtual=True)
-
-                    # V20: Record pattern outcome
-                    payload_data = json.loads(sig["payload"]) if sig.get("payload") else {}
-                    outcome_label = "WIN" if ret_pct > 0 else "LOSS"
-                    record_pattern_outcome(
-                        symbol=symbol,
-                        setup_type=sig.get("signal_type", ""),
-                        market_phase=sig.get("market_phase") or payload_data.get("market_phase", "NEUTRAL"),
-                        rsi_bucket=payload_data.get("rsi_bucket", "UNKNOWN"),
-                        volume_bucket=payload_data.get("volume_bucket", "UNKNOWN"),
-                        trend_alignment=payload_data.get("trend_alignment", "UNKNOWN"),
-                        outcome=outcome_label,
-                        return_pct=round(ret_pct, 2),
-                        score=float(sig.get("score") or 0),
-                        rr=float(sig.get("rr") or 0),
-                    )
-
-                    if ret_pct < 0:
-                        _classify_and_record_failure(symbol, sig, payload_data, ret_pct)
-
-                    evaluated.append({
-                        "id": sig["id"], "symbol": symbol,
-                        "type": sig["signal_type"], "outcome": outcome,
-                        "return_pct": round(ret_pct, 2)
-                    })
-            except Exception as e:
-                print(f"evaluate signal {sig.get('id')} error: {e}")
-                continue
-    except Exception as e:
-        print(f"evaluate_virtual_signals error: {e}")
-
+                    conn2.cursor().execute("UPDATE ai_virtual_signals SET max_high=%s,min_low=%s,bars_checked=%s,status=%s,outcome=%s,outcome_at=%s WHERE id=%s",
+                        (mh,ml,len(rel),status,outcome,utc_now() if status=="CLOSED" else None,sig["id"]))
+                if status=="CLOSED":
+                    update_learning(sym,ret,sig["signal_type"],is_virtual=True)
+                    pd=json.loads(sig["payload"]) if sig.get("payload") else {}
+                    record_pattern_outcome(sym,sig.get("signal_type",""),sig.get("market_phase") or pd.get("market_phase","NEUTRAL"),
+                        pd.get("rsi_bucket","UNKNOWN"),pd.get("volume_bucket","UNKNOWN"),pd.get("trend_alignment","UNKNOWN"),
+                        "WIN" if ret>0 else "LOSS",round(ret,2),float(sig.get("score") or 0),float(sig.get("rr") or 0))
+                    if ret<0: _classify_and_record_failure(sym,sig,pd,ret)
+                    evaluated.append({"id":sig["id"],"symbol":sym,"type":sig["signal_type"],"outcome":outcome,"return_pct":round(ret,2)})
+            except Exception as e: print(f"eval signal error:{e}"); continue
+    except Exception as e: print(f"eval signals error:{e}")
     return evaluated
 
-def _classify_and_record_failure(symbol, sig, payload, ret_pct):
-    vol   = float(payload.get("volume_ratio") or sig.get("volume_ratio") or 0)
-    r_val = float(payload.get("rsi") or 0)
-    rr    = float(sig.get("rr") or 0)
-    phase = payload.get("market_phase") or sig.get("market_phase") or "UNKNOWN"
-    strength = payload.get("strength") or sig.get("strength") or ""
-
-    if phase in ["DISTRIBUTION", "MARKDOWN"]:
-        reason = "DISTRIBUTION_ENTRY"
-        lesson = "لا تشتري في مرحلة التصريف أو الهبوط"
-    elif vol < 0.9:
-        reason = "LOW_VOLUME_REVERSAL"
-        lesson = "تجنب الدخول بحجم ضعيف"
-    elif r_val > 73:
-        reason = "LATE_ENTRY_OVERBOUGHT"
-        lesson = "تجنب الدخول بعد RSI مرتفع جداً"
-    elif rr < 1.0:
-        reason = "POOR_RISK_REWARD"
-        lesson = "اشترط RR >= 1.2 على الأقل"
-    elif strength in ["WEAK", "MEDIUM"]:
-        reason = "LOW_QUALITY_SETUP"
-        lesson = "اشترط قوة STRONG كحد أدنى"
-    elif ret_pct <= -5:
-        reason = "STRUCTURE_FAILED"
-        lesson = "الهيكل فشل — قلل الثقة بالسهم مؤقتاً"
-    else:
-        reason = "NORMAL_LOSS"
-        lesson = "خسارة طبيعية — لا تغيير"
-
+def _classify_and_record_failure(symbol,sig,payload,ret_pct):
+    vol=float(payload.get("volume_ratio") or sig.get("volume_ratio") or 0)
+    rv=float(payload.get("rsi") or 0); rr=float(sig.get("rr") or 0)
+    phase=payload.get("market_phase") or sig.get("market_phase") or "UNKNOWN"
+    strength=payload.get("strength") or sig.get("strength") or ""
+    if phase in ["DISTRIBUTION","MARKDOWN"]: reason,lesson="DISTRIBUTION_ENTRY","لا تشتري في التصريف"
+    elif vol<0.9: reason,lesson="LOW_VOLUME_REVERSAL","تجنب الدخول بحجم ضعيف"
+    elif rv>73: reason,lesson="LATE_ENTRY_OVERBOUGHT","تجنب RSI مرتفع"
+    elif rr<1.0: reason,lesson="POOR_RISK_REWARD","اشترط RR>=1.2"
+    elif strength in ["WEAK","MEDIUM"]: reason,lesson="LOW_QUALITY_SETUP","اشترط STRONG"
+    elif ret_pct<=-5: reason,lesson="STRUCTURE_FAILED","الهيكل فشل"
+    else: reason,lesson="NORMAL_LOSS","خسارة طبيعية"
     try:
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO ai_failure_memory
-                (symbol,setup_type,failure_reason,loss_pct,market_state,lesson,created_at,payload)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (normalize_symbol(symbol), sig.get("signal_type",""),
-                  reason, round(ret_pct, 2), phase, lesson, utc_now(), json.dumps(payload)))
-    except Exception:
-        pass
+            conn.cursor().execute("INSERT INTO ai_failure_memory (symbol,setup_type,failure_reason,loss_pct,market_state,lesson,created_at,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+                (normalize_symbol(symbol),sig.get("signal_type",""),reason,round(ret_pct,2),phase,lesson,utc_now(),json.dumps(payload)))
+    except: pass
 
-def record_observations(scan_payload: Dict) -> int:
-    created = 0
+def record_observations(scan_payload):
+    created=0
     try:
         with get_db() as conn:
-            cur = conn.cursor()
-            for item in scan_payload.get("ranked", []):
-                if not item.get("has_data") or not item.get("price"):
-                    continue
-                key = (f"{item.get('symbol')}-{scan_payload.get('scan_type')}"
-                       f"-{item.get('timeframe')}-{item.get('price')}"
-                       f"-{scan_payload.get('created_at','')[:13]}")
+            c=conn.cursor()
+            for item in scan_payload.get("ranked",[]):
+                if not item.get("has_data") or not item.get("price"): continue
+                key=f"{item.get('symbol')}-{scan_payload.get('scan_type')}-{item.get('timeframe')}-{item.get('price')}-{scan_payload.get('created_at','')[:13]}"
                 try:
-                    cur.execute("""
-                        INSERT INTO ai_observations
-                        (obs_key,symbol,scan_type,timeframe,action,model_action,
-                         strength,score,rank_score,price,observed_at,status,payload)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
-                        ON CONFLICT DO NOTHING
-                    """, (
-                        key, item.get("symbol"), scan_payload.get("scan_type"),
-                        item.get("timeframe"),
-                        item.get("display_action") or item.get("action"),
-                        item.get("model_action"), item.get("strength"),
-                        item.get("score"), item.get("rank_score"), item.get("price"),
-                        scan_payload.get("created_at"), json.dumps(item)
-                    ))
-                    created += cur.rowcount
-                except Exception:
-                    conn.rollback()
-    except Exception as e:
-        print(f"record_observations error: {e}")
+                    c.execute("""INSERT INTO ai_observations
+                        (obs_key,symbol,scan_type,timeframe,action,model_action,strength,score,rank_score,price,observed_at,status,payload)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s) ON CONFLICT DO NOTHING""",
+                        (key,item.get("symbol"),scan_payload.get("scan_type"),item.get("timeframe"),
+                        item.get("display_action") or item.get("action"),item.get("model_action"),
+                        item.get("strength"),item.get("score"),item.get("rank_score"),item.get("price"),
+                        scan_payload.get("created_at"),json.dumps(item)))
+                    created+=c.rowcount
+                except: conn.rollback()
+    except Exception as e: print(f"obs error:{e}")
     return created
 
-def evaluate_observations() -> List[Dict]:
-    if not is_uae_trading_day():
-        return []
-    out = []
+def evaluate_observations():
+    if not is_uae_trading_day(): return []
+    out=[]
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT * FROM ai_observations WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
-            rows = cur.fetchall()
-
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM ai_observations WHERE status='OPEN' ORDER BY id ASC LIMIT 500")
+            rows=c.fetchall()
         for obs in rows:
             try:
-                tf       = normalize_tf(obs["timeframe"] or "60")
-                symbol   = obs["symbol"]
-                observed = parse_dt(obs["observed_at"])
-                candles  = get_candles(symbol, tf, 400)
-                relevant = [
-                    c for c in candles
-                    if observed and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) and
-                       (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) >= observed
-                ]
-                if not relevant: continue
-
-                price    = float(obs["price"] or 0)
-                if price <= 0: continue
-
-                max_high = max(float(x["high"]) for x in relevant)
-                min_low  = min(float(x["low"])  for x in relevant)
-                latest   = float(relevant[-1]["close"])
-                ret_pct  = ((latest - price) / price) * 100
-                max_days = 5 if tf == "60" else 25
-
-                target_hit = ((max_high - price) / price) * 100 >= OBSERVATION_TARGET_PCT
-                drop_hit   = ((price - min_low) / price) * 100 >= OBSERVATION_DROP_PCT
-
-                status, outcome = "OPEN", None
-                if target_hit:
-                    status, outcome = "CLOSED", "WATCH_RALLIED"
-                elif drop_hit:
-                    status, outcome = "CLOSED", "WATCH_DROPPED"
-                elif observed and business_days_between(observed, utc_now_dt()) > max_days:
-                    status, outcome = "CLOSED", "WATCH_TIME_EXIT"
-
+                tf=normalize_tf(obs["timeframe"] or "60"); sym=obs["symbol"]; observed=parse_dt(obs["observed_at"])
+                candles=get_candles(sym,tf,400)
+                rel=[c for c in candles if observed and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"]))>=observed]
+                if not rel: continue
+                price=float(obs["price"] or 0)
+                if price<=0: continue
+                mh=max(float(x["high"]) for x in rel); ml=min(float(x["low"]) for x in rel)
+                lat=float(rel[-1]["close"]); ret=((lat-price)/price)*100; mxd=5 if tf=="60" else 25
+                th=((mh-price)/price)*100>=OBSERVATION_TARGET_PCT; dh=((price-ml)/price)*100>=OBSERVATION_DROP_PCT
+                status,outcome="OPEN",None
+                if th: status,outcome="CLOSED","WATCH_RALLIED"
+                elif dh: status,outcome="CLOSED","WATCH_DROPPED"
+                elif observed and business_days_between(observed,utc_now_dt())>mxd: status,outcome="CLOSED","WATCH_TIME_EXIT"
                 with get_db() as conn2:
-                    cur2 = conn2.cursor()
-                    cur2.execute("""
-                        UPDATE ai_observations SET
-                            max_high=%s,min_low=%s,return_pct=%s,
-                            status=%s,outcome=%s,outcome_at=%s
-                        WHERE id=%s
-                    """, (max_high, min_low, ret_pct, status, outcome,
-                          utc_now() if status == "CLOSED" else None, obs["id"]))
-
-                if status == "CLOSED":
-                    update_learning(symbol, ret_pct, "OBSERVATION", is_virtual=True)
-                    out.append({"symbol": symbol, "outcome": outcome, "return_pct": round(ret_pct, 2)})
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"evaluate_observations error: {e}")
+                    conn2.cursor().execute("UPDATE ai_observations SET max_high=%s,min_low=%s,return_pct=%s,status=%s,outcome=%s,outcome_at=%s WHERE id=%s",
+                        (mh,ml,ret,status,outcome,utc_now() if status=="CLOSED" else None,obs["id"]))
+                if status=="CLOSED": update_learning(sym,ret,"OBSERVATION",is_virtual=True); out.append({"symbol":sym,"outcome":outcome,"return_pct":round(ret,2)})
+            except: continue
+    except Exception as e: print(f"obs eval error:{e}")
     return out
 
-# ============================================================
-# SELF EVALUATION V20 — تقييم ذاتي شامل
-# ============================================================
+# ── SELF EVALUATION ───────────────────────────────────────────
 
-def run_self_evaluation() -> Dict:
-    """
-    التقييم الذاتي الكامل:
-    - Win Rate
-    - Pattern Quality
-    - Phase Detection Accuracy
-    - Decision Stability Score
-    - Readiness Grade
-    """
+def run_self_evaluation():
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-            cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals")
-            total = int(cur.fetchone()["c"])
-
-            cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='CLOSED'")
-            evaluated = int(cur.fetchone()["c"])
-
-            cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE 'TARGET%'")
-            target_hits = int(cur.fetchone()["c"])
-
-            cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'")
-            stop_hits = int(cur.fetchone()["c"])
-
-            cur.execute("""
-                SELECT AVG(rr) avg_rr, AVG(score) avg_score
-                FROM ai_virtual_signals WHERE status='CLOSED'
-            """)
-            rr_row = cur.fetchone()
-
-            cur.execute("SELECT COUNT(*) c FROM ai_failure_memory")
-            lessons_count = int(cur.fetchone()["c"])
-
-            # Pattern win rates - fix timestamp comparison
-            cur.execute("""
-                SELECT market_phase,
-                       SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
-                       COUNT(*) as total
-                FROM v20_pattern_learning
-                WHERE created_at::timestamp > NOW() - INTERVAL '30 days'
-                GROUP BY market_phase
-            """)
-            phase_stats = cur.fetchall()
-
-            # Decision lock stats
-            cur.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='LOCKED'")
-            locked_count = int(cur.fetchone()["c"])
-            cur.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='HIT_TARGET'")
-            lock_hits = int(cur.fetchone()["c"])
-            cur.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='HIT_STOP'")
-            lock_stops = int(cur.fetchone()["c"])
-
-            cur.execute("""
-                SELECT avg_return_pct, (virtual_short_count+virtual_long_count+trades_count) AS cnt
-                FROM ai_learning_stats
-                WHERE (virtual_short_count+virtual_long_count+trades_count) > 0
-            """)
-            learn_rows = cur.fetchall()
-
-        win_rate    = (target_hits / evaluated * 100) if evaluated else 0
-        total_w     = sum(int(r["cnt"] or 0) for r in learn_rows)
-        avg_return  = (
-            sum(float(r["avg_return_pct"] or 0) * int(r["cnt"] or 0) for r in learn_rows) / total_w
-            if total_w else 0
-        )
-        rr_quality  = float(rr_row["avg_rr"] or 0) if rr_row else 0
-        avg_score   = float(rr_row["avg_score"] or 0) if rr_row else 0
-
-        # Phase analysis
-        phase_report = {}
-        for ps in phase_stats:
-            ph   = ps["market_phase"]
-            w    = int(ps["wins"] or 0)
-            tot  = int(ps["total"] or 0)
-            wr   = round(w / tot * 100, 1) if tot else 0
-            phase_report[ph] = {"wins": w, "total": tot, "win_rate_pct": wr}
-
-        # Confidence scoring
-        confidence = 0
-        conf_reasons = []
-
-        if evaluated >= 10:   confidence += 10; conf_reasons.append("+10: 10+ signals evaluated")
-        if evaluated >= 30:   confidence += 10; conf_reasons.append("+10: 30+ signals")
-        if evaluated >= 60:   confidence += 10; conf_reasons.append("+10: 60+ signals")
-        if win_rate >= 50:    confidence += 10; conf_reasons.append("+10: win rate ≥50%")
-        if win_rate >= 60:    confidence += 10; conf_reasons.append("+10: win rate ≥60%")
-        if win_rate >= 68:    confidence += 10; conf_reasons.append("+10: win rate ≥68%")
-        if avg_return > 0:    confidence += 10; conf_reasons.append("+10: avg return positive")
-        if avg_return > 1.5:  confidence += 5;  conf_reasons.append("+5: avg return >1.5%")
-        if rr_quality >= 1.2: confidence += 10; conf_reasons.append("+10: avg RR ≥1.2")
-        if rr_quality >= 1.8: confidence += 5;  conf_reasons.append("+5: avg RR ≥1.8")
-
-        # MARKUP phase working well?
-        mkup = phase_report.get("MARKUP", {})
-        if mkup.get("win_rate_pct", 0) >= 60 and mkup.get("total", 0) >= 5:
-            confidence += 5; conf_reasons.append("+5: MARKUP phase proven")
-
-        # Penalize low performance
-        if win_rate < 40 and evaluated >= 15:
-            confidence -= 15; conf_reasons.append("-15: win rate below 40%")
-        if avg_return < -1:
-            confidence -= 10; conf_reasons.append("-10: avg return negative")
-
-        confidence = max(0, min(100, confidence))
-        age = learning_age_days()
-
-        # State & Readiness
-        if confidence < 35:
-            state = "LEARNING"
-            ready = False
-            recommendation = "🔴 وضع التعلم — لا تداول بأموال حقيقية"
-            grade = "F"
-        elif confidence < 50:
-            state = "DEVELOPING"
-            ready = False
-            recommendation = "🟠 النظام يتطور — مراقبة فقط، لا تداول"
-            grade = "D"
-        elif confidence < 65:
-            state = "STABILIZING"
-            ready = False
-            recommendation = "🟡 يستقر — يمكن تداول تجريبي بمبلغ صغير جداً"
-            grade = "C"
-        elif confidence < 80:
-            state = "STABLE"
-            ready = True
-            recommendation = "🟢 مستقر — تداول ورقي كامل، رأس مال حقيقي صغير ممكن"
-            grade = "B"
-        else:
-            state = "HIGH_CONFIDENCE"
-            ready = True
-            recommendation = "✅ ثقة عالية — جاهز مع إدارة مخاطر صارمة"
-            grade = "A"
-
-        # Additional conditions regardless of confidence
-        if age < LEARNING_DAYS:
-            state = min(state, "STABILIZING")
-            recommendation += f" | ⏳ لا تزال {round(LEARNING_DAYS - age, 1)} يوم تداول باقية للتعلم"
-            ready = False
-
-        result = {
-            "ok": True,
-            "version": "V20",
-            "created_at": utc_now(),
-            "system_state": state,
-            "readiness_grade": grade,
-            "confidence_score": confidence,
-            "ready_for_trading": ready,
-            "recommendation": recommendation,
-            "confidence_breakdown": conf_reasons,
-
-            "learning_age_days": round(age, 2),
-            "learning_days_required": LEARNING_DAYS,
-            "learning_progress_pct": round(min(100, age / LEARNING_DAYS * 100), 1),
-
-            "signals": {
-                "total": total,
-                "evaluated": evaluated,
-                "target_hits": target_hits,
-                "stop_hits": stop_hits,
-                "win_rate_pct": round(win_rate, 2),
-                "avg_return_pct": round(avg_return, 2),
-                "avg_rr": round(rr_quality, 2),
-                "avg_score": round(avg_score, 2),
-            },
-            "phase_performance": phase_report,
-            "decision_locks": {
-                "active": locked_count,
-                "hit_target": lock_hits,
-                "hit_stop": lock_stops,
-            },
-            "lessons_learned": lessons_count,
-        }
-
-        # Save to DB
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT COUNT(*) c FROM ai_virtual_signals"); total=int(c.fetchone()["c"])
+            c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='CLOSED'"); evaluated=int(c.fetchone()["c"])
+            c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE 'TARGET%'"); th=int(c.fetchone()["c"])
+            c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'"); sh=int(c.fetchone()["c"])
+            c.execute("SELECT AVG(rr) avg_rr,AVG(score) avg_score FROM ai_virtual_signals WHERE status='CLOSED'"); rr_row=c.fetchone()
+            c.execute("SELECT COUNT(*) c FROM ai_failure_memory"); lc=int(c.fetchone()["c"])
+            c.execute("""SELECT market_phase,SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) wins,COUNT(*) total
+                FROM v20_pattern_learning WHERE created_at::timestamp>NOW()-INTERVAL '30 days' GROUP BY market_phase""")
+            ps=c.fetchall()
+            c.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='LOCKED'"); locked=int(c.fetchone()["c"])
+            c.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='HIT_TARGET'"); lh=int(c.fetchone()["c"])
+            c.execute("SELECT COUNT(*) c FROM v20_decision_lock WHERE status='HIT_STOP'"); ls=int(c.fetchone()["c"])
+            c.execute("SELECT avg_return_pct,(virtual_short_count+virtual_long_count+trades_count) cnt FROM ai_learning_stats WHERE (virtual_short_count+virtual_long_count+trades_count)>0")
+            lr=c.fetchall()
+        wr=(th/evaluated*100) if evaluated else 0
+        tw=sum(int(r["cnt"] or 0) for r in lr)
+        ar=sum(float(r["avg_return_pct"] or 0)*int(r["cnt"] or 0) for r in lr)/tw if tw else 0
+        rq=float(rr_row["avg_rr"] or 0) if rr_row else 0
+        aq=float(rr_row["avg_score"] or 0) if rr_row else 0
+        phase_report={}
+        for p in ps:
+            ph=p["market_phase"]; w=int(p["wins"] or 0); t=int(p["total"] or 0)
+            phase_report[ph]={"wins":w,"total":t,"win_rate_pct":round(w/t*100,1) if t else 0}
+        conf=0; cr=[]
+        if evaluated>=10: conf+=10; cr.append("+10: 10+ evaluated")
+        if evaluated>=30: conf+=10; cr.append("+10: 30+ signals")
+        if evaluated>=60: conf+=10; cr.append("+10: 60+ signals")
+        if wr>=50: conf+=10; cr.append("+10: WR>=50%")
+        if wr>=60: conf+=10; cr.append("+10: WR>=60%")
+        if wr>=68: conf+=10; cr.append("+10: WR>=68%")
+        if ar>0: conf+=10; cr.append("+10: avg return positive")
+        if ar>1.5: conf+=5; cr.append("+5: avg return>1.5%")
+        if rq>=1.2: conf+=10; cr.append("+10: avg RR>=1.2")
+        if rq>=1.8: conf+=5; cr.append("+5: avg RR>=1.8")
+        mkup=phase_report.get("MARKUP",{})
+        if mkup.get("win_rate_pct",0)>=60 and mkup.get("total",0)>=5: conf+=5; cr.append("+5: MARKUP proven")
+        if wr<40 and evaluated>=15: conf-=15; cr.append("-15: WR<40%")
+        if ar<-1: conf-=10; cr.append("-10: avg return negative")
+        conf=max(0,min(100,conf)); age=learning_age_days()
+        if conf<35: state,ready,rec,grade="LEARNING",False,"🔴 وضع التعلم — لا تداول","F"
+        elif conf<50: state,ready,rec,grade="DEVELOPING",False,"🟠 يتطور — مراقبة فقط","D"
+        elif conf<65: state,ready,rec,grade="STABILIZING",False,"🟡 يستقر — تجريبي فقط","C"
+        elif conf<80: state,ready,rec,grade="STABLE",True,"🟢 مستقر — ورقي كامل","B"
+        else: state,ready,rec,grade="HIGH_CONFIDENCE",True,"✅ ثقة عالية — جاهز","A"
+        if age<LEARNING_DAYS: rec+=f" | ⏳ {round(LEARNING_DAYS-age,1)} يوم باقية"; ready=False
+        result={"ok":True,"version":"V20.1","created_at":utc_now(),"system_state":state,
+            "readiness_grade":grade,"confidence_score":conf,"ready_for_trading":ready,
+            "recommendation":rec,"confidence_breakdown":cr,
+            "learning_age_days":round(age,2),"learning_days_required":LEARNING_DAYS,
+            "learning_progress_pct":round(min(100,age/LEARNING_DAYS*100),1),
+            "signals":{"total":total,"evaluated":evaluated,"target_hits":th,"stop_hits":sh,
+                "win_rate_pct":round(wr,2),"avg_return_pct":round(ar,2),"avg_rr":round(rq,2),"avg_score":round(aq,2)},
+            "phase_performance":phase_report,
+            "decision_locks":{"active":locked,"hit_target":lh,"hit_stop":ls},
+            "lessons_learned":lc}
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO ai_self_evaluation
-                (created_at,system_state,confidence_score,ready_for_trading,
-                 win_rate,avg_return_pct,rr_quality,lessons_count,
-                 pattern_quality,recommendation,payload)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                utc_now(), state, confidence, ready,
-                win_rate, avg_return, rr_quality, lessons_count,
-                float(mkup.get("win_rate_pct", 0)), recommendation,
-                json.dumps(result)
-            ))
-
+            conn.cursor().execute("INSERT INTO ai_self_evaluation (created_at,system_state,confidence_score,ready_for_trading,win_rate,avg_return_pct,rr_quality,lessons_count,pattern_quality,recommendation,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (utc_now(),state,conf,ready,wr,ar,rq,lc,float(mkup.get("win_rate_pct",0)),rec,json.dumps(result)))
         return result
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1000:]}
+    except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-1000:]}
 
-# ============================================================
-# READINESS REPORT (backward compat)
-# ============================================================
+def readiness_report():
+    ev=run_self_evaluation(); sigs=ev.get("signals",{})
+    return {"ok":True,"mode":get_ai_mode(),"status":ev.get("system_state","LEARNING"),
+        "readiness_grade":ev.get("readiness_grade","F"),"confidence_score":ev.get("confidence_score",0),
+        "ready_for_trading":ev.get("ready_for_trading",False),"recommendation":ev.get("recommendation",""),
+        "learning_age_days":ev.get("learning_age_days",0),"learning_days_required":LEARNING_DAYS,
+        "learning_progress_pct":ev.get("learning_progress_pct",0),
+        "total_signals":sigs.get("total",0),"evaluated_signals":sigs.get("evaluated",0),
+        "target_hits":sigs.get("target_hits",0),"stop_hits":sigs.get("stop_hits",0),
+        "open_signals":sigs.get("total",0)-sigs.get("evaluated",0),
+        "win_rate":sigs.get("win_rate_pct",0),"avg_return_pct":sigs.get("avg_return_pct",0)}
 
-def readiness_report() -> Dict:
-    ev = run_self_evaluation()
-    sigs = ev.get("signals", {})
-    return {
-        "ok": True,
-        "mode": get_ai_mode(),
-        "status": ev.get("system_state", "LEARNING"),
-        "readiness_grade": ev.get("readiness_grade", "F"),
-        "confidence_score": ev.get("confidence_score", 0),
-        "ready_for_trading": ev.get("ready_for_trading", False),
-        "recommendation": ev.get("recommendation", ""),
-        "learning_age_days": ev.get("learning_age_days", 0),
-        "learning_days_required": LEARNING_DAYS,
-        "learning_progress_pct": ev.get("learning_progress_pct", 0),
-        "total_signals": sigs.get("total", 0),
-        "evaluated_signals": sigs.get("evaluated", 0),
-        "target_hits": sigs.get("target_hits", 0),
-        "stop_hits": sigs.get("stop_hits", 0),
-        "open_signals": sigs.get("total", 0) - sigs.get("evaluated", 0),
-        "win_rate": sigs.get("win_rate_pct", 0),
-        "avg_return_pct": sigs.get("avg_return_pct", 0),
-    }
-
-def get_signal_stats() -> Dict:
+def get_signal_stats():
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals");                   total    = int(cur.fetchone()["c"])
-        cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='OPEN'"); open_c = int(cur.fetchone()["c"])
-        cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='CLOSED'"); closed = int(cur.fetchone()["c"])
-        cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE 'TARGET%'"); hits = int(cur.fetchone()["c"])
-        cur.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'");  stops= int(cur.fetchone()["c"])
-    return {
-        "total_signals": total, "open_signals": open_c, "closed_signals": closed,
-        "target_hits": hits, "stop_hits": stops,
-        "win_rate": round(hits / closed * 100, 2) if closed else 0,
-    }
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT COUNT(*) c FROM ai_virtual_signals"); total=int(c.fetchone()["c"])
+        c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='OPEN'"); op=int(c.fetchone()["c"])
+        c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE status='CLOSED'"); cl=int(c.fetchone()["c"])
+        c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE 'TARGET%'"); hits=int(c.fetchone()["c"])
+        c.execute("SELECT COUNT(*) c FROM ai_virtual_signals WHERE outcome LIKE '%STOP%'"); stops=int(c.fetchone()["c"])
+    return {"total_signals":total,"open_signals":op,"closed_signals":cl,"target_hits":hits,"stop_hits":stops,
+            "win_rate":round(hits/cl*100,2) if cl else 0}
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+# ── TELEGRAM ─────────────────────────────────────────────────
 
-def tg_api(method, payload):
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"}
+def tg_api(method,payload):
+    if not TELEGRAM_BOT_TOKEN: return {"ok":False,"error":"no token"}
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
-            json=payload, timeout=30
-        )
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "status_code": r.status_code, "text": r.text[:500]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        r=requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",json=payload,timeout=30)
+        try: return r.json()
+        except: return {"ok":False,"text":r.text[:500]}
+    except Exception as e: return {"ok":False,"error":str(e)}
 
-def tg_send(chat_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id, "text": str(text)[:4000],
-        "parse_mode": "HTML", "disable_web_page_preview": True
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_api("sendMessage", payload)
+def tg_send(chat_id,text,reply_markup=None):
+    p={"chat_id":chat_id,"text":str(text)[:4000],"parse_mode":"HTML","disable_web_page_preview":True}
+    if reply_markup: p["reply_markup"]=reply_markup
+    return tg_api("sendMessage",p)
 
-def tg_main_send(text, reply_markup=None):
-    if not TELEGRAM_CHAT_ID:
-        return {"ok": False, "error": "TELEGRAM_CHAT_ID missing"}
-    return tg_send(TELEGRAM_CHAT_ID, text, reply_markup)
+def tg_main_send(text,reply_markup=None):
+    if not TELEGRAM_CHAT_ID: return {"ok":False,"error":"no chat_id"}
+    return tg_send(TELEGRAM_CHAT_ID,text,reply_markup)
 
 def signal_keyboard(symbol):
-    return {"inline_keyboard": [[
-        {"text": "تحليل أعمق", "callback_data": f"more:{symbol}"},
-        {"text": "تجاهل", "callback_data": f"ignore:{symbol}"}
-    ]]}
+    return {"inline_keyboard":[[{"text":"تحليل أعمق","callback_data":f"more:{symbol}"},{"text":"تجاهل","callback_data":f"ignore:{symbol}"}]]}
 
-# ============================================================
-# TELEGRAM FORMATTERS V20
-# ============================================================
+def format_signal_v20(sig):
+    sz=sig.get("position_sizing") or {}; ez=sig.get("entry_zone") or ["-","-"]
+    phase=sig.get("market_phase","-"); rev=sig.get("reversal_signals") or []
+    rt="\n".join(f"⚠️ {s['type']}: {s['message']}" for s in rev) if rev else "لا توجد"
+    stale=f"\n⚠️ بيانات قديمة ({sig.get('candle_age_hours',0)}h)" if sig.get("data_is_stale") else ""
+    pe={"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔","NEUTRAL":"⚪"}.get(phase,"⚪")
+    return f"""<b>{sig.get('symbol','?')} — UAE AI V20.1</b>{stale}
 
-def format_signal_v20(sig: Dict) -> str:
-    size        = sig.get("position_sizing") or {}
-    entry_zone  = sig.get("entry_zone") or ["-", "-"]
-    phase       = sig.get("market_phase", "-")
-    rev_sigs    = sig.get("reversal_signals") or []
-    rev_text    = "\n".join(f"⚠️ {s['type']}: {s['message']}" for s in rev_sigs) if rev_sigs else "لا توجد"
-    est_days    = sig.get("estimated_days", "-")
+{pe} المرحلة: <b>{phase}</b>
+القرار: <b>{sig.get('display_action','-')}</b> | القوة: <b>{sig.get('strength','-')}</b>
+Score: <b>{sig.get('score','-')}</b> | RR: <b>{sig.get('rr','-')}</b> | CMF: <b>{sig.get('cmf','-')}</b>
 
-    phase_emoji = {
-        "ACCUMULATION": "🔵", "MARKUP": "🟢",
-        "DISTRIBUTION": "🔴", "MARKDOWN": "⛔", "NEUTRAL": "⚪"
-    }.get(phase, "⚪")
+💰 السعر: <b>{sig.get('price','-')}</b>
+دخول: <b>{ez[0]} — {ez[1]}</b> | Stop: <b>{sig.get('stop_loss','-')}</b>
 
-    return f"""
-<b>{sig.get('symbol', 'UNKNOWN')} — UAE AI V20</b>
+🎯 T1: <b>{sig.get('target1','-')}</b>
+🎯 T2: <b>{sig.get('target2','-')}</b>
+🎯 T3: <b>{sig.get('target3','-')}</b>
 
-{phase_emoji} المرحلة: <b>{phase}</b>
-نوع الإشارة: <b>{sig.get('type', '-')}</b>
-القرار: <b>{sig.get('display_action', '-')}</b>
-القوة: <b>{sig.get('strength', '-')}</b>
-النقاط: <b>{sig.get('score', '-')}</b>
-RR: <b>{sig.get('rr', '-')}</b>
-CMF: <b>{sig.get('cmf', '-')}</b>
+⏱ ~{sig.get('estimated_days','-')} يوم | خطر: {sig.get('risk_pct','-')}% | هدف: {sig.get('target_pct','-')}%
+📊 RSI:{sig.get('rsi','-')} | حجم:{sig.get('volume_ratio','-')}x
 
-💰 السعر الحالي: <b>{sig.get('price', '-')}</b>
-منطقة الدخول: <b>{entry_zone[0]} — {entry_zone[1]}</b>
-وقف الخسارة: <b>{sig.get('stop_loss', '-')}</b>
+📦 الكمية: {sz.get('qty','-')} | القيمة: {sz.get('position_value','-')} AED
 
-🎯 الهدف الأول:  <b>{sig.get('target1', '-')}</b>
-🎯 الهدف الثاني: <b>{sig.get('target2', '-')}</b>
-🎯 الهدف الثالث: <b>{sig.get('target3', '-')}</b>
+⚠️ انعكاس: {rt}
+{esc(sig.get('reason','-'))}
 
-⏱ تقدير الوصول: <b>{est_days} يوم تداول</b>
-المخاطرة: <b>{sig.get('risk_pct', '-')}%</b>
-الهدف: <b>{sig.get('target_pct', '-')}%</b>
+{DASHBOARD_URL}""".strip()
 
-📊 RSI: {sig.get('rsi', '-')} | حجم: {sig.get('volume_ratio', '-')}x | Momentum: {sig.get('momentum_pct', '-')}%
-
-📦 الحجم المقترح: {size.get('qty', '-')} سهم
-قيمة المركز: {size.get('position_value', '-')} AED
-الحد الأقصى للمخاطرة: {size.get('max_risk_aed', '-')} AED
-
-⚠️ إشارات الانعكاس:
-{rev_text}
-
-السبب: {esc(sig.get('reason', '-'))}
-
-{DASHBOARD_URL}
-""".strip()
-
-def format_daily_report_v20() -> str:
-    ev    = run_self_evaluation()
-    stats = get_signal_stats()
-    scan  = latest_scan_result("COMBINED") or {}
-
-    grade   = ev.get("readiness_grade", "?")
-    state   = ev.get("system_state", "?")
-    conf    = ev.get("confidence_score", 0)
-    ready   = "✅ جاهز" if ev.get("ready_for_trading") else "🔴 غير جاهز"
-    rec     = ev.get("recommendation", "")
-    ph_perf = ev.get("phase_performance", {})
-
-    phase_lines = []
-    for ph, pd in ph_perf.items():
-        phase_lines.append(f"  {ph}: {pd.get('win_rate_pct',0)}% ({pd.get('total',0)} إشارة)")
-
-    top_signals = scan.get("signals", [])[:5]
-    sig_lines = []
-    for s in top_signals:
-        phase_e = {"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔"}.get(s.get("market_phase",""),"⚪")
-        sig_lines.append(
-            f"{phase_e} <b>{s.get('symbol')}</b> | {s.get('type')} | "
-            f"Score:{s.get('score')} | T1:{s.get('target1')} | "
-            f"~{s.get('estimated_days','?')} يوم"
-        )
-
-    locks  = ev.get("decision_locks", {})
-
-    lines = [
-        "<b>🤖 UAE AI V20 — التقرير اليومي</b>",
-        f"📅 {uae_now_dt().strftime('%Y-%m-%d')} | {uae_now_dt().strftime('%H:%M')} UAE",
-        "",
-        "<b>حالة النظام</b>",
-        f"الدرجة: <b>{grade}</b> | الحالة: <b>{state}</b>",
-        f"الثقة: <b>{conf}%</b> | الجاهزية: <b>{ready}</b>",
-        f"التوصية: {rec}",
-        "",
-        f"<b>تقدم التعلم</b>",
-        f"أيام التعلم: {ev.get('learning_age_days',0)} / {LEARNING_DAYS}",
-        f"التقدم: {ev.get('learning_progress_pct',0)}%",
-        "",
-        "<b>الإشارات</b>",
-        f"إجمالي: {stats['total_signals']} | مفتوحة: {stats['open_signals']} | مغلقة: {stats['closed_signals']}",
-        f"أصابت الهدف: {stats['target_hits']} | ضربت الـstop: {stats['stop_hits']}",
-        f"Win Rate: <b>{stats['win_rate']}%</b>",
-        f"متوسط العائد: {ev.get('signals',{}).get('avg_return_pct',0)}%",
-        f"متوسط RR: {ev.get('signals',{}).get('avg_rr',0)}",
-        "",
-        "<b>أداء المراحل</b>",
-    ] + phase_lines + [
-        "",
-        "<b>قفل القرارات</b>",
-        f"مقفلة: {locks.get('active',0)} | أصابت: {locks.get('hit_target',0)} | وقف: {locks.get('hit_stop',0)}",
-        "",
-    ]
-
-    if sig_lines:
-        lines.append("<b>أفضل الإشارات الحالية</b>")
-        lines.extend(sig_lines)
-    else:
-        lines.append("لا توجد إشارات شراء قوية الآن")
-
-    lines += ["", DASHBOARD_URL]
+def format_daily_report_v20():
+    ev=run_self_evaluation(); stats=get_signal_stats(); scan=latest_scan_result("COMBINED") or {}
+    grade=ev.get("readiness_grade","?"); conf=ev.get("confidence_score",0)
+    ready="✅ جاهز" if ev.get("ready_for_trading") else "🔴 غير جاهز"
+    ph_lines=[f"  {ph}: {pd.get('win_rate_pct',0)}% ({pd.get('total',0)} إشارة)" for ph,pd in ev.get("phase_performance",{}).items()]
+    sig_lines=[]
+    for s in scan.get("signals",[])[:5]:
+        pe={"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔"}.get(s.get("market_phase",""),"⚪")
+        sig_lines.append(f"{pe} <b>{s.get('symbol')}</b> | Score:{s.get('score')} | T1:{s.get('target1')} | ~{s.get('estimated_days','?')} يوم")
+    locks=ev.get("decision_locks",{})
+    lines=["<b>🤖 UAE AI V20.1 — التقرير اليومي</b>",
+        f"📅 {uae_now_dt().strftime('%Y-%m-%d %H:%M')} UAE","",
+        f"الدرجة: <b>{grade}</b> | الثقة: <b>{conf}%</b> | {ready}",
+        f"{ev.get('recommendation','')}","",
+        f"أيام التعلم: {ev.get('learning_age_days',0)}/{LEARNING_DAYS} ({ev.get('learning_progress_pct',0)}%)","",
+        f"إشارات: {stats['total_signals']} | مغلقة: {stats['closed_signals']} | Win Rate: <b>{stats['win_rate']}%</b>",
+        f"متوسط العائد: {ev.get('signals',{}).get('avg_return_pct',0)}% | RR: {ev.get('signals',{}).get('avg_rr',0)}","",
+        "<b>أداء المراحل</b>"]+ph_lines+["",
+        f"Locks: {locks.get('active',0)} مقفل | {locks.get('hit_target',0)} هدف | {locks.get('hit_stop',0)} stop",""]
+    lines+=sig_lines if sig_lines else ["لا توجد إشارات شراء الآن"]
+    lines+=[f"",DASHBOARD_URL]
     return "\n".join(lines)
 
-def format_weekly_report_v20() -> str:
-    ev    = run_self_evaluation()
-    stats = get_signal_stats()
-
-    lines = [
-        "<b>🤖 UAE AI V20 — التقرير الأسبوعي</b>",
-        f"📅 أسبوع {uae_now_dt().strftime('%Y-%m-%d')}",
-        "",
+def format_weekly_report_v20():
+    ev=run_self_evaluation(); stats=get_signal_stats()
+    lines=["<b>🤖 UAE AI V20.1 — التقرير الأسبوعي</b>",f"📅 {uae_now_dt().strftime('%Y-%m-%d')}","",
         f"الثقة: <b>{ev.get('confidence_score',0)}%</b> | الدرجة: <b>{ev.get('readiness_grade','?')}</b>",
-        f"الحالة: <b>{ev.get('system_state','?')}</b>",
-        f"التوصية: {ev.get('recommendation','')}",
-        "",
-        f"Win Rate: <b>{stats['win_rate']}%</b>",
-        f"إجمالي الإشارات: {stats['total_signals']}",
-        f"مغلقة: {stats['closed_signals']}",
-        f"الدروس المتعلمة: {ev.get('lessons_learned',0)}",
-        "",
-        "<b>أداء المراحل هذا الأسبوع</b>",
-    ]
-    for ph, pd in ev.get("phase_performance", {}).items():
-        lines.append(f"  {ph}: {pd.get('win_rate_pct',0)}% من {pd.get('total',0)} إشارة")
-
-    lines += ["", DASHBOARD_URL]
+        f"{ev.get('recommendation','')}","",
+        f"Win Rate: <b>{stats['win_rate']}%</b> | إشارات: {stats['total_signals']}",
+        f"الدروس: {ev.get('lessons_learned',0)}","","<b>أداء المراحل</b>"]
+    for ph,pd in ev.get("phase_performance",{}).items():
+        lines.append(f"  {ph}: {pd.get('win_rate_pct',0)}% من {pd.get('total',0)}")
+    lines+=[f"",DASHBOARD_URL]
     return "\n".join(lines)
 
-def format_readiness_alert(ev: Dict) -> str:
-    grade = ev.get("readiness_grade", "?")
-    emoji = {"A":"✅","B":"🟢","C":"🟡","D":"🟠","F":"🔴"}.get(grade, "⚪")
-    return (
-        f"{emoji} <b>تقييم جاهزية النظام V20</b>\n"
-        f"الدرجة: <b>{grade}</b> | الثقة: <b>{ev.get('confidence_score',0)}%</b>\n"
-        f"الحالة: <b>{ev.get('system_state','?')}</b>\n"
-        f"Win Rate: <b>{ev.get('signals',{}).get('win_rate_pct',0)}%</b>\n"
-        f"متوسط RR: <b>{ev.get('signals',{}).get('avg_rr',0)}</b>\n"
-        f"{ev.get('recommendation','')}"
-    )
+def format_readiness_alert(ev):
+    grade=ev.get("readiness_grade","?"); emoji={"A":"✅","B":"🟢","C":"🟡","D":"🟠","F":"🔴"}.get(grade,"⚪")
+    return (f"{emoji} <b>جاهزية V20.1</b>\n"
+            f"الدرجة: <b>{grade}</b> | الثقة: <b>{ev.get('confidence_score',0)}%</b>\n"
+            f"Win Rate: <b>{ev.get('signals',{}).get('win_rate_pct',0)}%</b>\n"
+            f"{ev.get('recommendation','')}")
 
-# ============================================================
-# SCAN JOBS
-# ============================================================
+# ── SCAN JOBS ─────────────────────────────────────────────────
 
-def hourly_scan_job(send: bool = False):
-    scan = run_scan("HOURLY")
-    save_scan_result("HOURLY", scan)
-    for sig in scan.get("signals", []):
-        record_virtual_signal(sig)
-    evaluate_virtual_signals()
-    evaluate_observations()
-    check_decision_exits()
-    save_combined_scan()
-    if send and scan.get("signals"):
-        tg_main_send(_format_scan_summary(scan, "🕐 Hourly Scan V20"))
+def _scan_summary(scan,title):
+    lines=[f"<b>{title}</b>",f"Mode:{scan.get('mode',get_ai_mode())} | إشارات:<b>{scan.get('signals_count',0)}</b>",""]
+    for s in scan.get("signals",[])[:TELEGRAM_TOP_N]:
+        ez=s.get("entry_zone") or ["-","-"]; ph=s.get("market_phase","")
+        pe={"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔"}.get(ph,"⚪")
+        lines.append(f"{pe} <b>{s.get('symbol')}</b> {s.get('type')} | Score:{s.get('score')} | Entry:{ez[0]}-{ez[1]} | T1:{s.get('target1')} | ~{s.get('estimated_days','?')}يوم")
+    if not scan.get("signals"): lines.append("لا توجد إشارات — السوق يحتاج وقتاً")
+    lines+=[f"",DASHBOARD_URL]; return "\n".join(lines)
 
-def daily_scan_job(send: bool = True):
-    scan = run_scan("DAILY")
-    save_scan_result("DAILY", scan)
-    for sig in scan.get("signals", []):
-        record_virtual_signal(sig)
-    evaluate_virtual_signals()
-    evaluate_observations()
-    check_decision_exits()
-    save_combined_scan()
-    if send:
-        tg_main_send(format_daily_report_v20())
+def hourly_scan_job(send=False):
+    scan=run_scan("HOURLY"); save_scan_result("HOURLY",scan)
+    for s in scan.get("signals",[]): record_virtual_signal(s)
+    evaluate_virtual_signals(); evaluate_observations(); check_decision_exits(); save_combined_scan()
+    if send and scan.get("signals"): tg_main_send(_scan_summary(scan,"🕐 Hourly Scan V20.1"))
+
+def daily_scan_job(send=True):
+    scan=run_scan("DAILY"); save_scan_result("DAILY",scan)
+    for s in scan.get("signals",[]): record_virtual_signal(s)
+    evaluate_virtual_signals(); evaluate_observations(); check_decision_exits(); save_combined_scan()
+    if send: tg_main_send(format_daily_report_v20())
 
 def learning_scan_job():
-    hourly = latest_scan_result("HOURLY")
-    daily  = latest_scan_result("DAILY")
-    signals = []
-    if hourly: signals.extend(hourly.get("signals", []))
-    if daily:  signals.extend(daily.get("signals",  []))
-    for sig in signals:
-        record_virtual_signal(sig)
-    evaluate_virtual_signals()
-    evaluate_observations()
+    for scan in [latest_scan_result("HOURLY"),latest_scan_result("DAILY")]:
+        if scan:
+            for s in scan.get("signals",[]): record_virtual_signal(s)
+    evaluate_virtual_signals(); evaluate_observations()
 
-def _format_scan_summary(scan: Dict, title: str) -> str:
-    lines = [
-        f"<b>{title}</b>",
-        f"Mode: {scan.get('mode', get_ai_mode())}",
-        f"إشارات: <b>{scan.get('signals_count', 0)}</b>",
-        "",
-    ]
-    for s in scan.get("signals", [])[:TELEGRAM_TOP_N]:
-        entry = s.get("entry_zone") or ["-", "-"]
-        ph    = s.get("market_phase", "")
-        emoji = {"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔"}.get(ph,"⚪")
-        lines.append(
-            f"{emoji} <b>{s.get('symbol')}</b> {s.get('type')} | "
-            f"Score:{s.get('score')} | "
-            f"Entry:{entry[0]}-{entry[1]} | T1:{s.get('target1')} | "
-            f"~{s.get('estimated_days','?')} يوم"
-        )
-    if not scan.get("signals"):
-        lines.append("لا توجد إشارات شراء قوية — السوق يحتاج وقتاً")
-    lines.extend(["", DASHBOARD_URL])
-    return "\n".join(lines)
-
-# ============================================================
-# BATCH SCAN
-# ============================================================
-
-def get_batch_index() -> int:
+def get_batch_index():
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO batch_scan_state(key,next_index,updated_at)
-            VALUES('main',0,%s) ON CONFLICT(key) DO NOTHING
-        """, (utc_now(),))
-        cur.execute("SELECT next_index FROM batch_scan_state WHERE key='main'")
-        row = cur.fetchone()
-    return int(row[0]) if row else 0
+        c=conn.cursor()
+        c.execute("INSERT INTO batch_scan_state(key,next_index,updated_at) VALUES('main',0,%s) ON CONFLICT(key) DO NOTHING",(utc_now(),))
+        c.execute("SELECT next_index FROM batch_scan_state WHERE key='main'")
+        r=c.fetchone()
+    return int(r[0]) if r else 0
 
-def set_batch_index(i: int):
+def set_batch_index(i):
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO batch_scan_state(key,next_index,updated_at)
-            VALUES('main',%s,%s)
-            ON CONFLICT(key) DO UPDATE SET next_index=EXCLUDED.next_index, updated_at=EXCLUDED.updated_at
-        """, (i, utc_now()))
+        conn.cursor().execute("INSERT INTO batch_scan_state(key,next_index,updated_at) VALUES('main',%s,%s) ON CONFLICT(key) DO UPDATE SET next_index=EXCLUDED.next_index,updated_at=EXCLUDED.updated_at",(i,utc_now()))
 
-# ============================================================
-# FAILURE MEMORY (fallback classify)
-# ============================================================
-
-def record_failure_memory(symbol, setup_type, failure_reason, loss_pct, lesson, payload=None):
+def record_failure_memory(symbol,setup_type,failure_reason,loss_pct,lesson,payload=None):
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO ai_failure_memory
-            (symbol,setup_type,failure_reason,loss_pct,market_state,lesson,created_at,payload)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (normalize_symbol(symbol), setup_type, failure_reason, loss_pct,
-              "UNKNOWN", lesson, utc_now(), json.dumps(payload or {})))
+        conn.cursor().execute("INSERT INTO ai_failure_memory (symbol,setup_type,failure_reason,loss_pct,market_state,lesson,created_at,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+            (normalize_symbol(symbol),setup_type,failure_reason,loss_pct,"UNKNOWN",lesson,utc_now(),json.dumps(payload or {})))
 
-# ============================================================
-# API ROUTES
-# ============================================================
+# ── API ROUTES ────────────────────────────────────────────────
 
 @app.get("/")
 def home():
-    return {
-        "ok": True, "version": "V20_INTELLIGENT_CORE",
-        "mode": get_ai_mode(), "uae_now": uae_now_dt().isoformat(),
-        "is_trading_day": is_uae_trading_day(), "is_market_time": is_uae_market_time(),
-        "learning_age_days": round(learning_age_days(), 2),
-        "learning_remaining_days": round(learning_remaining_days(), 2),
-        "watchlist_count": len(WATCHLIST),
-    }
+    return {"ok":True,"version":"V20.1","mode":get_ai_mode(),"uae_now":uae_now_dt().isoformat(),
+        "is_trading_day":is_uae_trading_day(),"is_market_time":is_uae_market_time(),
+        "learning_age_days":round(learning_age_days(),2),"learning_remaining_days":round(learning_remaining_days(),2),
+        "watchlist_count":len(WATCHLIST)}
 
 @app.get("/api/health")
 @app.get("/api/healthz")
-def health():
-    return {"ok": True, "version": "V20_INTELLIGENT_CORE", "mode": get_ai_mode()}
+def health(): return {"ok":True,"version":"V20.1","mode":get_ai_mode()}
 
 @app.get("/api/watchlist")
-def watchlist_api():
-    return {"ok": True, "count": len(WATCHLIST), "stocks": WATCHLIST}
+def watchlist_api(): return {"ok":True,"count":len(WATCHLIST),"stocks":WATCHLIST}
 
 @app.get("/api/system/mode")
-def api_mode():
-    return {"ok": True, "mode": get_ai_mode(),
-            "learning_age_days": round(learning_age_days(), 2),
-            "learning_remaining_days": round(learning_remaining_days(), 2)}
+def api_mode(): return {"ok":True,"mode":get_ai_mode(),"learning_age_days":round(learning_age_days(),2),"learning_remaining_days":round(learning_remaining_days(),2)}
 
 @app.get("/api/system/set-mode")
-def api_set_mode(mode: str, secret: Optional[str] = None):
-    if not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
-    mode = mode.upper().strip()
-    if mode not in ["LEARNING", "PAPER", "LIVE"]:
-        return {"ok": False, "error": "mode must be LEARNING, PAPER, LIVE"}
-    set_setting("ai_mode", mode)
-    return {"ok": True, "mode": mode}
+def api_set_mode(mode:str,secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    mode=mode.upper().strip()
+    if mode not in ["LEARNING","PAPER","LIVE"]: return {"ok":False,"error":"invalid mode"}
+    set_setting("ai_mode",mode); return {"ok":True,"mode":mode}
 
-# Webhooks
 @app.post("/webhook/tradingview")
 @app.post("/api/webhook/price-alert")
 @app.get("/api/webhook/price-alert")
-async def price_webhook(request: Request, secret: Optional[str] = None):
+async def price_webhook(request:Request,secret:Optional[str]=None):
     try:
-        sec = secret
+        sec=secret
         try:
-            data = await request.json()
-            if not sec: sec = data.get("secret")
-        except Exception:
-            data = dict(request.query_params)
-
-        # قبول SECRET أو CRON_SECRET
-        if sec != SECRET and sec != CRON_SECRET:
-            return {"ok": False, "error": "bad_secret"}
-
-        symbol   = normalize_symbol(data.get("symbol") or data.get("ticker") or "")
-        exchange = str(data.get("exchange") or data.get("source") or "TRADINGVIEW").upper()
-        tf_raw   = str(data.get("timeframe") or data.get("interval") or "60")
-        tf       = normalize_tf(tf_raw)
-
-        # ✅ الـ timeframe في الـ JSON هو المرجع الوحيد
-        # الـ indicator يرسل "1D" أو "60" صريحاً
-        if tf_raw.strip() in ["1D", "1440", "D", "DAY", "DAILY"]:
-            tf = "1D"
-        elif tf_raw.strip() in ["60", "1H", "H1", "1h"]:
-            tf = "60"
-        # fallback: إذا exchange يحتوي DLY وما في timeframe صريح
-        elif is_daily_exchange(exchange) and tf_raw.strip() not in ["60", "1H", "H1"]:
-            tf = "1D"
-
-        o = safe_float(data.get("open")   or data.get("o"))
-        h = safe_float(data.get("high")   or data.get("h"))
-        l = safe_float(data.get("low")    or data.get("l"))
-        c = safe_float(data.get("close")  or data.get("price") or data.get("c"))
-        v = safe_float(data.get("volume") or data.get("v"), 0)
-
-        if not symbol:
-            return {"ok": False, "error": "missing_symbol"}
-        if tf not in ["60", "1D"]:
-            # لا نرفض — نحفظ كـ 60 افتراضياً
-            tf = "60"
-        if None in [o, h, l, c]:
-            return {"ok": False, "error": "missing_ohlc"}
-
+            data=await request.json()
+            if not sec: sec=data.get("secret")
+        except: data=dict(request.query_params)
+        if sec!=SECRET and sec!=CRON_SECRET: return {"ok":False,"error":"bad_secret"}
+        symbol=normalize_symbol(data.get("symbol") or data.get("ticker") or "")
+        exchange=str(data.get("exchange") or data.get("source") or "TRADINGVIEW").upper()
+        tf_raw=str(data.get("timeframe") or data.get("interval") or "60")
+        if tf_raw.strip() in ["1D","1440","D","DAY","DAILY"]: tf="1D"
+        elif tf_raw.strip() in ["60","1H","H1","1h"]: tf="60"
+        elif is_daily_exchange(exchange) and tf_raw.strip() not in ["60","1H","H1"]: tf="1D"
+        else: tf=normalize_tf(tf_raw)
+        o=safe_float(data.get("open") or data.get("o")); h=safe_float(data.get("high") or data.get("h"))
+        l=safe_float(data.get("low") or data.get("l")); cl=safe_float(data.get("close") or data.get("price") or data.get("c"))
+        v=safe_float(data.get("volume") or data.get("v"),0)
+        if not symbol: return {"ok":False,"error":"missing_symbol"}
+        if tf not in ["60","1D"]: tf="60"
+        if None in [o,h,l,cl]: return {"ok":False,"error":"missing_ohlc"}
         with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (symbol, exchange, tf,
-                  parse_bar_time(data.get("time") or data.get("timenow")),
-                  o, h, l, c, v, utc_now()))
-        return {"ok": True, "symbol": symbol, "timeframe": tf, "exchange": exchange, "close": c}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1000:]}
+            conn.cursor().execute("INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (symbol,exchange,tf,parse_bar_time(data.get("time") or data.get("timenow")),o,h,l,cl,v,utc_now()))
+        return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,"close":cl}
+    except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
 
-# Candle endpoints
 @app.get("/api/candles/latest")
-def latest_candles(symbol: Optional[str] = None, timeframe: Optional[str] = None, limit: int = 100):
+def latest_candles(symbol:Optional[str]=None,timeframe:Optional[str]=None,limit:int=100):
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        q, params = "SELECT * FROM candles WHERE 1=1", []
-        if symbol:    q += " AND symbol=%s";    params.append(normalize_symbol(symbol))
-        if timeframe: q += " AND timeframe=%s"; params.append(normalize_tf(timeframe))
-        q += " ORDER BY id DESC LIMIT %s"; params.append(limit)
-        cur.execute(q, tuple(params))
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "candles": rows}
-
-@app.get("/api/admin/fix-daily-candles")
-def fix_daily_candles(secret: Optional[str] = None):
-    """
-    إصلاح الكاندلز اليومية المحفوظة بـ timeframe=60 بدلاً من 1D
-    يحول كل كاندلز DFM_DLY و ADX_DLY من 60 إلى 1D
-    """
-    if not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE candles
-                SET timeframe = '1D'
-                WHERE (
-                    timeframe IN ('60', '1', 'D', 'DAILY', 'DAY', '1440')
-                )
-                AND (
-                    exchange ILIKE '%DLY%'
-                    OR exchange ILIKE '%DAILY%'
-                    OR exchange ILIKE '%DAY%'
-                )
-            """)
-            updated = cur.rowcount
-        return {"ok": True, "updated_rows": updated, "message": f"تم تحويل {updated} كاندل يومي من 60 إلى 1D"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        q,params="SELECT * FROM candles WHERE 1=1",[]
+        if symbol: q+=" AND symbol=%s"; params.append(normalize_symbol(symbol))
+        if timeframe: q+=" AND timeframe=%s"; params.append(normalize_tf(timeframe))
+        q+=" ORDER BY id DESC LIMIT %s"; params.append(limit)
+        c.execute(q,tuple(params)); rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"candles":rows}
 
 @app.get("/api/admin/candle-stats")
 def candle_stats():
-    """إحصائيات الكاندلز في الداتابيز"""
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT timeframe, exchange, COUNT(*) as count,
-                   MIN(bar_time) as oldest, MAX(bar_time) as newest
-            FROM candles
-            GROUP BY timeframe, exchange
-            ORDER BY count DESC
-        """)
-        rows = cur.fetchall()
-        cur.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='1D'")
-        d1_symbols = cur.fetchone()["count"]
-        cur.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='60'")
-        h1_symbols = cur.fetchone()["count"]
-    return {
-        "ok": True,
-        "h1_symbols": h1_symbols,
-        "d1_symbols": d1_symbols,
-        "breakdown": rows
-    }
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT timeframe,exchange,COUNT(*) count,MIN(bar_time) oldest,MAX(bar_time) newest FROM candles GROUP BY timeframe,exchange ORDER BY count DESC")
+        rows=c.fetchall()
+        c.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='1D'"); d1=c.fetchone()["count"]
+        c.execute("SELECT COUNT(DISTINCT symbol) FROM candles WHERE timeframe='60'"); h1=c.fetchone()["count"]
+    return {"ok":True,"h1_symbols":h1,"d1_symbols":d1,"breakdown":rows}
+
+@app.get("/api/admin/fix-daily-candles")
+def fix_daily_candles(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    with get_db() as conn:
+        c=conn.cursor()
+        c.execute("UPDATE candles SET timeframe='1D' WHERE timeframe IN ('60','1','D','DAILY','DAY','1440') AND (exchange ILIKE '%DLY%' OR exchange ILIKE '%DAILY%' OR exchange ILIKE '%DAY%')")
+        u=c.rowcount
+    return {"ok":True,"updated_rows":u}
 
 @app.get("/api/admin/fix-dfm-hourly")
-def fix_dfm_hourly(secret: Optional[str] = None):
-    """
-    إصلاح الكاندلز الساعية من DFM_DLY المحفوظة خطأ كـ 1D
-    الكاندلز اليومية الحقيقية تكون bar_time = 10:00:00 فقط (وقت الإغلاق اليومي)
-    الكاندلز الساعية تكون bar_time في ساعات مختلفة
-    """
-    if not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            # أي كاندل 1D من DFM_DLY ليس وقتها 10:00:00 هو ساعي محفوظ خطأ
-            cur.execute("""
-                UPDATE candles
-                SET timeframe = '60'
-                WHERE timeframe = '1D'
-                  AND exchange = 'DFM_DLY'
-                  AND (
-                    bar_time NOT LIKE '%T10:00:00%'
-                    AND bar_time NOT LIKE '%10:00:00+00:00%'
-                  )
-            """)
-            fixed = cur.rowcount
-        return {"ok": True, "fixed_rows": fixed, "message": f"تم إصلاح {fixed} كاندل ساعي كان محفوظاً كـ 1D"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def fix_dfm_hourly(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    with get_db() as conn:
+        c=conn.cursor()
+        c.execute("UPDATE candles SET timeframe='60' WHERE timeframe='1D' AND exchange='DFM_DLY' AND (bar_time NOT LIKE '%T10:00:00%' AND bar_time NOT LIKE '%10:00:00+00:00%')")
+        f=c.rowcount
+    return {"ok":True,"fixed_rows":f}
 
 @app.get("/api/admin/reset-learning-start")
-def reset_learning_start(secret: Optional[str] = None):
-    """إعادة ضبط تاريخ بداية التعلم للتاريخ الفعلي للبيانات"""
-    if not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
-    try:
-        with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT MIN(created_at) as oldest FROM ai_virtual_signals")
-            row = cur.fetchone()
-        oldest = row["oldest"] if row and row["oldest"] else utc_now()
-        set_setting("learning_started_at", str(oldest))
-        return {"ok": True, "learning_started_at": str(oldest)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def reset_learning_start(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    with get_db() as conn:
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT MIN(created_at) oldest FROM ai_virtual_signals"); r=c.fetchone()
+    oldest=r["oldest"] if r and r["oldest"] else utc_now()
+    set_setting("learning_started_at",str(oldest)); return {"ok":True,"learning_started_at":str(oldest)}
 
 @app.get("/api/watchlist/coverage")
 @app.get("/api/coverage")
 def coverage():
-    out, ready_count = [], 0
+    out,ready_count=[],0
     for s in WATCHLIST:
-        h1 = len(get_candles(s, "60", 35))
-        d1 = len(get_candles(s, "1D", 15))
-        ready = h1 >= MIN_H1_CANDLES and d1 >= MIN_D1_CANDLES
-        if ready: ready_count += 1
-        out.append({"symbol": s, "h1_count": h1, "d1_count": d1, "ready": ready})
-    return {"ok": True, "count": len(out), "ready_count": ready_count, "coverage": out}
+        h1=len(get_candles(s,"60",35)); d1=len(get_candles(s,"1D",15))
+        ready=h1>=MIN_H1_CANDLES and d1>=MIN_D1_CANDLES
+        if ready: ready_count+=1
+        out.append({"symbol":s,"h1_count":h1,"d1_count":d1,"ready":ready})
+    return {"ok":True,"count":len(out),"ready_count":ready_count,"coverage":out}
 
-# Analysis
 @app.get("/api/ai/analyze")
 @app.get("/api/analyze/{symbol}")
-def api_analyze(symbol: str):
-    symbol = normalize_symbol(symbol)
-    sigs   = analyze_symbol(symbol, "ALL")
-    locked = get_locked_decision(symbol)
-    return {"ok": True, "symbol": symbol, "signals": sigs, "locked_decision": locked}
+def api_analyze(symbol:str):
+    symbol=normalize_symbol(symbol); sigs=analyze_symbol(symbol,"ALL"); locked=get_locked_decision(symbol)
+    lp,ltf,lbt=get_latest_price(symbol)
+    return {"ok":True,"symbol":symbol,"latest_price":lp,"price_timeframe":ltf,"price_bar_time":lbt,"signals":sigs,"locked_decision":locked}
 
-# Scans
 @app.get("/api/ai/pro-scan")
-def pro_scan(scan_type: str = "COMBINED", run: bool = False):
-    scan_type = scan_type.upper()
+def pro_scan(scan_type:str="COMBINED",run:bool=False):
     if run:
-        data = run_scan(scan_type)
-        save_scan_result(scan_type, data)
-        return data
-    data = latest_scan_result(scan_type)
-    if not data:
-        return {"ok": True, "message": "No scan yet. Use ?run=true", "signals": [], "coverage": []}
-    return data
+        data=run_scan(scan_type.upper()); save_scan_result(scan_type.upper(),data); return data
+    data=latest_scan_result(scan_type.upper())
+    return data or {"ok":True,"message":"No scan yet. Use ?run=true","signals":[],"coverage":[]}
 
-# Self evaluation
 @app.get("/api/ai/self-evaluation")
-def api_self_evaluation(secret: Optional[str] = None):
-    return run_self_evaluation()
+def api_self_evaluation(secret:Optional[str]=None): return run_self_evaluation()
 
 @app.get("/api/ai/readiness")
-def api_readiness(secret: Optional[str] = None):
-    return readiness_report()
+def api_readiness(secret:Optional[str]=None): return readiness_report()
 
-# Decision locks
 @app.get("/api/ai/decision-locks")
 def api_decision_locks():
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM v20_decision_lock ORDER BY locked_at DESC")
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "locks": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM v20_decision_lock ORDER BY locked_at DESC"); rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"locks":rows}
 
 @app.get("/api/ai/decision/{symbol}")
-def api_decision(symbol: str):
-    lock = get_locked_decision(normalize_symbol(symbol))
-    return {"ok": True, "symbol": symbol, "decision": lock}
+def api_decision(symbol:str): return {"ok":True,"symbol":symbol,"decision":get_locked_decision(normalize_symbol(symbol))}
 
-# Pattern stats
 @app.get("/api/ai/pattern-stats")
-def api_pattern_stats(symbol: Optional[str] = None):
+def api_pattern_stats(symbol:Optional[str]=None):
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        q = """
-            SELECT symbol, market_phase, setup_type, rsi_bucket,
-                   COUNT(*) total,
-                   SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) wins,
-                   AVG(return_pct) avg_return
-            FROM v20_pattern_learning
-            WHERE 1=1
-        """
-        params = []
-        if symbol:
-            q += " AND symbol=%s"; params.append(normalize_symbol(symbol))
-        q += " GROUP BY symbol,market_phase,setup_type,rsi_bucket ORDER BY total DESC LIMIT 100"
-        cur.execute(q, params)
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "patterns": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        q="SELECT symbol,market_phase,setup_type,rsi_bucket,COUNT(*) total,SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) wins,AVG(return_pct) avg_return FROM v20_pattern_learning WHERE 1=1"
+        params=[]
+        if symbol: q+=" AND symbol=%s"; params.append(normalize_symbol(symbol))
+        q+=" GROUP BY symbol,market_phase,setup_type,rsi_bucket ORDER BY total DESC LIMIT 100"
+        c.execute(q,params); rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"patterns":rows}
 
-# Signals
 @app.get("/api/signals/open")
 def get_open_signals():
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT symbol,signal_type,timeframe,action,price,target1,stop_loss,
-                   score,strength,rr,risk_pct,market_phase,estimated_days,created_at,status
-            FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id DESC LIMIT 100
-        """)
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "signals": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT symbol,signal_type,timeframe,action,price,target1,stop_loss,score,strength,rr,risk_pct,market_phase,estimated_days,created_at,status FROM ai_virtual_signals WHERE status='OPEN' ORDER BY id DESC LIMIT 100")
+        rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"signals":rows}
 
 @app.get("/api/signals/completed")
 def get_completed_signals():
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT symbol,signal_type,timeframe,action,price,target1,stop_loss,
-                   score,strength,rr,outcome,outcome_at,max_high,min_low,
-                   market_phase,estimated_days,created_at
-            FROM ai_virtual_signals WHERE status='CLOSED' ORDER BY id DESC LIMIT 100
-        """)
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "signals": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT symbol,signal_type,timeframe,action,price,target1,stop_loss,score,strength,rr,outcome,outcome_at,max_high,min_low,market_phase,estimated_days,created_at FROM ai_virtual_signals WHERE status='CLOSED' ORDER BY id DESC LIMIT 100")
+        rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"signals":rows}
 
-# Portfolio
 @app.get("/api/portfolio")
 def portfolio_list():
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
-        rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "positions": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol"); rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"positions":rows}
 
 @app.get("/api/portfolio/add")
-def portfolio_add(secret: Optional[str]=None, symbol: str="", qty: float=0,
-                  entry: float=0, position_type: str="HOLDING", notes: str=""):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_secret"}
-    symbol = normalize_symbol(symbol)
-    if not symbol or qty <= 0 or entry <= 0:
-        return {"ok": False, "error": "symbol, qty, entry required"}
+def portfolio_add(secret:Optional[str]=None,symbol:str="",qty:float=0,entry:float=0,position_type:str="HOLDING",notes:str=""):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    symbol=normalize_symbol(symbol)
+    if not symbol or qty<=0 or entry<=0: return {"ok":False,"error":"symbol,qty,entry required"}
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO portfolio_positions(symbol,qty,entry_price,position_type,status,notes,created_at,updated_at)
-            VALUES(%s,%s,%s,%s,'OPEN',%s,%s,%s)
-            ON CONFLICT(symbol) DO UPDATE SET qty=EXCLUDED.qty, entry_price=EXCLUDED.entry_price,
-                position_type=EXCLUDED.position_type, notes=EXCLUDED.notes, status='OPEN', updated_at=EXCLUDED.updated_at
-        """, (symbol, qty, entry, position_type, notes, utc_now(), utc_now()))
-    return {"ok": True, "symbol": symbol, "qty": qty, "entry": entry}
+        conn.cursor().execute("INSERT INTO portfolio_positions(symbol,qty,entry_price,position_type,status,notes,created_at,updated_at) VALUES(%s,%s,%s,%s,'OPEN',%s,%s,%s) ON CONFLICT(symbol) DO UPDATE SET qty=EXCLUDED.qty,entry_price=EXCLUDED.entry_price,position_type=EXCLUDED.position_type,notes=EXCLUDED.notes,status='OPEN',updated_at=EXCLUDED.updated_at",
+            (symbol,qty,entry,position_type,notes,utc_now(),utc_now()))
+    return {"ok":True,"symbol":symbol,"qty":qty,"entry":entry}
 
 @app.get("/api/portfolio/monitor")
-def portfolio_monitor(secret: Optional[str] = None):
-    if secret is not None and not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
+def portfolio_monitor(secret:Optional[str]=None):
+    if secret is not None and not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM portfolio_positions WHERE status='OPEN'")
-        positions = cur.fetchall()
-
-    out = []
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN'"); positions=c.fetchall()
+    out=[]
     for p in positions:
-        symbol = p["symbol"]; entry = float(p["entry_price"]); qty = float(p["qty"])
-        candles = get_candles(symbol, "60", 5)
-        last_price = float(candles[-1]["close"]) if candles else None
-        sigs = analyze_symbol(symbol, "ALL")
-        best = max(sigs, key=lambda x: x.get("rank_score",0), default=None)
-        lock = get_locked_decision(symbol)
+        sym=p["symbol"]; entry=float(p["entry_price"]); qty=float(p["qty"])
+        # FIX: أحدث سعر من H1 أو 1D
+        last_price,price_tf,price_time=get_latest_price(sym)
+        sigs=analyze_symbol(sym,"ALL"); best=max(sigs,key=lambda x:x.get("rank_score",0),default=None)
+        lock=get_locked_decision(sym)
+        pnl_pct=((last_price-entry)/entry*100) if last_price else None
+        pnl_aed=((last_price-entry)*qty) if last_price else None
+        price_age=None; is_stale=False
+        if price_time:
+            pt=parse_dt(price_time)
+            if pt:
+                price_age=round((utc_now_dt()-pt).total_seconds()/3600,1)
+                is_stale=price_age>MAX_CANDLE_AGE_HOURS
+        action,reason="HOLD","قرار مستقر"
+        if is_stale: action,reason="STALE_DATA",f"⚠️ بيانات قديمة ({price_age}h)"
+        elif lock and lock.get("decision")=="AVOID": action,reason="EXIT_ALERT","المرحلة تحولت لتصريف"
+        elif best and best.get("market_phase") in ["DISTRIBUTION","MARKDOWN"]: action,reason="EXIT_REVIEW","مرحلة تصريف/هبوط"
+        elif pnl_pct and pnl_pct<=-8: action,reason="RISK_REVIEW",f"خسارة {round(pnl_pct,1)}%"
+        out.append({"symbol":sym,"qty":qty,"entry_price":entry,"last_price":last_price,
+            "price_source":price_tf,"price_time":price_time,"price_age_hours":price_age,
+            "data_is_stale":is_stale,"pnl_pct":round(pnl_pct,2) if pnl_pct is not None else None,
+            "pnl_aed":round(pnl_aed,2) if pnl_aed is not None else None,
+            "action":action,"reason":reason,"market_phase":best.get("market_phase") if best else None,
+            "signal_strength":best.get("strength") if best else None,"score":best.get("score") if best else None,
+            "locked_decision":lock.get("decision") if lock else None})
+    return {"ok":True,"count":len(out),"positions":out}
 
-        pnl_pct = ((last_price - entry) / entry * 100) if last_price else None
-        pnl_aed = ((last_price - entry) * qty) if last_price else None
-
-        action, reason = "HOLD", "قرار مستقر"
-        if lock and lock.get("decision") == "AVOID":
-            action, reason = "EXIT_ALERT", "المرحلة تحولت لتصريف — اخرج"
-        elif best and best.get("market_phase") in ["DISTRIBUTION", "MARKDOWN"]:
-            action, reason = "EXIT_REVIEW", "مرحلة تصريف/هبوط"
-        elif pnl_pct and pnl_pct <= -8:
-            action, reason = "RISK_REVIEW", f"خسارة {round(pnl_pct,1)}% تجاوزت الحد"
-
-        out.append({
-            "symbol": symbol, "qty": qty, "entry_price": entry,
-            "last_price": last_price,
-            "pnl_pct": round(pnl_pct, 2) if pnl_pct else None,
-            "pnl_aed": round(pnl_aed, 2) if pnl_aed else None,
-            "action": action, "reason": reason,
-            "market_phase": best.get("market_phase") if best else None,
-            "signal_strength": best.get("strength") if best else None,
-            "score": best.get("score") if best else None,
-            "locked_decision": lock.get("decision") if lock else None,
-        })
-    return {"ok": True, "count": len(out), "positions": out}
-
-# Reports
 @app.get("/api/reports/daily")
-def daily_report_api(secret: Optional[str]=None, send: bool=False):
-    text = format_daily_report_v20()
-    sent = tg_main_send(text) if send else None
-    return {"ok": True, "sent": send, "telegram": sent, "report": text}
+def daily_report_api(secret:Optional[str]=None,send:bool=False):
+    text=format_daily_report_v20(); sent=tg_main_send(text) if send else None
+    return {"ok":True,"sent":send,"telegram":sent,"report":text}
 
 @app.get("/api/reports/weekly")
-def weekly_report_api(secret: Optional[str]=None, send: bool=False):
-    text = format_weekly_report_v20()
-    sent = tg_main_send(text) if send else None
-    return {"ok": True, "sent": send, "telegram": sent, "report": text}
+def weekly_report_api(secret:Optional[str]=None,send:bool=False):
+    text=format_weekly_report_v20(); sent=tg_main_send(text) if send else None
+    return {"ok":True,"sent":send,"telegram":sent,"report":text}
 
-# Observations
 @app.get("/api/ai/observations")
-def api_observations(limit: int = 100):
-    evaluated = evaluate_observations()
+def api_observations(limit:int=100):
+    ev=evaluate_observations()
     with get_db() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM ai_observations ORDER BY id DESC LIMIT %s", (limit,))
-        rows = cur.fetchall()
-    return {"ok": True, "evaluated_now": evaluated, "count": len(rows), "observations": rows}
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM ai_observations ORDER BY id DESC LIMIT %s",(limit,)); rows=c.fetchall()
+    return {"ok":True,"evaluated_now":ev,"count":len(rows),"observations":rows}
 
 @app.get("/api/ai/learning-scan")
 def api_learning_scan():
-    hourly = latest_scan_result("HOURLY")
-    daily  = latest_scan_result("DAILY")
-    signals = []
-    if hourly: signals.extend(hourly.get("signals", []))
-    if daily:  signals.extend(daily.get("signals",  []))
-    created, evaluated = [], []
-    for sig in signals:
-        if record_virtual_signal(sig):
-            created.append({"symbol": sig["symbol"], "type": sig["type"]})
-    evaluated = evaluate_virtual_signals()
-    obs_ev    = evaluate_observations()
-    return {
-        "ok": True, "mode": get_ai_mode(),
-        "created_count": len(created), "evaluated_count": len(evaluated),
-        "observations_evaluated": len(obs_ev)
-    }
+    hourly=latest_scan_result("HOURLY"); daily=latest_scan_result("DAILY"); signals=[]
+    if hourly: signals.extend(hourly.get("signals",[]))
+    if daily: signals.extend(daily.get("signals",[]))
+    created=[{"symbol":s["symbol"],"type":s["type"]} for s in signals if record_virtual_signal(s)]
+    ev=evaluate_virtual_signals(); ob=evaluate_observations()
+    return {"ok":True,"mode":get_ai_mode(),"created_count":len(created),"evaluated_count":len(ev),"observations_evaluated":len(ob)}
 
-# Telegram
 @app.get("/api/ai/test-telegram")
-def test_telegram():
-    return tg_main_send("✅ UAE AI V20 — اختبار Telegram ناجح!")
+def test_telegram(): return tg_main_send("✅ UAE AI V20.1 — اختبار Telegram ناجح!")
 
 @app.get("/api/telegram/set-webhook")
 def set_webhook():
-    url = f"{BASE_URL}/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
-    return tg_api("setWebhook", {"url": url})
+    return tg_api("setWebhook",{"url":f"{BASE_URL}/api/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"})
 
 @app.post("/api/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != TELEGRAM_WEBHOOK_SECRET:
-        return {"ok": False, "error": "unauthorized"}
-    data = await request.json()
+async def telegram_webhook(secret:str,request:Request):
+    if secret!=TELEGRAM_WEBHOOK_SECRET: return {"ok":False,"error":"unauthorized"}
+    data=await request.json()
     try:
         if "message" in data:
-            msg    = data["message"]
-            chat_id= msg["chat"]["id"]
-            text   = msg.get("text", "").strip()
-            upper  = text.upper()
-
-            if upper in ["READINESS", "جاهزية", "STATUS"]:
-                ev = run_self_evaluation()
-                return tg_send(chat_id, format_readiness_alert(ev))
-
-            if upper in ["DAILY", "تقرير", "تقرير يومي"]:
-                return tg_send(chat_id, format_daily_report_v20())
-
-            if upper in ["WEEKLY", "أسبوعي", "اسبوعي"]:
-                return tg_send(chat_id, format_weekly_report_v20())
-
+            msg=data["message"]; chat_id=msg["chat"]["id"]; text=msg.get("text","").strip(); upper=text.upper()
+            if upper in ["READINESS","جاهزية","STATUS"]: return tg_send(chat_id,format_readiness_alert(run_self_evaluation()))
+            if upper in ["DAILY","تقرير","تقرير يومي"]: return tg_send(chat_id,format_daily_report_v20())
+            if upper in ["WEEKLY","أسبوعي","اسبوعي"]: return tg_send(chat_id,format_weekly_report_v20())
             if upper.startswith("تحليل") or upper.startswith("ANALYZE"):
-                parts = upper.split()
-                if len(parts) >= 2:
-                    sym  = normalize_symbol(parts[1])
-                    sigs = analyze_symbol(sym, "ALL")
-                    if sigs:
-                        best = max(sigs, key=lambda x: x["score"])
-                        return tg_send(chat_id, format_signal_v20(best), signal_keyboard(sym))
-                return tg_send(chat_id, "لا توجد بيانات كافية بعد")
-
-            sym = normalize_symbol(upper.split()[0] if upper.split() else "")
+                parts=upper.split()
+                if len(parts)>=2:
+                    sym=normalize_symbol(parts[1]); sigs=analyze_symbol(sym,"ALL")
+                    if sigs: return tg_send(chat_id,format_signal_v20(max(sigs,key=lambda x:x["score"])),signal_keyboard(sym))
+                return tg_send(chat_id,"لا توجد بيانات كافية")
+            sym=normalize_symbol(upper.split()[0] if upper.split() else "")
             if sym in WATCHLIST:
-                sigs = analyze_symbol(sym, "ALL")
+                sigs=analyze_symbol(sym,"ALL")
                 if sigs:
-                    best = max(sigs, key=lambda x: x["score"])
-                    lock = get_locked_decision(sym)
-                    reply = format_signal_v20(best)
-                    if lock:
-                        reply += f"\n\n🔒 القرار المقفل: {lock.get('decision')} | {lock.get('market_phase')}"
-                    return tg_send(chat_id, reply, signal_keyboard(sym))
-                return tg_send(chat_id, "لا توجد بيانات كافية لهذا السهم")
-
-            return tg_send(chat_id,
-                "أرسل اسم السهم (مثال: EMAAR) أو:\n"
-                "READINESS — جاهزية النظام\n"
-                "DAILY — التقرير اليومي\n"
-                "WEEKLY — التقرير الأسبوعي\n"
-                "ANALYZE EMAAR — تحليل سهم")
-    except Exception as e:
-        print(f"Telegram webhook error: {e}")
-    return {"ok": True}
+                    best=max(sigs,key=lambda x:x["score"]); lock=get_locked_decision(sym)
+                    reply=format_signal_v20(best)
+                    if lock: reply+=f"\n\n🔒 القرار: {lock.get('decision')} | {lock.get('market_phase')}"
+                    return tg_send(chat_id,reply,signal_keyboard(sym))
+            return tg_send(chat_id,"أرسل اسم السهم أو: READINESS / DAILY / WEEKLY / ANALYZE EMAAR")
+    except Exception as e: print(f"tg webhook error:{e}")
+    return {"ok":True}
 
 @app.get("/api/ai/send-alerts")
-def send_alerts(secret: Optional[str] = None, force: bool = False):
-    if secret is not None and not cron_ok(secret):
-        return {"ok": False, "error": "bad_secret"}
-    scan = latest_scan_result("COMBINED")
-    if not scan: return {"ok": False, "message": "No scan yet"}
-    signals = scan.get("signals", [])
-    sent, skipped, errors = [], [], []
-
+def send_alerts(secret:Optional[str]=None,force:bool=False):
+    if secret is not None and not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    scan=latest_scan_result("COMBINED")
+    if not scan: return {"ok":False,"message":"No scan yet"}
+    sent,skipped,errors=[],[],[]
     with get_db() as conn:
-        cur = conn.cursor()
-        for sig in signals[:5]:
+        c=conn.cursor()
+        for sig in scan.get("signals",[])[:5]:
             try:
-                symbol = sig.get("symbol", "")
-
-                # ✅ تحقق من Decision Lock — لا ترسل إلا إذا القرار مقفل
-                lock = get_locked_decision(symbol)
-                if not lock:
-                    skipped.append(f"{symbol}:no_lock")
-                    continue
-
-                # ✅ لا ترسل إذا القرار AVOID
-                if lock.get("decision") == "AVOID":
-                    skipped.append(f"{symbol}:avoid")
-                    continue
-
-                # ✅ مفتاح فريد مبني على تاريخ القفل — يمنع التكرار اليومي
-                lock_date = str(lock.get("locked_at", ""))[:10]
-                key = f"{symbol}-{lock.get('decision')}-{lock_date}"
-
+                sym=sig.get("symbol",""); lock=get_locked_decision(sym)
+                if not lock: skipped.append(f"{sym}:no_lock"); continue
+                if lock.get("decision")=="AVOID": skipped.append(f"{sym}:avoid"); continue
+                key=f"{sym}-{lock.get('decision')}-{str(lock.get('locked_at',''))[:10]}"
                 if not force:
-                    cur.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s", (key,))
-                    if cur.fetchone():
-                        skipped.append(f"{symbol}:already_sent_today")
-                        continue
-
-                tg_main_send(format_signal_v20(sig), signal_keyboard(symbol))
-                cur.execute("""
-                    INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload)
-                    VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
-                """, (key, symbol, sig.get("type"), utc_now(), json.dumps(sig)))
-                sent.append(symbol)
-            except Exception as e:
-                errors.append({"symbol": sig.get("symbol", ""), "error": str(e)})
-
-    return {"ok": True, "sent": sent, "skipped": skipped, "errors": errors}
-
-# ============================================================
-# CRON ENDPOINTS — جدول التشغيل المقترح
-# ============================================================
-# كل ساعة (أثناء ساعات السوق):  /api/cron/hourly-scan
-# مرة يومياً (08:30 UAE):        /api/cron/daily-scan
-# مرة يومياً (15:30 UAE):        /api/cron/end-of-day
-# كل يومين (أي وقت):            /api/cron/weekly-report
-# كل يوم تداول (07:00 UAE):      /api/cron/self-evaluation
-# كل يوم تداول (16:00 UAE):      /api/cron/learning-scan
-
-@app.get("/api/cron/hourly-scan")
-def cron_hourly_scan(secret: Optional[str] = None, send: bool = True):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    run_background_job(hourly_scan_job, send)
-    return {"ok": True, "started": True, "job": "HOURLY_SCAN_V20"}
-
-@app.get("/api/cron/daily-scan")
-def cron_daily_scan(secret: Optional[str] = None, send: bool = True):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    if not is_uae_trading_day():
-        return {"ok": True, "skipped": True, "reason": "UAE weekend"}
-    run_background_job(daily_scan_job, send)
-    return {"ok": True, "started": True, "job": "DAILY_SCAN_V20"}
-
-@app.get("/api/cron/learning-scan")
-def cron_learning_scan(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    run_background_job(learning_scan_job)
-    return {"ok": True, "started": True, "job": "LEARNING_SCAN_V20"}
-
-@app.get("/api/cron/self-evaluation")
-def cron_self_evaluation(secret: Optional[str] = None, send: bool = True):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    ev = run_self_evaluation()
-    if send:
-        tg_main_send(format_readiness_alert(ev))
-    return {"ok": True, "evaluation": ev}
-
-@app.get("/api/cron/end-of-day")
-def cron_end_of_day(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    if not is_uae_trading_day():
-        return {"ok": True, "skipped": True, "reason": "UAE weekend"}
-    try:
-        scan = run_scan("COMBINED")
-        save_scan_result("COMBINED", scan)
-        for sig in scan.get("signals", []):
-            record_virtual_signal(sig)
-        ev = evaluate_virtual_signals()
-        obs = evaluate_observations()
-        exits = check_decision_exits()
-        self_ev = run_self_evaluation()
-        tg_main_send(format_daily_report_v20())
-        return {
-            "ok": True, "scan_signals": scan.get("signals_count", 0),
-            "evaluated": len(ev), "observations": len(obs),
-            "decision_exits": len(exits),
-            "confidence": self_ev.get("confidence_score", 0),
-            "state": self_ev.get("system_state"),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1500:]}
-
-@app.get("/api/cron/daily-report")
-def cron_daily_report(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    if not is_uae_trading_day():
-        return {"ok": True, "skipped": True, "reason": "UAE weekend"}
-    text = format_daily_report_v20()
-    sent = tg_main_send(text)
-    return {"ok": True, "sent": True, "telegram": sent}
-
-@app.get("/api/cron/weekly-report")
-def cron_weekly_report(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    text = format_weekly_report_v20()
-    sent = tg_main_send(text)
-    return {"ok": True, "sent": True, "telegram": sent}
-
-@app.get("/api/cron/portfolio-monitor")
-def cron_portfolio_monitor(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    data = portfolio_monitor(secret)
-    positions = data.get("positions", [])
-    if not positions: return {"ok": True, "message": "No positions"}
-    lines = ["<b>📊 Portfolio Monitor V20</b>", ""]
-    for p in positions:
-        lines.append(
-            f"{p['symbol']} | {p['action']} | "
-            f"PnL {p['pnl_pct']}% | المرحلة: {p.get('market_phase','?')} | {p['reason']}"
-        )
-    tg_main_send("\n".join(lines))
-    return {"ok": True, "count": len(positions)}
-
-@app.get("/api/cron/batch-scan")
-def batch_scan(secret: Optional[str] = None, limit: int = 10, send: bool = False):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    if not is_uae_trading_day(): return {"ok": True, "skipped": True}
-
-    total  = len(WATCHLIST)
-    start  = get_batch_index()
-    end    = min(start + limit, total)
-    batch  = WATCHLIST[start:end]
-    set_batch_index(0 if end >= total else end)
-
-    ranked, batch_signals, coverage_rows = [], [], []
-    candle_cache = get_all_candles_for_scan(220)
-
-    for symbol in batch:
-        try:
-            sigs = analyze_symbol_from_cache(symbol, "ALL", candle_cache)
-            best = max(sigs, key=lambda x: x.get("rank_score", 0), default=None)
-            if best:
-                ranked.append(best)
-                if best.get("model_action") == "BUY":
-                    batch_signals.append(best)
-                update_decision_lock(symbol, best)
-                coverage_rows.append({
-                    "symbol": symbol, "action": classify_action(best),
-                    "score": best.get("score"), "market_phase": best.get("market_phase"),
-                    "estimated_days": best.get("estimated_days"),
-                })
-        except Exception as e:
-            coverage_rows.append({"symbol": symbol, "error": str(e)})
-
-    payload = {
-        "ok": True, "version": "V20", "scan_type": "BATCH",
-        "created_at": utc_now(), "batch_start": start, "batch_end": end,
-        "signals_count": len(batch_signals), "signals": batch_signals[:10],
-        "coverage": coverage_rows
-    }
-    save_scan_result("HOURLY", payload)
-    save_combined_scan()
-
-    for sig in batch_signals:
-        record_virtual_signal(sig)
-    evaluate_virtual_signals()
-    evaluate_observations()
-
-    if send and batch_signals:
-        tg_main_send(_format_scan_summary({"signals": batch_signals, "signals_count": len(batch_signals), "mode": get_ai_mode()}, "📦 Batch Scan"))
-
-    return payload
-
-@app.get("/api/cron/send-alerts")
-def cron_send_alerts(secret: Optional[str] = None, force: bool = False):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
-    return send_alerts(secret=secret, force=force)
+                    c.execute("SELECT id FROM ai_alerts_log WHERE alert_key=%s",(key,))
+                    if c.fetchone(): skipped.append(f"{sym}:already_sent"); continue
+                tg_main_send(format_signal_v20(sig),signal_keyboard(sym))
+                c.execute("INSERT INTO ai_alerts_log(alert_key,symbol,signal_type,created_at,payload) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (key,sym,sig.get("type"),utc_now(),json.dumps(sig)))
+                sent.append(sym)
+            except Exception as e: errors.append({"symbol":sig.get("symbol",""),"error":str(e)})
+    return {"ok":True,"sent":sent,"skipped":skipped,"errors":errors}
 
 @app.get("/api/ai/reset-alerts")
-def reset_alerts(secret: Optional[str] = None):
-    if not cron_ok(secret): return {"ok": False, "error": "bad_secret"}
-    with get_db() as conn:
-        conn.cursor().execute("DELETE FROM ai_alerts_log")
-    return {"ok": True}
+def reset_alerts(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    with get_db() as conn: conn.cursor().execute("DELETE FROM ai_alerts_log")
+    return {"ok":True}
 
-# ============================================================
-# DASHBOARD
-# ============================================================
+# ── CRON ENDPOINTS ────────────────────────────────────────────
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/api/cron/hourly-scan")
+def cron_hourly_scan(secret:Optional[str]=None,send:bool=True):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    run_background_job(hourly_scan_job,send); return {"ok":True,"started":True,"job":"HOURLY_SCAN"}
+
+@app.get("/api/cron/daily-scan")
+def cron_daily_scan(secret:Optional[str]=None,send:bool=True):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
+    run_background_job(daily_scan_job,send); return {"ok":True,"started":True,"job":"DAILY_SCAN"}
+
+@app.get("/api/cron/learning-scan")
+def cron_learning_scan(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    run_background_job(learning_scan_job); return {"ok":True,"started":True,"job":"LEARNING_SCAN"}
+
+@app.get("/api/cron/self-evaluation")
+def cron_self_evaluation(secret:Optional[str]=None,send:bool=True):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    ev=run_self_evaluation()
+    if send: tg_main_send(format_readiness_alert(ev))
+    return {"ok":True,"evaluation":ev}
+
+@app.get("/api/cron/end-of-day")
+def cron_end_of_day(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
+    try:
+        scan=run_scan("COMBINED"); save_scan_result("COMBINED",scan)
+        for s in scan.get("signals",[]): record_virtual_signal(s)
+        ev=evaluate_virtual_signals(); obs=evaluate_observations(); exits=check_decision_exits()
+        self_ev=run_self_evaluation(); tg_main_send(format_daily_report_v20())
+        return {"ok":True,"scan_signals":scan.get("signals_count",0),"evaluated":len(ev),
+            "observations":len(obs),"decision_exits":len(exits),"confidence":self_ev.get("confidence_score",0),"state":self_ev.get("system_state")}
+    except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-1500:]}
+
+@app.get("/api/cron/weekly-report")
+def cron_weekly_report(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    sent=tg_main_send(format_weekly_report_v20()); return {"ok":True,"sent":True,"telegram":sent}
+
+@app.get("/api/cron/portfolio-monitor")
+def cron_portfolio_monitor(secret:Optional[str]=None):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    data=portfolio_monitor(secret); positions=data.get("positions",[])
+    if not positions: return {"ok":True,"message":"No positions"}
+    lines=["<b>📊 Portfolio Monitor V20.1</b>",""]
+    for p in positions:
+        icon="⚠️ " if p.get("data_is_stale") else ""
+        lines.append(f"{icon}{p['symbol']} | {p['action']} | PnL {p['pnl_pct']}% ({p['price_source']}) | {p['reason']}")
+    tg_main_send("\n".join(lines)); return {"ok":True,"count":len(positions)}
+
+@app.get("/api/cron/send-alerts")
+def cron_send_alerts(secret:Optional[str]=None,force:bool=False):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    return send_alerts(secret=secret,force=force)
+
+@app.get("/api/cron/batch-scan")
+def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True}
+    total=len(WATCHLIST); start=get_batch_index(); end=min(start+limit,total)
+    batch=WATCHLIST[start:end]; set_batch_index(0 if end>=total else end)
+    ranked,batch_sigs,cov=[],[],[]
+    cache=get_all_candles_for_scan(220)
+    for sym in batch:
+        try:
+            sigs=analyze_symbol_from_cache(sym,"ALL",cache)
+            best=max(sigs,key=lambda x:x.get("rank_score",0),default=None)
+            if best:
+                ranked.append(best)
+                if best.get("model_action")=="BUY": batch_sigs.append(best)
+                update_decision_lock(sym,best)
+                cov.append({"symbol":sym,"action":classify_action(best),"score":best.get("score"),"market_phase":best.get("market_phase")})
+        except Exception as e: cov.append({"symbol":sym,"error":str(e)})
+    payload={"ok":True,"version":"V20.1","scan_type":"BATCH","created_at":utc_now(),
+        "batch_start":start,"batch_end":end,"signals_count":len(batch_sigs),"signals":batch_sigs[:10],"coverage":cov}
+    save_scan_result("HOURLY",payload); save_combined_scan()
+    for s in batch_sigs: record_virtual_signal(s)
+    evaluate_virtual_signals(); evaluate_observations()
+    if send and batch_sigs: tg_main_send(_scan_summary({"signals":batch_sigs,"signals_count":len(batch_sigs),"mode":get_ai_mode()},"📦 Batch Scan"))
+    return payload
+
+# ── DASHBOARD ─────────────────────────────────────────────────
+
+@app.get("/dashboard",response_class=HTMLResponse)
 def dashboard():
-    scan = latest_scan_result("COMBINED") or {"signals": [], "coverage": [], "ranked": [], "signals_count": 0}
-    ev   = run_self_evaluation()
-    sigs = ev.get("signals", {})
+    scan=latest_scan_result("COMBINED") or {"signals":[],"coverage":[],"ranked":[],"signals_count":0}
+    ev=run_self_evaluation(); sigs=ev.get("signals",{})
+    gc={"A":"#22c55e","B":"#86efac","C":"#fbbf24","D":"#f97316","F":"#ef4444"}.get(ev.get("readiness_grade","F"),"#9ca3af")
+    pc={"ACCUMULATION":"#3b82f6","MARKUP":"#22c55e","DISTRIBUTION":"#ef4444","MARKDOWN":"#7f1d1d","NEUTRAL":"#6b7280"}
 
-    grade_color = {"A": "#22c55e", "B": "#86efac", "C": "#fbbf24", "D": "#f97316", "F": "#ef4444"}.get(
-        ev.get("readiness_grade", "F"), "#9ca3af"
-    )
-
-    phase_colors = {
-        "ACCUMULATION": "#3b82f6", "MARKUP": "#22c55e",
-        "DISTRIBUTION": "#ef4444", "MARKDOWN": "#7f1d1d", "NEUTRAL": "#6b7280"
-    }
-
-    signal_rows = ""
-    for s in scan.get("ranked", [])[:30]:
-        ph      = s.get("market_phase", "NEUTRAL")
-        ph_col  = phase_colors.get(ph, "#6b7280")
-        rev     = s.get("reversal_signals") or []
-        rev_icon= "⚠️" if rev else ""
-        signal_rows += f"""
-        <tr>
-            <td><b>{esc(s.get('symbol',''))}</b></td>
-            <td>{esc(s.get('type',''))}</td>
-            <td style="color:{ph_col}">{esc(ph)}</td>
-            <td><b>{esc(s.get('display_action',''))}</b></td>
-            <td>{esc(s.get('strength',''))}</td>
-            <td>{esc(s.get('score',''))}</td>
-            <td>{esc(s.get('price',''))}</td>
-            <td>{esc(s.get('stop_loss',''))}</td>
-            <td>{esc(s.get('target1',''))}</td>
-            <td>{esc(s.get('estimated_days',''))} يوم</td>
-            <td>{esc(s.get('rr',''))}</td>
-            <td>{esc(s.get('cmf',''))}</td>
-            <td>{rev_icon} {esc(s.get('ai_comment',''))}</td>
-        </tr>"""
-
-    lock_rows = ""
+    # بورتفوليو
+    port_rows=""
     try:
         with get_db() as conn:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED' ORDER BY locked_at DESC")
-            locks = cur.fetchall()
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol"); pp=c.fetchall()
+        for p in pp:
+            sym=p["symbol"]; entry=float(p["entry_price"]); qty=float(p["qty"])
+            lp,ltf,lbt=get_latest_price(sym)
+            pnl_pct=((lp-entry)/entry*100) if lp else None
+            pnl_aed=((lp-entry)*qty) if lp else None
+            stale_warn=""; pst=""
+            if lbt:
+                pt=parse_dt(lbt)
+                if pt:
+                    age=(utc_now_dt()-pt).total_seconds()/3600
+                    if age>MAX_CANDLE_AGE_HOURS: stale_warn=f"⚠️{round(age,0):.0f}h"; pst="color:#f97316"
+            pc_=("#22c55e" if pnl_pct and pnl_pct>=0 else "#ef4444") if pnl_pct is not None else "#94a3b8"
+            port_rows+=f"""<tr>
+            <td><b>{esc(sym)}</b></td><td>{esc(qty)}</td><td>{esc(entry)}</td>
+            <td style="{pst}"><b>{esc(lp or '-')}</b> <small>✓{esc(ltf or '')}</small> {stale_warn}</td>
+            <td style="color:{pc_}"><b>{round(pnl_pct,2) if pnl_pct is not None else '-'}%</b></td>
+            <td style="color:{pc_}">{round(pnl_aed,0) if pnl_aed is not None else '-'} AED</td></tr>"""
+    except: pass
+
+    # قرارات مقفلة
+    lock_rows=""
+    try:
+        with get_db() as conn:
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v20_decision_lock WHERE status='LOCKED' ORDER BY locked_at DESC"); locks=c.fetchall()
         for lk in locks:
-            ph    = lk.get("market_phase","")
-            ph_col= phase_colors.get(ph, "#6b7280")
-            lock_rows += f"""
-            <tr>
-                <td><b>{esc(lk.get('symbol',''))}</b></td>
-                <td>{esc(lk.get('decision',''))}</td>
-                <td style="color:{ph_col}">{esc(ph)}</td>
-                <td>{esc(lk.get('score',''))}</td>
-                <td>{esc(lk.get('entry_price',''))}</td>
-                <td>{esc(lk.get('stop_loss',''))}</td>
-                <td>{esc(lk.get('target1',''))}</td>
-                <td>{esc(lk.get('estimated_days',''))} يوم</td>
-                <td>{esc(lk.get('lock_reason',''))}</td>
-                <td>{esc(lk.get('locked_at','')[:16])}</td>
-            </tr>"""
-    except Exception:
-        pass
+            ph=lk.get("market_phase",""); phc=pc.get(ph,"#6b7280")
+            lp,ltf,_=get_latest_price(lk.get("symbol",""))
+            ep=safe_float(lk.get("entry_price"))
+            diff_txt=""
+            if lp and ep:
+                d=((lp-ep)/ep)*100; dc="#22c55e" if d>=0 else "#ef4444"
+                diff_txt=f'<span style="color:{dc}"> ({round(d,1):+.1f}%)</span>'
+            lock_rows+=f"""<tr>
+            <td><b>{esc(lk.get('symbol',''))}</b></td><td>{esc(lk.get('decision',''))}</td>
+            <td style="color:{phc}">{esc(ph)}</td><td>{esc(lk.get('score',''))}</td>
+            <td>{esc(lp or lk.get('entry_price',''))} <small>✓{esc(ltf or '')}</small>{diff_txt}</td>
+            <td>{esc(lk.get('stop_loss',''))}</td><td>{esc(lk.get('target1',''))}</td>
+            <td>{esc(lk.get('estimated_days',''))} يوم</td>
+            <td>{esc(lk.get('lock_reason',''))}</td><td>{esc(str(lk.get('locked_at',''))[:16])}</td></tr>"""
+    except: pass
+
+    # جدول الأسهم
+    sig_rows=""
+    for s in scan.get("ranked",[])[:30]:
+        ph=s.get("market_phase","NEUTRAL"); phc=pc.get(ph,"#6b7280")
+        rev=s.get("reversal_signals") or []; ri="⚠️" if rev else ""
+        # FIX: جلب أحدث سعر مباشرة
+        lp,ltf,lbt=get_latest_price(s.get("symbol",""))
+        dp=lp if lp else s.get("price","")
+        pan=""; pst=""
+        if lbt:
+            pt=parse_dt(lbt)
+            if pt:
+                age=(utc_now_dt()-pt).total_seconds()/3600
+                if age>MAX_CANDLE_AGE_HOURS: pan=f"⚠️{round(age,0):.0f}h"; pst="color:#f97316"
+                else: pan=f"✓{ltf}"
+        sig_rows+=f"""<tr>
+        <td><b>{esc(s.get('symbol',''))}</b></td><td>{esc(s.get('type',''))}</td>
+        <td style="color:{phc}">{esc(ph)}</td><td><b>{esc(s.get('display_action',''))}</b></td>
+        <td>{esc(s.get('strength',''))}</td><td>{esc(s.get('score',''))}</td>
+        <td style="{pst}"><b>{esc(dp)}</b> <small>{pan}</small></td>
+        <td>{esc(s.get('stop_loss',''))}</td><td>{esc(s.get('target1',''))}</td>
+        <td>{esc(s.get('estimated_days',''))} يوم</td><td>{esc(s.get('rr',''))}</td>
+        <td>{esc(s.get('cmf',''))}</td><td>{ri} {esc(s.get('ai_comment',''))}</td></tr>"""
 
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>UAE PRO AI V20</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Arial, sans-serif; background:#0f172a; color:#e2e8f0; padding:20px; margin:0; }}
-        .card {{ background:#1e293b; padding:20px; border-radius:16px; margin-bottom:20px; border:1px solid #334155; }}
-        .grade {{ font-size:48px; font-weight:bold; color:{grade_color}; }}
-        .stat {{ display:inline-block; margin:8px 16px; text-align:center; }}
-        .stat-val {{ font-size:24px; font-weight:bold; color:#a78bfa; }}
-        .stat-lbl {{ font-size:12px; color:#94a3b8; }}
-        table {{ width:100%; border-collapse:collapse; margin:10px 0; font-size:13px; }}
-        th {{ background:#334155; padding:10px 8px; text-align:right; color:#94a3b8; white-space:nowrap; }}
-        td {{ border-bottom:1px solid #1e293b; padding:8px; white-space:nowrap; }}
-        tr:hover td {{ background:#1e293b; }}
-        h1 {{ color:#a78bfa; margin:0 0 4px; }}
-        h2 {{ color:#60a5fa; margin:20px 0 10px; font-size:16px; }}
-        .badge {{ display:inline-block; padding:2px 8px; border-radius:9999px; font-size:11px; font-weight:bold; }}
-        .badge-green {{ background:#166534; color:#86efac; }}
-        .badge-red   {{ background:#7f1d1d; color:#fca5a5; }}
-        .badge-blue  {{ background:#1e3a5f; color:#93c5fd; }}
-        .rec {{ background:#1e3a5f; border-left:4px solid #3b82f6; padding:12px; border-radius:8px; margin:10px 0; }}
-    </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>UAE PRO AI V20.1</title>
+<style>
+body{{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#e2e8f0;padding:20px;margin:0}}
+.card{{background:#1e293b;padding:20px;border-radius:16px;margin-bottom:20px;border:1px solid #334155}}
+.grade{{font-size:48px;font-weight:bold;color:{gc}}}
+.stat{{display:inline-block;margin:8px 16px;text-align:center}}
+.stat-val{{font-size:24px;font-weight:bold;color:#a78bfa}}
+.stat-lbl{{font-size:12px;color:#94a3b8}}
+table{{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}}
+th{{background:#334155;padding:10px 8px;text-align:right;color:#94a3b8;white-space:nowrap}}
+td{{border-bottom:1px solid #1e293b;padding:8px;white-space:nowrap}}
+tr:hover td{{background:#263548}}
+h1{{color:#a78bfa;margin:0 0 4px}}
+h2{{color:#60a5fa;margin:20px 0 10px;font-size:16px}}
+.rec{{background:#1e3a5f;border-left:4px solid #3b82f6;padding:12px;border-radius:8px;margin:10px 0}}
+.info{{background:#1e3a5f;border:1px solid #3b82f6;padding:8px 12px;border-radius:8px;margin-bottom:16px;font-size:13px}}
+</style>
 </head>
 <body>
-<h1>🤖 UAE PRO AI V20 — Intelligent Core</h1>
+<h1>🤖 UAE PRO AI V20.1</h1>
+<p style="color:#94a3b8;font-size:12px">🕐 {uae_now_dt().strftime('%Y-%m-%d %H:%M')} UAE | تحديث تلقائي كل 5 دقائق</p>
+<div class="info">ℹ️ الأسعار: أحدث سعر من H1 أو 1D — أيهما أحدث | ✓H1=ساعي | ✓1D=يومي | ⚠️Xh=قديم X ساعة</div>
+
 <div class="card">
-    <div class="grade">{ev.get('readiness_grade','?')}</div>
-    <div class="rec">{ev.get('recommendation','')}</div>
-    <div>
-        <div class="stat"><div class="stat-val">{ev.get('confidence_score',0)}%</div><div class="stat-lbl">الثقة</div></div>
-        <div class="stat"><div class="stat-val">{sigs.get('win_rate_pct',0)}%</div><div class="stat-lbl">Win Rate</div></div>
-        <div class="stat"><div class="stat-val">{sigs.get('avg_rr',0)}</div><div class="stat-lbl">Avg RR</div></div>
-        <div class="stat"><div class="stat-val">{sigs.get('avg_return_pct',0)}%</div><div class="stat-lbl">Avg Return</div></div>
-        <div class="stat"><div class="stat-val">{sigs.get('evaluated',0)}</div><div class="stat-lbl">Evaluated</div></div>
-        <div class="stat"><div class="stat-val">{ev.get('learning_progress_pct',0)}%</div><div class="stat-lbl">Learning Progress</div></div>
-        <div class="stat"><div class="stat-val">{scan.get('signals_count',0)}</div><div class="stat-lbl">BUY Signals</div></div>
-        <div class="stat"><div class="stat-val">{scan.get('created_at','')[:16]}</div><div class="stat-lbl">Last Scan</div></div>
-    </div>
+<div class="grade">{ev.get('readiness_grade','?')}</div>
+<div class="rec">{ev.get('recommendation','')}</div>
+<div>
+<div class="stat"><div class="stat-val">{ev.get('confidence_score',0)}%</div><div class="stat-lbl">الثقة</div></div>
+<div class="stat"><div class="stat-val">{sigs.get('win_rate_pct',0)}%</div><div class="stat-lbl">Win Rate</div></div>
+<div class="stat"><div class="stat-val">{sigs.get('avg_rr',0)}</div><div class="stat-lbl">Avg RR</div></div>
+<div class="stat"><div class="stat-val">{sigs.get('avg_return_pct',0)}%</div><div class="stat-lbl">Avg Return</div></div>
+<div class="stat"><div class="stat-val">{sigs.get('evaluated',0)}</div><div class="stat-lbl">Evaluated</div></div>
+<div class="stat"><div class="stat-val">{ev.get('learning_progress_pct',0)}%</div><div class="stat-lbl">Learning</div></div>
+<div class="stat"><div class="stat-val">{scan.get('signals_count',0)}</div><div class="stat-lbl">BUY Signals</div></div>
+<div class="stat"><div class="stat-val">{scan.get('created_at','')[:16]}</div><div class="stat-lbl">Last Scan</div></div>
+</div>
 </div>
 
-<h2>🔒 القرارات المقفلة (Decision Locks)</h2>
+<h2>💼 البورتفوليو</h2>
 <div class="card">
 <table>
-    <tr><th>السهم</th><th>القرار</th><th>المرحلة</th><th>Score</th><th>الدخول</th><th>Stop</th><th>T1</th><th>الأيام</th><th>السبب</th><th>تاريخ القفل</th></tr>
-    {lock_rows if lock_rows else "<tr><td colspan='10' style='text-align:center'>لا توجد قرارات مقفلة</td></tr>"}
+<tr><th>السهم</th><th>الكمية</th><th>سعر الدخول</th><th>السعر الحالي</th><th>P&L %</th><th>P&L AED</th></tr>
+{port_rows if port_rows else "<tr><td colspan='6' style='text-align:center;color:#94a3b8'>لا توجد مراكز مفتوحة</td></tr>"}
+</table>
+</div>
+
+<h2>🔒 القرارات المقفلة</h2>
+<div class="card">
+<table>
+<tr><th>السهم</th><th>القرار</th><th>المرحلة</th><th>Score</th><th>السعر الحالي</th><th>Stop</th><th>T1</th><th>الأيام</th><th>السبب</th><th>تاريخ القفل</th></tr>
+{lock_rows if lock_rows else "<tr><td colspan='10' style='text-align:center;color:#94a3b8'>لا توجد قرارات مقفلة</td></tr>"}
 </table>
 </div>
 
 <h2>📊 ترتيب الأسهم</h2>
 <div class="card">
 <table>
-    <tr><th>السهم</th><th>النوع</th><th>المرحلة</th><th>القرار</th><th>القوة</th><th>Score</th><th>السعر</th><th>Stop</th><th>T1</th><th>الأيام</th><th>RR</th><th>CMF</th><th>التعليق</th></tr>
-    {signal_rows if signal_rows else "<tr><td colspan='13' style='text-align:center'>لا توجد إشارات</td></tr>"}
+<tr><th>السهم</th><th>النوع</th><th>المرحلة</th><th>القرار</th><th>القوة</th><th>Score</th><th>السعر</th><th>Stop</th><th>T1</th><th>الأيام</th><th>RR</th><th>CMF</th><th>التعليق</th></tr>
+{sig_rows if sig_rows else "<tr><td colspan='13' style='text-align:center;color:#94a3b8'>لا توجد إشارات</td></tr>"}
 </table>
 </div>
 </body>
