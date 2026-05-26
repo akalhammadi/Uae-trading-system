@@ -1658,7 +1658,7 @@ def dashboard():
     scan=latest_scan_result("COMBINED") or {"signals":[],"coverage":[],"ranked":[],"signals_count":0}
     pc={"ACCUMULATION":"#3b82f6","MARKUP":"#22c55e","DISTRIBUTION":"#ef4444","MARKDOWN":"#7f1d1d","NEUTRAL":"#6b7280"}
 
-    # self evaluation من آخر نتيجة محفوظة (بدل run_self_evaluation() الثقيلة)
+    # self evaluation — من آخر نتيجة محفوظة، وإذا ما في نشغل مرة واحدة
     ev={}
     try:
         with get_db() as conn:
@@ -1667,36 +1667,50 @@ def dashboard():
             r=c.fetchone()
             if r and r["payload"]: ev=json.loads(r["payload"])
     except: pass
+    if not ev:
+        try: ev=run_self_evaluation()
+        except: ev={}
     if not ev: ev={"readiness_grade":"F","recommendation":"لا يوجد تقييم بعد","confidence_score":0,"signals":{},"learning_progress_pct":0,"decision_locks":{}}
     sigs=ev.get("signals",{})
     gc={"A":"#22c55e","B":"#86efac","C":"#fbbf24","D":"#f97316","F":"#ef4444"}.get(ev.get("readiness_grade","F"),"#9ca3af")
 
-    # جلب أسعار كل الأسهم في query واحدة
+    # جلب أسعار كل الأسهم في query واحدة — تشمل portfolio + ranked + locks
     price_map={}
     try:
-        symbols_needed=list({s.get("symbol","") for s in scan.get("ranked",[])[:30]})
+        # جمع كل الأسهم المطلوبة
+        syms_set=set()
+        for s in scan.get("ranked",[])[:30]: syms_set.add(s.get("symbol",""))
+        # أضف أسهم البورتفوليو والقرارات
+        with get_db() as conn:
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT symbol FROM portfolio_positions WHERE status='OPEN'")
+            for r in c.fetchall(): syms_set.add(r["symbol"])
+            c.execute("SELECT symbol FROM v20_decision_lock WHERE status='LOCKED'")
+            for r in c.fetchall(): syms_set.add(r["symbol"])
+
+        symbols_needed=[s for s in syms_set if s]
         if symbols_needed:
             with get_db() as conn:
                 c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                # آخر كاندل لكل سهم من H1 و 1D معاً
                 c.execute("""
                     SELECT DISTINCT ON (symbol, timeframe) symbol, timeframe, close, bar_time
                     FROM candles WHERE symbol=ANY(%s) AND timeframe IN ('60','1D')
                     ORDER BY symbol, timeframe, id DESC
                 """, (symbols_needed,))
                 rows=c.fetchall()
-            # نبني map: symbol -> (price, tf, bar_time) — أحدث timeframe
             tmp={}
             for r in rows:
                 sym=r["symbol"]; tf=r["timeframe"]
+                # تقريب السعر لـ 4 أرقام بعد الفاصلة
+                price=round(float(r["close"]),4) if r["close"] else None
                 bt=parse_dt(str(r.get("bar_time") or ""))
                 existing=tmp.get(sym)
                 if not existing:
-                    tmp[sym]=(safe_float(r["close"]),tf,str(r.get("bar_time","")))
+                    tmp[sym]=(price, "H1" if tf=="60" else "1D", str(r.get("bar_time","")))
                 else:
                     ebt=parse_dt(str(existing[2]))
                     if bt and ebt and bt>ebt:
-                        tmp[sym]=(safe_float(r["close"]),tf,str(r.get("bar_time","")))
+                        tmp[sym]=(price, "H1" if tf=="60" else "1D", str(r.get("bar_time","")))
             price_map=tmp
     except: pass
 
