@@ -1082,7 +1082,11 @@ def run_self_evaluation():
             "decision_locks":{"active":locked,"hit_target":lh,"hit_stop":ls},
             "lessons_learned":lc}
         with get_db() as conn:
-            conn.cursor().execute("INSERT INTO ai_self_evaluation (created_at,system_state,confidence_score,ready_for_trading,win_rate,avg_return_pct,rr_quality,lessons_count,pattern_quality,recommendation,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            c=conn.cursor()
+            # FIX: أضف العمود تلقائياً إذا ما كان موجود
+            try: c.execute("ALTER TABLE ai_self_evaluation ADD COLUMN IF NOT EXISTS pattern_quality DOUBLE PRECISION")
+            except: pass
+            c.execute("INSERT INTO ai_self_evaluation (created_at,system_state,confidence_score,ready_for_trading,win_rate,avg_return_pct,rr_quality,lessons_count,pattern_quality,recommendation,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (utc_now(),state,conf,ready,wr,ar,rq,lc,float(mkup.get("win_rate_pct",0)),rec,json.dumps(result)))
         return result
     except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-1000:]}
