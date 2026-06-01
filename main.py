@@ -926,6 +926,9 @@ def evaluate_virtual_signals():
                 candles=get_candles(sym,tf,400)
                 rel=[c for c in candles if created and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"])) and (parse_dt(c["bar_time"]) or parse_dt(c["received_at"]))>=created]
                 if not rel: continue
+                # FIX: لا تقيّم إشارة عمرها أقل من يوم تداول — تعطيها فرصة
+                age_days=business_days_between(created,utc_now_dt())
+                if age_days < 1 and len(rel) < 4: continue
                 mh=max(float(x["high"]) for x in rel); ml=min(float(x["low"]) for x in rel)
                 lc=float(rel[-1]["close"]); price=float(sig["price"]); t1=float(sig["target1"]); stop=float(sig["stop_loss"])
                 mxh=int(sig["max_hold_days"] or 7)
@@ -934,7 +937,7 @@ def evaluate_virtual_signals():
                 if th and not sh: status,outcome,ret="CLOSED","TARGET1_HIT",((t1-price)/price)*100
                 elif sh and not th: status,outcome,ret="CLOSED","STOP_HIT",((stop-price)/price)*100
                 elif th and sh: status,outcome,ret="CLOSED","BOTH_TOUCHED",((stop-price)/price)*100
-                elif created and business_days_between(created,utc_now_dt())>mxh: status,outcome="CLOSED","TIME_EXIT"
+                elif created and age_days>mxh: status,outcome="CLOSED","TIME_EXIT"
                 with get_db() as conn2:
                     conn2.cursor().execute("UPDATE ai_virtual_signals SET max_high=%s,min_low=%s,bars_checked=%s,status=%s,outcome=%s,outcome_at=%s WHERE id=%s",
                         (mh,ml,len(rel),status,outcome,utc_now() if status=="CLOSED" else None,sig["id"]))
@@ -1222,7 +1225,8 @@ def hourly_scan_job(send=False):
     scan=run_scan("HOURLY"); save_scan_result("HOURLY",scan)
     for s in scan.get("signals",[]): record_virtual_signal(s)
     evaluate_virtual_signals(); evaluate_observations(); check_decision_exits(); save_combined_scan()
-    if send and scan.get("signals"): tg_main_send(_scan_summary(scan,"🕐 Hourly Scan V20.1"))
+    # FIX: الـ hourly لا يرسل تلقائياً — الإرسال فقط من send_alerts
+    # if send and scan.get("signals"): tg_main_send(_scan_summary(scan,"🕐 Hourly Scan V20.1"))
 
 def daily_scan_job(send=True):
     scan=run_scan("DAILY"); save_scan_result("DAILY",scan)
