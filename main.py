@@ -1864,6 +1864,216 @@ def format_full_portfolio_analysis_tg():
 
 
 
+
+# ============================================================
+# V20.2 — MORNING & EOD REPORTS
+# ============================================================
+
+def format_morning_report():
+    """
+    تقرير الصباح 07:00 UAE
+    - وضع المحفظة مع قرار لكل مركز
+    - أفضل الفرص اليوم
+    - تنبيهات مهمة
+    """
+    lines = [
+        f"☀️ <b>تقرير الصباح — {uae_now_dt().strftime('%Y-%m-%d')}</b>",
+        f"🕖 {uae_now_dt().strftime('%H:%M')} UAE",
+        "",
+    ]
+
+    # ── قسم المحفظة ──────────────────────────────────────────
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+            positions = c.fetchall()
+
+        if positions:
+            lines.append("💼 <b>محفظتك اليوم:</b>")
+            total_pnl = 0
+            urgent = []
+
+            for p in positions:
+                sym   = p["symbol"]
+                entry = float(p["entry_price"])
+                qty   = float(p["qty"])
+                a     = smart_position_analysis(sym, entry, qty)
+                if not a.get("ok"): continue
+
+                pnl   = a["pnl_pct"]
+                dec   = a["decision"]
+                price = a["current_price"]
+                total_pnl += a["pnl_aed"]
+
+                dec_map = {
+                    "EXIT_NOW":           "🚨 اخرج اليوم",
+                    "EXIT_SOON":          "🔴 فكر بالخروج",
+                    "HOLD":               "✅ احتفظ",
+                    "CONSIDER_AVERAGING": "🔵 ممكن تضيف",
+                    "WATCH":              "👀 راقب",
+                }
+                icon = dec_map.get(dec, dec)
+
+                lines.append(
+                    f"{icon} | <b>{sym}</b> {pnl:+.2f}% "
+                    f"(دخول:{entry} → حالي:{price})"
+                )
+
+                # إذا قرار عاجل أضفه للتنبيهات
+                if dec in ["EXIT_NOW", "EXIT_SOON"]:
+                    reason = a["exit_signals"][0] if a["exit_signals"] else ""
+                    urgent.append(f"⚠️ {sym}: {reason}")
+
+            pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+            lines.append(f"{pnl_icon} <b>إجمالي P&L: {total_pnl:+,.0f} AED</b>")
+
+            if urgent:
+                lines.append("")
+                lines.append("🚨 <b>تنبيهات عاجلة:</b>")
+                lines.extend(urgent)
+        else:
+            lines.append("💼 المحفظة فارغة")
+
+    except Exception as e:
+        lines.append(f"⚠️ خطأ في تحليل المحفظة: {e}")
+
+    # ── قسم الفرص ────────────────────────────────────────────
+    lines.append("")
+    lines.append("🎯 <b>أفضل الفرص اليوم:</b>")
+    try:
+        scan = latest_scan_result("COMBINED") or {}
+        ranked = scan.get("ranked", [])
+
+        # فلتر الفرص الجيدة فقط
+        opportunities = [
+            s for s in ranked
+            if s.get("score", 0) >= 80
+            and s.get("market_phase") in ["ACCUMULATION", "MARKUP"]
+            and not s.get("data_is_stale", False)
+        ][:5]
+
+        if opportunities:
+            for s in opportunities:
+                phase = s.get("market_phase", "")
+                pe = {"ACCUMULATION": "🔵", "MARKUP": "🟢"}.get(phase, "⚪")
+                lines.append(
+                    f"{pe} <b>{s.get('symbol')}</b> | "
+                    f"Score:{s.get('score')} | "
+                    f"T1:{s.get('target1')} | "
+                    f"RR:{s.get('rr')} | "
+                    f"~{s.get('estimated_days','?')} يوم"
+                )
+        else:
+            lines.append("لا توجد فرص قوية الآن — السوق يحتاج وقتاً")
+
+    except Exception as e:
+        lines.append(f"⚠️ خطأ في جلب الفرص: {e}")
+
+    # ── ملاحظات ──────────────────────────────────────────────
+    lines.append("")
+    lines.append(f"<i>للتحليل المفصل: اكتب اسم السهم في البوت</i>")
+    lines.append(DASHBOARD_URL)
+
+    return "\n".join(lines)
+
+
+def format_eod_report():
+    """
+    تقرير ما بعد الإغلاق 15:30 UAE
+    - حركة المحفظة اليوم
+    - نسبة التعلم والجاهزية
+    - الإشارات الجديدة
+    """
+    lines = [
+        f"📊 <b>تقرير ما بعد الإغلاق — {uae_now_dt().strftime('%Y-%m-%d')}</b>",
+        f"🕒 {uae_now_dt().strftime('%H:%M')} UAE",
+        "",
+    ]
+
+    # ── حالة التعلم والجاهزية ────────────────────────────────
+    try:
+        ev = {}
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT payload FROM ai_self_evaluation ORDER BY id DESC LIMIT 1")
+            r = c.fetchone()
+            if r and r["payload"]: ev = json.loads(r["payload"])
+
+        if ev:
+            grade = ev.get("readiness_grade", "?")
+            conf  = ev.get("confidence_score", 0)
+            sigs  = ev.get("signals", {})
+            wr    = sigs.get("win_rate_pct", 0)
+            age   = ev.get("learning_age_days", 0)
+            prog  = ev.get("learning_progress_pct", 0)
+            grade_emoji = {"A":"✅","B":"🟢","C":"🟡","D":"🟠","F":"🔴"}.get(grade,"⚪")
+
+            lines.append("🧠 <b>حالة النظام:</b>")
+            lines.append(f"{grade_emoji} الدرجة: <b>{grade}</b> | الثقة: <b>{conf}%</b>")
+            lines.append(f"Win Rate: <b>{wr}%</b> | التعلم: {age:.0f}/{ev.get('learning_days_required',21)} يوم ({prog}%)")
+            lines.append(f"إشارات: {sigs.get('total',0)} | مقيّمة: {sigs.get('evaluated',0)}")
+            lines.append(f"RR متوسط: {sigs.get('avg_rr',0)} | عائد متوسط: {sigs.get('avg_return_pct',0)}%")
+        else:
+            lines.append("🧠 <b>التعلم:</b> لا يوجد تقييم بعد")
+
+    except Exception as e:
+        lines.append(f"⚠️ خطأ في التقييم: {e}")
+
+    # ── ملخص المحفظة بعد الإغلاق ─────────────────────────────
+    lines.append("")
+    lines.append("💼 <b>محفظتك عند الإغلاق:</b>")
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+            positions = c.fetchall()
+
+        total_pnl = 0
+        for p in positions:
+            lp, ltf, _ = get_latest_price(p["symbol"])
+            entry = float(p["entry_price"]); qty = float(p["qty"])
+            pnl_pct = ((lp - entry) / entry * 100) if lp else None
+            pnl_aed = ((lp - entry) * qty) if lp else None
+            if pnl_aed: total_pnl += pnl_aed
+            icon = "🟢" if pnl_pct and pnl_pct >= 0 else "🔴"
+            lines.append(
+                f"{icon} <b>{p['symbol']}</b> {pnl_pct:+.2f}% "
+                f"({pnl_aed:+,.0f} AED) | {lp or '-'} ({ltf or '-'})"
+                if pnl_pct is not None else
+                f"⚪ <b>{p['symbol']}</b> — لا سعر"
+            )
+        pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(f"{pnl_icon} <b>إجمالي اليوم: {total_pnl:+,.0f} AED</b>")
+
+    except Exception as e:
+        lines.append(f"⚠️ خطأ: {e}")
+
+    # ── إشارات اليوم ─────────────────────────────────────────
+    lines.append("")
+    lines.append("📡 <b>إشارات اليوم:</b>")
+    try:
+        scan = latest_scan_result("COMBINED") or {}
+        signals = scan.get("signals", [])
+        if signals:
+            for s in signals[:5]:
+                pe = {"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔"}.get(
+                    s.get("market_phase",""),"⚪")
+                lines.append(
+                    f"{pe} <b>{s.get('symbol')}</b> | "
+                    f"Score:{s.get('score')} | T1:{s.get('target1')}"
+                )
+        else:
+            lines.append("لا توجد إشارات شراء قوية اليوم")
+
+    except Exception as e:
+        lines.append(f"⚠️ خطأ: {e}")
+
+    lines.append("")
+    lines.append(DASHBOARD_URL)
+    return "\n".join(lines)
+
+
 # ── API ROUTES ────────────────────────────────────────────────
 
 @app.get("/")
@@ -2342,7 +2552,9 @@ def cron_end_of_day(secret:Optional[str]=None):
         scan=run_scan("COMBINED"); save_scan_result("COMBINED",scan)
         for s in scan.get("signals",[]): record_virtual_signal(s)
         ev=evaluate_virtual_signals(); obs=evaluate_observations(); exits=check_decision_exits()
-        self_ev=run_self_evaluation(); tg_main_send(format_daily_report_v20())
+        self_ev=run_self_evaluation()
+        # FIX: بعد الإغلاق نرسل EOD report بدل daily report
+        tg_main_send(format_eod_report())
         return {"ok":True,"scan_signals":scan.get("signals_count",0),"evaluated":len(ev),
             "observations":len(obs),"decision_exits":len(exits),"confidence":self_ev.get("confidence_score",0),"state":self_ev.get("system_state")}
     except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-1500:]}
@@ -2352,16 +2564,30 @@ def cron_weekly_report(secret:Optional[str]=None):
     if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
     sent=tg_main_send(format_weekly_report_v20()); return {"ok":True,"sent":True,"telegram":sent}
 
+@app.get("/api/cron/morning-report")
+def cron_morning_report(secret:Optional[str]=None,send:bool=True):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
+    text=format_morning_report()
+    if send: tg_main_send(text)
+    return {"ok":True,"sent":send,"report":text}
+
+@app.get("/api/cron/eod-report")
+def cron_eod_report(secret:Optional[str]=None,send:bool=True):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
+    # شغّل self evaluation أولاً عشان الأرقام محدثة
+    run_self_evaluation()
+    text=format_eod_report()
+    if send: tg_main_send(text)
+    return {"ok":True,"sent":send,"report":text}
+
 @app.get("/api/cron/portfolio-monitor")
 def cron_portfolio_monitor(secret:Optional[str]=None):
+    # مدمج في تقرير الصباح الآن — هذا الـ endpoint للاستخدام اليدوي فقط
     if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
-    data=portfolio_monitor(secret); positions=data.get("positions",[])
-    if not positions: return {"ok":True,"message":"No positions"}
-    lines=["<b>📊 Portfolio Monitor V20.1</b>",""]
-    for p in positions:
-        icon="⚠️ " if p.get("data_is_stale") else ""
-        lines.append(f"{icon}{p['symbol']} | {p['action']} | PnL {p['pnl_pct']}% ({p['price_source']}) | {p['reason']}")
-    tg_main_send("\n".join(lines)); return {"ok":True,"count":len(positions)}
+    data=portfolio_monitor(secret)
+    return {"ok":True,"message":"Use /api/cron/morning-report for scheduled reports","data":data}
 
 @app.get("/api/cron/send-alerts")
 def cron_send_alerts(secret:Optional[str]=None,force:bool=False):
