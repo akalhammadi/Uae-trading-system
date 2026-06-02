@@ -902,7 +902,9 @@ def save_combined_scan():
 # ── VIRTUAL SIGNALS ───────────────────────────────────────────
 
 def sig_key(sig):
-    return f"{sig['symbol']}-{sig['type']}-{sig['price']}-{sig['target1']}-{sig['stop_loss']}"
+    # FIX: أضف التاريخ للـ key عشان كل يوم تداول يُسجل إشارة جديدة
+    today = utc_now_dt().strftime("%Y-%m-%d")
+    return f"{sig['symbol']}-{sig['type']}-{today}-{sig['price']}-{sig['target1']}"
 
 def record_virtual_signal(sig):
     if not sig or not sig.get("has_data"): return False
