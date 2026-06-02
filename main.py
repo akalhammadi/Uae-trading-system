@@ -210,6 +210,18 @@ def init_db():
             status TEXT DEFAULT 'OPEN', notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS batch_scan_state (
             key TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS portfolio_trades (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            qty DOUBLE PRECISION NOT NULL,
+            price DOUBLE PRECISION NOT NULL,
+            pnl_pct DOUBLE PRECISION,
+            pnl_aed DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            notes TEXT,
+            created_at TEXT NOT NULL)""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS v15_active_thesis (
             id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'ACTIVE',
             first_created_at TEXT NOT NULL, last_updated_at TEXT NOT NULL, trend_phase TEXT,
@@ -1257,6 +1269,157 @@ def record_failure_memory(symbol,setup_type,failure_reason,loss_pct,lesson,paylo
         conn.cursor().execute("INSERT INTO ai_failure_memory (symbol,setup_type,failure_reason,loss_pct,market_state,lesson,created_at,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
             (normalize_symbol(symbol),setup_type,failure_reason,loss_pct,"UNKNOWN",lesson,utc_now(),json.dumps(payload or {})))
 
+# ── PORTFOLIO TRADE FUNCTIONS ────────────────────────────────
+
+def portfolio_buy(symbol, qty, price, notes=""):
+    """تسجيل صفقة شراء"""
+    symbol = normalize_symbol(symbol)
+    qty = float(qty); price = float(price)
+    with get_db() as conn:
+        c = conn.cursor()
+        # أضف أو حدّث المركز
+        c.execute("""INSERT INTO portfolio_positions(symbol,qty,entry_price,position_type,status,notes,created_at,updated_at)
+            VALUES(%s,%s,%s,'HOLDING','OPEN',%s,%s,%s)
+            ON CONFLICT(symbol) DO UPDATE SET
+            qty=EXCLUDED.qty, entry_price=EXCLUDED.entry_price,
+            notes=EXCLUDED.notes, status='OPEN', updated_at=EXCLUDED.updated_at""",
+            (symbol, qty, price, notes, utc_now(), utc_now()))
+        # سجّل في تاريخ الصفقات
+        c.execute("""INSERT INTO portfolio_trades(symbol,action,qty,price,entry_price,notes,created_at)
+            VALUES(%s,'BUY',%s,%s,%s,%s,%s)""",
+            (symbol, qty, price, price, notes, utc_now()))
+    return {"ok": True, "symbol": symbol, "action": "BUY", "qty": qty, "price": price}
+
+def portfolio_sell(symbol, qty, price, notes=""):
+    """تسجيل صفقة بيع وحساب الربح"""
+    symbol = normalize_symbol(symbol)
+    qty = float(qty); price = float(price)
+    # جلب سعر الدخول
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE symbol=%s AND status='OPEN'", (symbol,))
+        pos = c.fetchone()
+    if not pos:
+        return {"ok": False, "error": f"{symbol} مو موجود في المحفظة"}
+    entry = float(pos["entry_price"]); pos_qty = float(pos["qty"])
+    pnl_pct = ((price - entry) / entry) * 100
+    pnl_aed = (price - entry) * qty
+    with get_db() as conn:
+        c = conn.cursor()
+        # سجّل البيع
+        c.execute("""INSERT INTO portfolio_trades(symbol,action,qty,price,entry_price,pnl_pct,pnl_aed,notes,created_at)
+            VALUES(%s,'SELL',%s,%s,%s,%s,%s,%s,%s)""",
+            (symbol, qty, price, entry, round(pnl_pct,2), round(pnl_aed,2), notes, utc_now()))
+        # إذا باع كل الكمية أغلق المركز
+        if qty >= pos_qty:
+            c.execute("UPDATE portfolio_positions SET status='CLOSED', updated_at=%s WHERE symbol=%s", (utc_now(), symbol))
+        else:
+            new_qty = pos_qty - qty
+            c.execute("UPDATE portfolio_positions SET qty=%s, updated_at=%s WHERE symbol=%s", (new_qty, utc_now(), symbol))
+    return {"ok": True, "symbol": symbol, "action": "SELL", "qty": qty,
+            "price": price, "entry": entry,
+            "pnl_pct": round(pnl_pct, 2), "pnl_aed": round(pnl_aed, 2)}
+
+def format_portfolio_tg():
+    """تنسيق المحفظة لـ Telegram"""
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+        positions = c.fetchall()
+    if not positions:
+        return "📭 المحفظة فارغة"
+    lines = ["<b>💼 محفظتي</b>", ""]
+    total_pnl = 0
+    for p in positions:
+        sym = p["symbol"]; entry = float(p["entry_price"]); qty = float(p["qty"])
+        lp, ltf, _ = get_latest_price(sym)
+        pnl_pct = ((lp - entry) / entry * 100) if lp else None
+        pnl_aed = ((lp - entry) * qty) if lp else None
+        if pnl_aed: total_pnl += pnl_aed
+        icon = "🟢" if pnl_pct and pnl_pct >= 0 else "🔴"
+        pnl_txt = f"{round(pnl_pct,2):+.2f}% ({round(pnl_aed,0):+.0f} AED)" if pnl_pct is not None else "لا سعر"
+        lines.append(f"{icon} <b>{sym}</b> | {qty:.0f} سهم @ {entry}")
+        lines.append(f"   السعر: {lp or '-'} ({ltf}) | P&L: {pnl_txt}")
+    lines.append("")
+    lines.append(f"<b>إجمالي P&L: {round(total_pnl,0):+.0f} AED</b>")
+    return "\n".join(lines)
+
+def format_trade_history_tg(symbol=None):
+    """تاريخ الصفقات"""
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if symbol:
+            c.execute("SELECT * FROM portfolio_trades WHERE symbol=%s ORDER BY id DESC LIMIT 10", (normalize_symbol(symbol),))
+        else:
+            c.execute("SELECT * FROM portfolio_trades ORDER BY id DESC LIMIT 15")
+        rows = c.fetchall()
+    if not rows:
+        return "لا توجد صفقات مسجلة"
+    lines = ["<b>📋 تاريخ الصفقات</b>", ""]
+    for r in rows:
+        icon = "🟢 شراء" if r["action"] == "BUY" else "🔴 بيع"
+        pnl = f" | P&L: {r['pnl_pct']:+.2f}%" if r.get("pnl_pct") is not None else ""
+        lines.append(f"{icon} <b>{r['symbol']}</b> {r['qty']:.0f}@ {r['price']}{pnl}")
+        lines.append(f"   {str(r['created_at'])[:16]}")
+    return "\n".join(lines)
+
+def format_analysis_tg(symbol):
+    """تحليل سهم للبوت"""
+    symbol = normalize_symbol(symbol)
+    if symbol not in WATCHLIST:
+        return f"⚠️ {symbol} مو في الـ Watchlist"
+    sigs = analyze_symbol(symbol, "ALL")
+    if not sigs:
+        return f"لا توجد بيانات كافية لـ {symbol}"
+    best = max(sigs, key=lambda x: x.get("score", 0))
+    lock = get_locked_decision(symbol)
+    lp, ltf, lbt = get_latest_price(symbol)
+    stale = ""
+    if lbt:
+        pt = parse_dt(lbt)
+        if pt:
+            age = (utc_now_dt() - pt).total_seconds() / 3600
+            if age > MAX_CANDLE_AGE_HOURS:
+                stale = f"\n⚠️ بيانات قديمة ({round(age,0):.0f}h)"
+    phase = best.get("market_phase", "-")
+    pe = {"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔","NEUTRAL":"⚪"}.get(phase,"⚪")
+    lines = [
+        f"<b>📊 {symbol}</b>{stale}",
+        f"{pe} المرحلة: <b>{phase}</b>",
+        f"Score: <b>{best.get('score','-')}</b> | القوة: <b>{best.get('strength','-')}</b>",
+        f"السعر: <b>{lp or best.get('price','-')}</b> ({ltf or '-'})",
+        f"RSI: {best.get('rsi','-')} | حجم: {best.get('volume_ratio','-')}x",
+        f"",
+        f"القرار: <b>{best.get('display_action','-')}</b>",
+        f"دخول: {best.get('entry_zone',['?','?'])[0]} — {best.get('entry_zone',['?','?'])[1]}",
+        f"Stop: {best.get('stop_loss','-')} | T1: {best.get('target1','-')}",
+        f"RR: {best.get('rr','-')} | خطر: {best.get('risk_pct','-')}%",
+    ]
+    if lock:
+        lines.append(f"\n🔒 القرار المقفل: <b>{lock.get('decision')}</b> | {lock.get('market_phase')}")
+    lines.append(f"\n{best.get('ai_comment','')}")
+    return "\n".join(lines)
+
+HELP_MSG = """<b>🤖 UAE AI Bot — الأوامر</b>
+
+<b>📊 تحليل الأسهم:</b>
+EMAAR — تحليل سهم
+تحليل EMAAR — نفس الشيء
+
+<b>💼 المحفظة:</b>
+محفظة — عرض مراكزي
+صفقاتي — تاريخ الصفقات
+صفقات EMAAR — صفقات سهم معين
+
+<b>💰 الشراء والبيع:</b>
+شراء EMAAR 1000 11.56
+بيع EMAAR 500 12.00
+
+<b>📈 التقارير:</b>
+تقرير — التقرير اليومي
+أسبوعي — التقرير الأسبوعي
+جاهزية — حالة النظام"""
+
 # ── API ROUTES ────────────────────────────────────────────────
 
 @app.get("/")
@@ -1446,6 +1609,29 @@ def portfolio_add(secret:Optional[str]=None,symbol:str="",qty:float=0,entry:floa
             (symbol,qty,entry,position_type,notes,utc_now(),utc_now()))
     return {"ok":True,"symbol":symbol,"qty":qty,"entry":entry}
 
+@app.get("/api/portfolio/buy")
+def api_portfolio_buy(secret:Optional[str]=None,symbol:str="",qty:float=0,price:float=0,notes:str=""):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    if not symbol or qty<=0 or price<=0: return {"ok":False,"error":"symbol, qty, price required"}
+    return portfolio_buy(symbol,qty,price,notes)
+
+@app.get("/api/portfolio/sell")
+def api_portfolio_sell(secret:Optional[str]=None,symbol:str="",qty:float=0,price:float=0,notes:str=""):
+    if not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
+    if not symbol or qty<=0 or price<=0: return {"ok":False,"error":"symbol, qty, price required"}
+    return portfolio_sell(symbol,qty,price,notes)
+
+@app.get("/api/portfolio/trades")
+def api_portfolio_trades(symbol:Optional[str]=None,limit:int=50):
+    with get_db() as conn:
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if symbol:
+            c.execute("SELECT * FROM portfolio_trades WHERE symbol=%s ORDER BY id DESC LIMIT %s",(normalize_symbol(symbol),limit))
+        else:
+            c.execute("SELECT * FROM portfolio_trades ORDER BY id DESC LIMIT %s",(limit,))
+        rows=c.fetchall()
+    return {"ok":True,"count":len(rows),"trades":rows}
+
 @app.get("/api/portfolio/monitor")
 def portfolio_monitor(secret:Optional[str]=None):
     if secret is not None and not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
@@ -1521,26 +1707,93 @@ async def telegram_webhook(secret:str,request:Request):
     data=await request.json()
     try:
         if "message" in data:
-            msg=data["message"]; chat_id=msg["chat"]["id"]; text=msg.get("text","").strip(); upper=text.upper()
-            if upper in ["READINESS","جاهزية","STATUS"]: return tg_send(chat_id,format_readiness_alert(run_self_evaluation()))
-            if upper in ["DAILY","تقرير","تقرير يومي"]: return tg_send(chat_id,format_daily_report_v20())
-            if upper in ["WEEKLY","أسبوعي","اسبوعي"]: return tg_send(chat_id,format_weekly_report_v20())
-            if upper.startswith("تحليل") or upper.startswith("ANALYZE"):
-                parts=upper.split()
-                if len(parts)>=2:
-                    sym=normalize_symbol(parts[1]); sigs=analyze_symbol(sym,"ALL")
-                    if sigs: return tg_send(chat_id,format_signal_v20(max(sigs,key=lambda x:x["score"])),signal_keyboard(sym))
-                return tg_send(chat_id,"لا توجد بيانات كافية")
-            sym=normalize_symbol(upper.split()[0] if upper.split() else "")
+            msg=data["message"]; chat_id=msg["chat"]["id"]
+            text=msg.get("text","").strip(); upper=text.upper()
+            parts=text.split(); uparts=upper.split()
+
+            # ── تقارير وجاهزية ──────────────────────────────────
+            if upper in ["READINESS","جاهزية","STATUS","حالة"]:
+                return tg_send(chat_id,format_readiness_alert(run_self_evaluation()))
+
+            if upper in ["DAILY","تقرير","تقرير يومي"]:
+                return tg_send(chat_id,format_daily_report_v20())
+
+            if upper in ["WEEKLY","أسبوعي","اسبوعي","أسبوعي"]:
+                return tg_send(chat_id,format_weekly_report_v20())
+
+            if upper in ["HELP","مساعدة","اوامر","أوامر"]:
+                return tg_send(chat_id,HELP_MSG)
+
+            # ── المحفظة ──────────────────────────────────────────
+            if upper in ["محفظة","PORTFOLIO","بورتفوليو"]:
+                return tg_send(chat_id,format_portfolio_tg())
+
+            if upper in ["صفقاتي","TRADES","HISTORY"]:
+                return tg_send(chat_id,format_trade_history_tg())
+
+            # صفقات EMAAR
+            if upper.startswith("صفقات ") and len(uparts)>=2:
+                return tg_send(chat_id,format_trade_history_tg(uparts[1]))
+
+            # ── شراء ─────────────────────────────────────────────
+            # شراء EMAAR 1000 11.56
+            if (upper.startswith("شراء ") or upper.startswith("BUY ")) and len(parts)>=4:
+                try:
+                    sym=normalize_symbol(parts[1]); qty=float(parts[2]); price=float(parts[3])
+                    notes=" ".join(parts[4:]) if len(parts)>4 else ""
+                    r=portfolio_buy(sym,qty,price,notes)
+                    return tg_send(chat_id,
+                        f"✅ <b>تم تسجيل الشراء</b>\n"
+                        f"السهم: <b>{sym}</b>\n"
+                        f"الكمية: {qty:.0f} سهم\n"
+                        f"السعر: {price}\n"
+                        f"القيمة: {round(qty*price,2):,.0f} AED")
+                except Exception as e:
+                    return tg_send(chat_id,f"❌ خطأ: {e}\nالصيغة: شراء EMAAR 1000 11.56")
+
+            # ── بيع ──────────────────────────────────────────────
+            # بيع EMAAR 1000 12.00
+            if (upper.startswith("بيع ") or upper.startswith("SELL ")) and len(parts)>=4:
+                try:
+                    sym=normalize_symbol(parts[1]); qty=float(parts[2]); price=float(parts[3])
+                    notes=" ".join(parts[4:]) if len(parts)>4 else ""
+                    r=portfolio_sell(sym,qty,price,notes)
+                    if not r.get("ok"): return tg_send(chat_id,f"❌ {r.get('error')}")
+                    icon="🟢" if r['pnl_pct']>=0 else "🔴"
+                    return tg_send(chat_id,
+                        f"{icon} <b>تم تسجيل البيع</b>\n"
+                        f"السهم: <b>{sym}</b>\n"
+                        f"الكمية: {qty:.0f} سهم\n"
+                        f"البيع: {price} | الدخول: {r['entry']}\n"
+                        f"P&L: <b>{r['pnl_pct']:+.2f}% ({r['pnl_aed']:+,.0f} AED)</b>")
+                except Exception as e:
+                    return tg_send(chat_id,f"❌ خطأ: {e}\nالصيغة: بيع EMAAR 1000 12.00")
+
+            # ── تحليل سهم ────────────────────────────────────────
+            if (upper.startswith("تحليل ") or upper.startswith("ANALYZE ")) and len(uparts)>=2:
+                sym=normalize_symbol(uparts[1])
+                return tg_send(chat_id,format_analysis_tg(sym),signal_keyboard(sym))
+
+            # اسم السهم مباشرة
+            sym=normalize_symbol(uparts[0]) if uparts else ""
             if sym in WATCHLIST:
-                sigs=analyze_symbol(sym,"ALL")
-                if sigs:
-                    best=max(sigs,key=lambda x:x["score"]); lock=get_locked_decision(sym)
-                    reply=format_signal_v20(best)
-                    if lock: reply+=f"\n\n🔒 القرار: {lock.get('decision')} | {lock.get('market_phase')}"
-                    return tg_send(chat_id,reply,signal_keyboard(sym))
-            return tg_send(chat_id,"أرسل اسم السهم أو: READINESS / DAILY / WEEKLY / ANALYZE EMAAR")
-    except Exception as e: print(f"tg webhook error:{e}")
+                return tg_send(chat_id,format_analysis_tg(sym),signal_keyboard(sym))
+
+            # callback من أزرار الكيبورد
+            return tg_send(chat_id,HELP_MSG)
+
+        # callback query (أزرار inline)
+        if "callback_query" in data:
+            cb=data["callback_query"]; chat_id=cb["message"]["chat"]["id"]
+            cb_data=cb.get("data",""); cb_id=cb["id"]
+            tg_api("answerCallbackQuery",{"callback_query_id":cb_id})
+            if cb_data.startswith("more:"):
+                sym=cb_data.split(":")[1]
+                return tg_send(chat_id,format_analysis_tg(sym))
+            if cb_data.startswith("ignore:"):
+                return tg_send(chat_id,"تم التجاهل ✓")
+
+    except Exception as e: print(f"tg webhook error:{e}\n{traceback.format_exc()}")
     return {"ok":True}
 
 @app.get("/api/ai/send-alerts")
