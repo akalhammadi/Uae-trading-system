@@ -1422,6 +1422,448 @@ EMAAR — تحليل سهم
 أسبوعي — التقرير الأسبوعي
 جاهزية — حالة النظام"""
 
+# ============================================================
+# V20.2 — SMART POSITION ANALYSIS & EXIT SYSTEM
+# ============================================================
+
+# ── STRUCTURE ANALYSIS ───────────────────────────────────────
+
+def analyze_price_structure(candles):
+    """
+    يحلل هيكل السعر:
+    - هل في Higher Highs / Higher Lows (uptrend سليم)
+    - هل في Lower Lows / Lower Highs (downtrend)
+    - هل الهيكل مكسور
+    """
+    if len(candles) < 20:
+        return {"structure": "UNKNOWN", "broken": False, "details": "بيانات غير كافية"}
+
+    highs  = [safe_float(c["high"])  for c in candles if safe_float(c["high"])]
+    lows   = [safe_float(c["low"])   for c in candles if safe_float(c["low"])]
+    closes = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+
+    if len(highs) < 15:
+        return {"structure": "UNKNOWN", "broken": False, "details": "بيانات غير كافية"}
+
+    # نقسم إلى ثلاثة أثلاث
+    n = len(highs)
+    t1_h = highs[:n//3]; t2_h = highs[n//3:2*n//3]; t3_h = highs[2*n//3:]
+    t1_l = lows[:n//3];  t2_l = lows[n//3:2*n//3];  t3_l = lows[2*n//3:]
+
+    # أحدث قاع وقمة
+    recent_high = max(t3_h); recent_low = min(t3_l)
+    mid_high    = max(t2_h); mid_low    = min(t2_l)
+    old_high    = max(t1_h); old_low    = min(t1_l)
+
+    # Higher Highs + Higher Lows = uptrend
+    hh = recent_high > mid_high > old_high
+    hl = recent_low  > mid_low  > old_low
+
+    # Lower Lows + Lower Highs = downtrend
+    ll = recent_low  < mid_low  < old_low
+    lh = recent_high < mid_high < old_high
+
+    # كسر الهيكل: آخر low كسر قاع سابق مهم
+    key_support = min(lows[-20:-5]) if len(lows) >= 20 else min(lows[:-3])
+    structure_broken = closes[-1] < key_support
+
+    if hh and hl:
+        structure = "UPTREND"
+        desc = "Higher Highs + Higher Lows — اتجاه صاعد سليم"
+    elif ll and lh:
+        structure = "DOWNTREND"
+        desc = "Lower Lows + Lower Highs — اتجاه هابط"
+    elif structure_broken:
+        structure = "BROKEN"
+        desc = f"كسر دعم رئيسي عند {round(key_support,3)}"
+    else:
+        structure = "RANGING"
+        desc = "تذبذب — لا اتجاه واضح"
+
+    return {
+        "structure":        structure,
+        "broken":           structure_broken,
+        "key_support":      round(key_support, 3),
+        "recent_high":      round(recent_high, 3),
+        "recent_low":       round(recent_low, 3),
+        "higher_highs":     hh,
+        "higher_lows":      hl,
+        "lower_lows":       ll,
+        "lower_highs":      lh,
+        "description":      desc,
+    }
+
+def analyze_volume_behavior(candles):
+    """
+    يحلل سلوك الحجم:
+    - هل الحجم يرتفع في الهبوط (بيع حقيقي)
+    - هل الحجم خفيف في الهبوط (تصحيح طبيعي)
+    - هل في تجميع هادئ
+    """
+    if len(candles) < 15:
+        return {"verdict": "UNKNOWN", "details": "بيانات غير كافية"}
+
+    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
+    closes  = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+
+    avg_vol = sma(volumes, 20) or 1
+
+    # كاندلز هابطة وصاعدة
+    down_candles = [candles[i] for i in range(1, len(candles))
+                    if safe_float(candles[i]["close"]) and safe_float(candles[i-1]["close"])
+                    and safe_float(candles[i]["close"]) < safe_float(candles[i-1]["close"])]
+    up_candles   = [candles[i] for i in range(1, len(candles))
+                    if safe_float(candles[i]["close"]) and safe_float(candles[i-1]["close"])
+                    and safe_float(candles[i]["close"]) > safe_float(candles[i-1]["close"])]
+
+    avg_down_vol = (sum(safe_float(c.get("volume"),0) or 0 for c in down_candles[-10:]) /
+                    max(len(down_candles[-10:]), 1))
+    avg_up_vol   = (sum(safe_float(c.get("volume"),0) or 0 for c in up_candles[-10:]) /
+                    max(len(up_candles[-10:]), 1))
+
+    obv = compute_obv(candles)
+    obv_trend = "RISING" if len(obv)>=10 and obv[-1]>obv[-10] else "FALLING"
+    cmf_val   = compute_cmf(candles, 14)
+
+    # بيع حقيقي: حجم الهبوط أكبر من حجم الصعود
+    real_selling    = avg_down_vol > avg_up_vol * 1.3
+    # تجميع هادئ: OBV صاعد مع حجم معتدل
+    quiet_accum     = obv_trend == "RISING" and avg_up_vol > avg_down_vol
+    # تصحيح طبيعي: هبوط بحجم خفيف
+    healthy_pullback= avg_down_vol < avg_vol * 0.8 and obv_trend == "RISING"
+
+    if real_selling and obv_trend == "FALLING":
+        verdict = "REAL_SELLING"
+        desc    = "بيع حقيقي — مؤسسات تخرج"
+    elif quiet_accum:
+        verdict = "ACCUMULATION"
+        desc    = "تجميع هادئ — مؤسسات تشتري"
+    elif healthy_pullback:
+        verdict = "HEALTHY_PULLBACK"
+        desc    = "تصحيح طبيعي — حجم خفيف، الاتجاه سليم"
+    elif obv_trend == "FALLING":
+        verdict = "DISTRIBUTION"
+        desc    = "توزيع — ضغط بيع مستمر"
+    else:
+        verdict = "NEUTRAL"
+        desc    = "حجم محايد"
+
+    return {
+        "verdict":          verdict,
+        "obv_trend":        obv_trend,
+        "cmf":              round(cmf_val, 3),
+        "real_selling":     real_selling,
+        "quiet_accum":      quiet_accum,
+        "healthy_pullback": healthy_pullback,
+        "avg_down_vol":     round(avg_down_vol, 0),
+        "avg_up_vol":       round(avg_up_vol, 0),
+        "description":      desc,
+    }
+
+def find_key_support_levels(candles, n=3):
+    """يجد أهم مستويات الدعم القريبة"""
+    if len(candles) < 10:
+        return []
+    lows = [(i, safe_float(c["low"])) for i,c in enumerate(candles) if safe_float(c["low"])]
+    # نجد القيعان المحلية
+    supports = []
+    for i in range(2, len(lows)-2):
+        idx, val = lows[i]
+        if val and val < lows[i-1][1] and val < lows[i-2][1] and val < lows[i+1][1] and val < lows[i+2][1]:
+            supports.append(round(val, 3))
+    # نرتبها ونأخذ الأقرب للسعر الحالي
+    current = safe_float(candles[-1]["close"]) or 0
+    supports = sorted(set(supports), key=lambda x: abs(x - current))
+    return supports[:n]
+
+def calculate_averaging_down(entry_price, entry_qty, current_price, target_exit=None):
+    """
+    يحسب خطة Averaging Down:
+    - كم تشتري عشان تعدل السعر
+    - ما هو سعر التعادل الجديد
+    - هل يستحق؟
+    """
+    if not entry_price or not current_price or current_price >= entry_price:
+        return None
+
+    loss_pct = ((current_price - entry_price) / entry_price) * 100
+    current_value = entry_price * entry_qty
+
+    # خيارات Averaging Down
+    options = []
+    for multiplier in [0.5, 1.0, 1.5, 2.0]:
+        add_qty = entry_qty * multiplier
+        add_value = current_price * add_qty
+        total_qty = entry_qty + add_qty
+        avg_price = (current_value + add_value) / total_qty
+        breakeven_move = ((avg_price - current_price) / current_price) * 100
+
+        options.append({
+            "add_qty":        round(add_qty, 0),
+            "add_value_aed":  round(add_value, 0),
+            "new_avg_price":  round(avg_price, 3),
+            "breakeven_pct":  round(breakeven_move, 2),
+            "total_qty":      round(total_qty, 0),
+            "label":          f"أضف {multiplier}x"
+        })
+
+    return {
+        "entry_price":  entry_price,
+        "entry_qty":    entry_qty,
+        "current_price":current_price,
+        "loss_pct":     round(loss_pct, 2),
+        "options":      options
+    }
+
+# ── SMART POSITION DECISION ───────────────────────────────────
+
+def smart_position_analysis(symbol, entry_price, entry_qty):
+    """
+    التحليل الذكي الكامل للمركز:
+    يقرر: خروج / انتظار / averaging down
+    """
+    symbol = normalize_symbol(symbol)
+    entry_price = float(entry_price)
+    entry_qty   = float(entry_qty)
+
+    # جلب البيانات
+    h1 = get_candles(symbol, "60", 100)
+    d1 = get_candles(symbol, "1D", 60)
+
+    if not h1 and not d1:
+        return {"ok": False, "error": "لا توجد بيانات"}
+
+    # استخدم D1 إذا متاح، وإلا H1
+    candles = d1 if len(d1) >= 15 else h1
+
+    # السعر الحالي
+    current_price, price_tf, _ = get_latest_price(symbol)
+    if not current_price:
+        return {"ok": False, "error": "لا يوجد سعر حالي"}
+
+    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    pnl_aed = (current_price - entry_price) * entry_qty
+
+    # التحليلات
+    structure = analyze_price_structure(candles)
+    volume    = analyze_volume_behavior(candles)
+    phase, cmf_val, _ = detect_market_phase(candles)
+    rev_sigs  = detect_reversal_signals(candles)
+    supports  = find_key_support_levels(candles)
+
+    r = rsi([safe_float(c["close"]) for c in candles if safe_float(c["close"])], 14)
+    avg_calc  = calculate_averaging_down(entry_price, entry_qty, current_price)
+
+    # ── منطق القرار ──────────────────────────────────────────
+
+    exit_signals   = []
+    hold_signals   = []
+    avg_signals    = []
+    decision       = "HOLD"
+    confidence     = "MEDIUM"
+    avg_down_ok    = False
+
+    # إشارات الخروج
+    if structure["structure"] == "DOWNTREND" and structure["broken"]:
+        exit_signals.append("🔴 هيكل مكسور + اتجاه هابط")
+    elif structure["structure"] == "DOWNTREND":
+        exit_signals.append("🔴 اتجاه هابط — Lower Lows متتالية")
+
+    if volume["verdict"] == "REAL_SELLING":
+        exit_signals.append("🔴 بيع حقيقي مؤسسي")
+
+    if phase in ["MARKDOWN", "DISTRIBUTION"]:
+        exit_signals.append(f"🔴 المرحلة {phase} — ابتعد")
+
+    if any(s["severity"] == "CRITICAL" for s in rev_sigs):
+        exit_signals.append("⚠️ إشارة انعكاس حرجة")
+
+    if r and r > 70 and pnl_pct > 15:
+        exit_signals.append(f"⚠️ RSI مرتفع ({round(r,1)}) مع ربح جيد — فكر بالخروج")
+
+    # إشارات الانتظار
+    if structure["structure"] == "UPTREND":
+        hold_signals.append("✅ هيكل سليم — Higher Highs + Higher Lows")
+
+    if volume["verdict"] in ["HEALTHY_PULLBACK", "ACCUMULATION"]:
+        hold_signals.append(f"✅ {volume['description']}")
+
+    if phase in ["ACCUMULATION", "MARKUP"]:
+        hold_signals.append(f"✅ مرحلة {phase} — إيجابية")
+
+    if supports and current_price > supports[0] * 0.98:
+        hold_signals.append(f"✅ قريب من دعم {supports[0]} — قد يرتد")
+
+    # إشارات Averaging Down
+    if (structure["structure"] in ["UPTREND", "RANGING"] and
+        volume["verdict"] in ["HEALTHY_PULLBACK", "ACCUMULATION"] and
+        phase not in ["MARKDOWN", "DISTRIBUTION"] and
+        pnl_pct < -5):
+        avg_signals.append("✅ الهيكل سليم — Averaging Down ممكن")
+        avg_down_ok = True
+
+    if structure["broken"] or volume["verdict"] == "REAL_SELLING":
+        avg_down_ok = False
+        avg_signals = ["❌ لا تضيف على خسارة — الهيكل مكسور أو بيع حقيقي"]
+
+    # القرار النهائي
+    exit_score = len(exit_signals) * 2
+    hold_score = len(hold_signals)
+
+    if exit_score >= 4:
+        decision = "EXIT_NOW"
+        confidence = "HIGH"
+    elif exit_score >= 2 and hold_score == 0:
+        decision = "EXIT_SOON"
+        confidence = "MEDIUM"
+    elif hold_score >= 2 and exit_score == 0:
+        decision = "HOLD"
+        confidence = "HIGH"
+    elif avg_down_ok and exit_score == 0:
+        decision = "CONSIDER_AVERAGING"
+        confidence = "MEDIUM"
+    else:
+        decision = "WATCH"
+        confidence = "LOW"
+
+    return {
+        "ok":            True,
+        "symbol":        symbol,
+        "entry_price":   entry_price,
+        "entry_qty":     entry_qty,
+        "current_price": current_price,
+        "price_source":  price_tf,
+        "pnl_pct":       round(pnl_pct, 2),
+        "pnl_aed":       round(pnl_aed, 2),
+        "decision":      decision,
+        "confidence":    confidence,
+        "exit_signals":  exit_signals,
+        "hold_signals":  hold_signals,
+        "avg_signals":   avg_signals,
+        "avg_down_ok":   avg_down_ok,
+        "avg_calc":      avg_calc,
+        "structure":     structure,
+        "volume":        volume,
+        "phase":         phase,
+        "rsi":           round(r, 1) if r else None,
+        "key_supports":  supports,
+    }
+
+def format_position_analysis_tg(analysis):
+    """تنسيق تحليل المركز لـ Telegram"""
+    if not analysis.get("ok"):
+        return f"❌ {analysis.get('error','خطأ')}"
+
+    sym     = analysis["symbol"]
+    dec     = analysis["decision"]
+    conf    = analysis["confidence"]
+    pnl_pct = analysis["pnl_pct"]
+    pnl_aed = analysis["pnl_aed"]
+    phase   = analysis["phase"]
+    struct  = analysis["structure"]["structure"]
+    vol_v   = analysis["volume"]["verdict"]
+
+    # أيقونات
+    dec_icons = {
+        "EXIT_NOW":           "🚨 اخرج الآن",
+        "EXIT_SOON":          "🔴 خروج قريب",
+        "HOLD":               "✅ احتفظ",
+        "CONSIDER_AVERAGING": "🔵 فكر في Averaging Down",
+        "WATCH":              "👀 راقب",
+    }
+    conf_icons = {"HIGH":"عالية","MEDIUM":"متوسطة","LOW":"منخفضة"}
+    pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
+    phase_icons = {"ACCUMULATION":"🔵","MARKUP":"🟢","DISTRIBUTION":"🔴","MARKDOWN":"⛔","NEUTRAL":"⚪"}
+
+    lines = [
+        f"<b>🎯 تحليل مركز {sym}</b>",
+        "",
+        f"دخول: <b>{analysis['entry_price']}</b> | الكمية: {analysis['entry_qty']:.0f}",
+        f"السعر الحالي: <b>{analysis['current_price']}</b> ({analysis['price_source']})",
+        f"{pnl_icon} P&L: <b>{pnl_pct:+.2f}%</b> ({pnl_aed:+,.0f} AED)",
+        "",
+        f"<b>━━━ القرار ━━━</b>",
+        f"{dec_icons.get(dec, dec)} | ثقة: {conf_icons.get(conf,conf)}",
+        "",
+        f"<b>━━━ التحليل ━━━</b>",
+        f"الهيكل: <b>{struct}</b> — {analysis['structure']['description']}",
+        f"الحجم: <b>{vol_v}</b> — {analysis['volume']['description']}",
+        f"{phase_icons.get(phase,'⚪')} المرحلة: <b>{phase}</b>",
+        f"RSI: {analysis['rsi'] or '-'}",
+    ]
+
+    if analysis["key_supports"]:
+        lines.append(f"دعم رئيسي: {' | '.join(str(s) for s in analysis['key_supports'])}")
+
+    if analysis["exit_signals"]:
+        lines.append("")
+        lines.append("<b>إشارات الخروج:</b>")
+        lines.extend(analysis["exit_signals"])
+
+    if analysis["hold_signals"]:
+        lines.append("")
+        lines.append("<b>إشارات الانتظار:</b>")
+        lines.extend(analysis["hold_signals"])
+
+    # Averaging Down
+    if analysis["avg_down_ok"] and analysis["avg_calc"]:
+        ac = analysis["avg_calc"]
+        lines.append("")
+        lines.append("<b>━━━ Averaging Down ━━━</b>")
+        lines.append(f"{analysis['avg_signals'][0] if analysis['avg_signals'] else ''}")
+        lines.append("")
+        for opt in ac["options"][:3]:
+            lines.append(
+                f"• {opt['label']}: أضف {opt['add_qty']:.0f} سهم بـ {opt['add_value_aed']:,.0f} AED"
+                f" → سعر تعادل جديد: <b>{opt['new_avg_price']}</b>"
+                f" (تحتاج ارتفاع {opt['breakeven_pct']}%)"
+            )
+    elif analysis["avg_signals"]:
+        lines.append("")
+        lines.extend(analysis["avg_signals"])
+
+    return "\n".join(lines)
+
+def format_full_portfolio_analysis_tg():
+    """تحليل كامل لكل المحفظة"""
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN' ORDER BY symbol")
+        positions = c.fetchall()
+
+    if not positions:
+        return "📭 المحفظة فارغة"
+
+    lines = ["<b>🎯 تحليل المحفظة الكامل</b>", ""]
+    total_pnl = 0
+    exits = []; holds = []; avgs = []
+
+    for p in positions:
+        a = smart_position_analysis(p["symbol"], p["entry_price"], p["qty"])
+        if not a.get("ok"): continue
+        total_pnl += a["pnl_aed"]
+        icon = {"EXIT_NOW":"🚨","EXIT_SOON":"🔴","HOLD":"✅","CONSIDER_AVERAGING":"🔵","WATCH":"👀"}.get(a["decision"],"⚪")
+        line = f"{icon} <b>{a['symbol']}</b> | {a['pnl_pct']:+.2f}% | {a['decision']}"
+        if a["decision"] in ["EXIT_NOW","EXIT_SOON"]: exits.append(line)
+        elif a["decision"] == "CONSIDER_AVERAGING": avgs.append(line)
+        else: holds.append(line)
+
+    if exits:
+        lines.append("🚨 <b>اخرج الآن:</b>")
+        lines.extend(exits); lines.append("")
+    if avgs:
+        lines.append("🔵 <b>Averaging Down ممكن:</b>")
+        lines.extend(avgs); lines.append("")
+    if holds:
+        lines.append("✅ <b>احتفظ:</b>")
+        lines.extend(holds); lines.append("")
+
+    pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+    lines.append(f"{pnl_icon} <b>إجمالي P&L: {total_pnl:+,.0f} AED</b>")
+    return "\n".join(lines)
+
+
+
 # ── API ROUTES ────────────────────────────────────────────────
 
 @app.get("/")
@@ -1634,6 +2076,29 @@ def api_portfolio_trades(symbol:Optional[str]=None,limit:int=50):
         rows=c.fetchall()
     return {"ok":True,"count":len(rows),"trades":rows}
 
+@app.get("/api/portfolio/analyze/{symbol}")
+def api_position_analysis(symbol:str, entry:float=0, qty:float=0):
+    if entry<=0 or qty<=0:
+        with get_db() as conn:
+            c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM portfolio_positions WHERE symbol=%s AND status='OPEN'",(normalize_symbol(symbol),))
+            p=c.fetchone()
+        if not p: return {"ok":False,"error":"أدخل entry و qty أو أضف السهم للمحفظة"}
+        entry=float(p["entry_price"]); qty=float(p["qty"])
+    return smart_position_analysis(symbol,entry,qty)
+
+@app.get("/api/portfolio/analyze-all")
+def api_portfolio_analyze_all():
+    with get_db() as conn:
+        c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM portfolio_positions WHERE status='OPEN'")
+        positions=c.fetchall()
+    results=[]
+    for p in positions:
+        a=smart_position_analysis(p["symbol"],p["entry_price"],p["qty"])
+        results.append(a)
+    return {"ok":True,"count":len(results),"analyses":results}
+
 @app.get("/api/portfolio/monitor")
 def portfolio_monitor(secret:Optional[str]=None):
     if secret is not None and not cron_ok(secret): return {"ok":False,"error":"bad_secret"}
@@ -1729,6 +2194,22 @@ async def telegram_webhook(secret:str,request:Request):
             # ── المحفظة ──────────────────────────────────────────
             if upper in ["محفظة","PORTFOLIO","بورتفوليو"]:
                 return tg_send(chat_id,format_portfolio_tg())
+
+            # تحليل المحفظة الكامل
+            if upper in ["تحليل محفظتي","تحليل المحفظة","محفظة تحليل","ANALYZE PORTFOLIO"]:
+                return tg_send(chat_id,format_full_portfolio_analysis_tg())
+
+            # تحليل مركز معين — مركز EMAAR أو تحليل مركز EMAAR
+            if (upper.startswith("مركز ") or upper.startswith("تحليل مركز ")) and len(uparts)>=2:
+                sym=normalize_symbol(uparts[-1])
+                with get_db() as conn:
+                    c=conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    c.execute("SELECT * FROM portfolio_positions WHERE symbol=%s AND status='OPEN'",(sym,))
+                    p=c.fetchone()
+                if p:
+                    a=smart_position_analysis(sym,p["entry_price"],p["qty"])
+                    return tg_send(chat_id,format_position_analysis_tg(a))
+                return tg_send(chat_id,f"⚠️ {sym} مو موجود في محفظتك")
 
             if upper in ["صفقاتي","TRADES","HISTORY"]:
                 return tg_send(chat_id,format_trade_history_tg())
