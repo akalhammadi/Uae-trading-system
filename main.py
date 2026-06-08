@@ -41,7 +41,7 @@ MIN_CONFIDENCE_LIVE     = float(os.getenv("MIN_CONFIDENCE_LIVE", "70"))
 OBSERVATION_TARGET_PCT  = float(os.getenv("OBSERVATION_TARGET_PCT", "3.0"))
 OBSERVATION_DROP_PCT    = float(os.getenv("OBSERVATION_DROP_PCT", "2.0"))
 UAE_TZ_OFFSET           = timedelta(hours=4)
-MAX_CANDLE_AGE_HOURS    = int(os.getenv("MAX_CANDLE_AGE_HOURS", "72"))
+MAX_CANDLE_AGE_HOURS    = int(os.getenv("MAX_CANDLE_AGE_HOURS", "120"))  # 5 أيام — يغطي عطلة نهاية الأسبوع
 
 WATCHLIST = [
     "DTC","DU","EAND","EMSTEEL","ESHRAQ","GFH","GHITHA","GULFNAV",
