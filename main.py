@@ -590,6 +590,976 @@ def daily_trend_score(d1):
 
 # ── BUILD SIGNAL V20.1 ───────────────────────────────────────
 
+
+# ================================================================
+# V21 — MULTI-SCHOOL ANALYSIS ENGINE (Wyckoff + Classical Structure
+# + SMC/Order Flow + VPA) — يستبدل النظام المرجح الأحادي القديم
+# ================================================================
+
+# ============================================================
+# V21 — MULTI-SCHOOL ANALYSIS ENGINE
+# المدرسة 1: Wyckoff موسّع (مرحلة + موقع داخل المرحلة)
+# المدرسة 2: Classical Structure (الهيكل التقليدي)
+# ============================================================
+
+def find_swing_points(candles, lookback=3):
+    """
+    يجد القمم والقيعان المحلية (swing highs/lows) بدقة.
+    نقطة swing high: أعلى من lookback شمعة قبلها وبعدها.
+    """
+    highs = [safe_float(c["high"]) for c in candles]
+    lows = [safe_float(c["low"]) for c in candles]
+    swing_highs = []  # (index, price)
+    swing_lows = []
+    n = len(candles)
+    for i in range(lookback, n - lookback):
+        if highs[i] is None: continue
+        is_high = all(highs[i] >= (highs[i-j] or 0) for j in range(1, lookback+1)) and \
+                  all(highs[i] >= (highs[i+j] or 0) for j in range(1, lookback+1))
+        if is_high:
+            swing_highs.append((i, highs[i]))
+        if lows[i] is None: continue
+        is_low = all(lows[i] <= (lows[i-j] or 1e9) for j in range(1, lookback+1)) and \
+                 all(lows[i] <= (lows[i+j] or 1e9) for j in range(1, lookback+1))
+        if is_low:
+            swing_lows.append((i, lows[i]))
+    return swing_highs, swing_lows
+
+
+def classical_structure_analysis(candles):
+    """
+    المدرسة 2: التحليل الهيكلي الكلاسيكي.
+    يحدد: HH/HL (uptrend) أو LH/LL (downtrend) أو هيكل مكسور، باستخدام swing points حقيقية
+    بدل تقسيم الشموع لأثلاث (أدق وأكثر موثوقية).
+    """
+    if len(candles) < 25:
+        return {"vote": "WAIT", "confidence": 0, "structure": "UNKNOWN",
+                "reasoning": "بيانات غير كافية لتحديد الهيكل"}
+
+    swing_highs, swing_lows = find_swing_points(candles, lookback=3)
+    closes = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+    current_price = closes[-1] if closes else None
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return {"vote": "WAIT", "confidence": 0, "structure": "RANGING",
+                "reasoning": "لا توجد swing points كافية — السوق متذبذب"}
+
+    # آخر قمتين وآخر قاعين *المكتشفتين* (قد تكون قديمة نسبياً إذا كان هناك زخم مستمر بدون تصحيح)
+    last_highs = swing_highs[-2:]
+    last_lows = swing_lows[-2:]
+
+    hh = last_highs[1][1] > last_highs[0][1]   # Higher High
+    hl = last_lows[1][1] > last_lows[0][1]     # Higher Low
+    lh = last_highs[1][1] < last_highs[0][1]   # Lower High
+    ll = last_lows[1][1] < last_lows[0][1]     # Lower Low
+
+    last_major_low = last_lows[-1][1]
+    last_major_high = last_highs[-1][1]
+
+    # FIX: كشف زخم مستمر بدون تصحيح (monotonic move) — يحدث عندما تكون آخر swing points
+    # قديمة نسبياً (10+ شمعة) بينما السعر الحالي تجاوزها بوضوح باتجاه واحد فقط.
+    # هذا يمثل حركة Markup/Markdown نشطة لم تتشكل فيها swing points جديدة بعد لأنها لم تصحح،
+    # ويجب التعامل معها كاستمرار اتجاه (BOS) لا كهيكل هابط/متذبذب خاطئ.
+    last_high_idx = swing_highs[-1][0]
+    last_low_idx = swing_lows[-1][0]
+    candles_since_high = (len(candles) - 1) - last_high_idx
+    candles_since_low = (len(candles) - 1) - last_low_idx
+    sustained_rally = (current_price is not None and current_price > last_major_high
+                        and candles_since_high >= 10 and candles_since_low < candles_since_high)
+    sustained_decline = (current_price is not None and current_price < last_major_low
+                          and candles_since_low >= 10 and candles_since_high < candles_since_low)
+
+    # Break of Structure (BOS): كسر آخر swing مهم في اتجاه الترند
+    bos_down = current_price is not None and current_price < last_major_low and not sustained_rally
+    bos_up = current_price is not None and current_price > last_major_high and not sustained_decline
+
+    if sustained_rally:
+        structure = "SUSTAINED_UPTREND"
+        vote, conf = "BUY_BIAS", 65
+        reasoning = "زخم صاعد مستمر بدون تصحيح يُذكر — السعر تجاوز آخر قمة معروفة بثبات"
+    elif sustained_decline:
+        structure = "SUSTAINED_DOWNTREND"
+        vote, conf = "AVOID", 70
+        reasoning = "زخم هابط مستمر بدون ارتداد — السعر تحت آخر قاع معروف بثبات"
+    elif hh and hl:
+        structure = "UPTREND_INTACT"
+        vote, conf = "BUY_BIAS", 70
+        reasoning = "هيكل صاعد سليم — Higher High + Higher Low مؤكدتان"
+    elif hh and not hl and not bos_down:
+        structure = "UPTREND_WEAKENING"
+        vote, conf = "WAIT", 40
+        reasoning = "قمة أعلى لكن القاع لم يرتفع — الزخم يضعف"
+    elif ll and lh:
+        structure = "DOWNTREND_INTACT"
+        vote, conf = "AVOID", 70
+        reasoning = "هيكل هابط — Lower Low + Lower High"
+    elif bos_down:
+        structure = "STRUCTURE_BROKEN_BEARISH"
+        vote, conf = "AVOID", 85
+        reasoning = f"كسر هيكلي هابط (BOS) تحت {round(last_major_low,3)}"
+    elif bos_up:
+        structure = "STRUCTURE_BROKEN_BULLISH"
+        vote, conf = "BUY_BIAS", 75
+        reasoning = f"كسر هيكلي صاعد (BOS) فوق {round(last_major_high,3)}"
+    else:
+        structure = "RANGING"
+        vote, conf = "WAIT", 30
+        reasoning = "هيكل متذبذب بدون اتجاه واضح"
+
+    return {
+        "vote": vote, "confidence": conf, "structure": structure,
+        "reasoning": reasoning,
+        "last_swing_high": round(last_highs[-1][1], 4),
+        "last_swing_low": round(last_lows[-1][1], 4),
+        "bos_up": bos_up, "bos_down": bos_down,
+    }
+
+
+def wyckoff_phase_position(candles, market_phase, phase_details):
+    """
+    المدرسة 1: Wyckoff موسّع — لا يكتفي بتحديد المرحلة (موجود مسبقاً في detect_market_phase)
+    بل يحدد *الموقع داخل المرحلة*:
+    - Accumulation: Phase A (Selling Climax) → B (Building Cause) → C (Spring/Test) → D (SOS) → E (Markup بدأ)
+    - Distribution: نفس المنطق بالعكس
+    هذا يحل مشكلة "الإشارة قريبة جداً من الانعكاس" لأنه يميّز بين تجميع مبكر (خطر) ومتأخر (فرصة).
+    """
+    if len(candles) < 30:
+        return {"vote": "WAIT", "confidence": 0, "sub_phase": "UNKNOWN",
+                "reasoning": "بيانات غير كافية لتحليل Wyckoff"}
+
+    closes = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
+    lows = [safe_float(c["low"]) for c in candles if safe_float(c["low"])]
+    highs = [safe_float(c["high"]) for c in candles if safe_float(c["high"])]
+
+    obv = compute_obv(candles)
+    cmf_val = compute_cmf(candles, 14)
+    avg_vol_20 = sma(volumes, 20) or 1
+    recent_vol = sma(volumes[-5:], 5) or avg_vol_20
+    vol_trend_falling = recent_vol < avg_vol_20 * 0.85  # حجم يتقلص = اقتراب من نهاية المرحلة
+
+    price_range_pct = phase_details.get("price_range_pct", 10)
+    obv_rising = phase_details.get("obv_rising", False)
+
+    swing_highs, swing_lows = find_swing_points(candles, lookback=3)
+
+    if market_phase == "ACCUMULATION":
+        # هل في "Spring" — كسر القاع الأخير ثم رجوع سريع فوقه بحجم منخفض؟
+        spring_detected = False
+        if len(swing_lows) >= 2 and len(lows) >= 5:
+            prior_low = swing_lows[-2][1]
+            recent_min = min(lows[-5:])
+            recent_close = closes[-1]
+            if recent_min < prior_low * 0.995 and recent_close > prior_low:
+                spring_detected = True
+
+        if spring_detected and vol_trend_falling:
+            sub_phase = "PHASE_C_SPRING"
+            vote, conf = "BUY", 80
+            reasoning = "Spring مكتشف — اختبار قاع بحجم منخفض ثم ارتداد = نهاية التجميع، فرصة دخول قوية"
+        elif price_range_pct < 6 and vol_trend_falling and obv_rising:
+            sub_phase = "PHASE_B_C_LATE"
+            vote, conf = "BUY", 65
+            reasoning = "تجميع متأخر — نطاق ضيق + حجم متقلص + OBV صاعد = استعداد للانطلاق"
+        elif obv_rising and not vol_trend_falling:
+            sub_phase = "PHASE_B_EARLY"
+            vote, conf = "WAIT", 45
+            reasoning = "تجميع مبكر (Phase B) — لا يزال مبكراً، السبب (cause) لم يكتمل بناؤه بعد"
+        else:
+            sub_phase = "PHASE_A"
+            vote, conf = "WAIT", 30
+            reasoning = "بداية تجميع محتملة — مبكر جداً للدخول"
+
+    elif market_phase == "MARKUP":
+        # هل لا يزال في بداية الـ Markup (Phase D-E مبكرة) أم متقدم وقريب من القمة؟
+        # FIX: نستخدم آخر swing low حقيقي (قاع بداية الحركة) بدل min(آخر 20 شمعة) الذي
+        # كان يقطع منتصف الحركة الصاعدة ويعطي قراءة خاطئة لمدى التقدم في الـ Markup.
+        base_low = None
+        if swing_lows:
+            base_low = swing_lows[-1][1]
+            # إذا كان آخر swing low قريب جداً زمنياً (أقل من 8 شموع)، نرجع لقاع أعمق قبله
+            if len(swing_lows) >= 2 and (len(candles) - 1 - swing_lows[-1][0]) < 8:
+                base_low = swing_lows[-2][1]
+        if base_low is None and lows:
+            base_low = min(lows[-30:]) if len(lows) >= 30 else min(lows)
+
+        move_from_base = ((closes[-1] - base_low) / base_low) * 100 if base_low else 0
+
+        if move_from_base < 8 and obv_rising:
+            sub_phase = "PHASE_D_EARLY_MARKUP"
+            vote, conf = "BUY", 75
+            reasoning = f"بداية صعود مؤكدة ({round(move_from_base,1)}% من القاع) — أفضل نقطة دخول في Markup"
+        elif move_from_base < 18:
+            sub_phase = "PHASE_D_MID_MARKUP"
+            vote, conf = "BUY", 55
+            reasoning = f"صعود متوسط ({round(move_from_base,1)}% من القاع) — لا يزال مقبولاً لكن المخاطرة أعلى"
+        else:
+            sub_phase = "PHASE_E_LATE_MARKUP"
+            vote, conf = "WAIT", 35
+            reasoning = f"صعود متقدم ({round(move_from_base,1)}% من القاع) — قريب جداً، انتظر تصحيح"
+
+    elif market_phase == "DISTRIBUTION":
+        upthrust_detected = False
+        if len(swing_highs) >= 2 and len(highs) >= 5:
+            prior_high = swing_highs[-2][1]
+            recent_max = max(highs[-5:])
+            recent_close = closes[-1]
+            if recent_max > prior_high * 1.005 and recent_close < prior_high:
+                upthrust_detected = True
+        if upthrust_detected:
+            sub_phase = "PHASE_C_UPTHRUST"
+            vote, conf = "AVOID", 85
+            reasoning = "Upthrust مكتشف — فخصعود فوق القمة ثم رفض = توزيع متقدم، خطر هبوط وشيك"
+        else:
+            sub_phase = "PHASE_B_DISTRIBUTION"
+            vote, conf = "AVOID", 65
+            reasoning = "توزيع نشط — مؤسسات تبيع، تجنب الدخول"
+
+    elif market_phase == "MARKDOWN":
+        if len(closes) >= 20:
+            decline_pct = ((max(highs[-20:]) - closes[-1]) / max(highs[-20:])) * 100 if max(highs[-20:]) else 0
+        else:
+            decline_pct = 0
+        if decline_pct > 20 and vol_trend_falling:
+            sub_phase = "MARKDOWN_EXHAUSTION"
+            vote, conf = "WAIT", 40
+            reasoning = f"هبوط ممتد ({round(decline_pct,1)}%) مع تقلص حجم — احتمال اقتراب من قاع، راقب للتجميع القادم"
+        else:
+            sub_phase = "MARKDOWN_ACTIVE"
+            vote, conf = "AVOID", 80
+            reasoning = "هبوط نشط ومستمر — ابتعد تماماً"
+    else:
+        sub_phase = "NEUTRAL"
+        vote, conf = "WAIT", 25
+        reasoning = "لا توجد مرحلة Wyckoff واضحة"
+
+    return {
+        "vote": vote, "confidence": conf, "sub_phase": sub_phase,
+        "reasoning": reasoning, "market_phase": market_phase,
+    }
+# ============================================================
+# المدرسة 3: SMC / Order Flow (Order Blocks, FVG, Liquidity Sweeps)
+# المدرسة 4: VPA (Volume Price Analysis)
+# ============================================================
+
+def find_order_blocks(candles, lookback=40):
+    """
+    Order Block: آخر شمعة هابطة (أو مجموعة) قبل حركة صاعدة قوية تكسر هيكلاً —
+    تمثل منطقة حيث دخلت مؤسسات بكميات كبيرة. السعر يميل للعودة لاختبارها قبل الاستمرار.
+    نبحث عن: شمعة حمراء (أو أخيرة قبل انعكاس) يتبعها صعود قوي (>1.5x ATR) يكسر قمة سابقة.
+    """
+    if len(candles) < lookback:
+        lookback = len(candles)
+    recent = candles[-lookback:]
+    closes = [safe_float(c["close"]) for c in recent]
+    opens = [safe_float(c["open"]) for c in recent]
+    highs = [safe_float(c["high"]) for c in recent]
+    lows = [safe_float(c["low"]) for c in recent]
+
+    atr_val = atr(candles, 14) or (closes[-1] * 0.01 if closes[-1] else 1)
+
+    bullish_obs = []  # Order Blocks صاعدة (دعم محتمل)
+    bearish_obs = []  # Order Blocks هابطة (مقاومة محتملة)
+
+    for i in range(2, len(recent) - 3):
+        if None in [closes[i], opens[i], highs[i], lows[i]]: continue
+        is_red = closes[i] < opens[i]
+        is_green = closes[i] > opens[i]
+
+        # Bullish OB: شمعة حمراء يتبعها صعود قوي يكسر قمة الشموع الثلاث التالية
+        if is_red:
+            next3_close = closes[i+1:i+4] if i+4 <= len(recent) else []
+            next3_high = highs[i+1:i+4] if i+4 <= len(recent) else []
+            if next3_close and next3_high:
+                move = (max(next3_close) - closes[i]) if closes[i] else 0
+                if move > atr_val * 1.5:
+                    bullish_obs.append({
+                        "low": lows[i], "high": highs[i], "index": i,
+                        "strength": round(move / atr_val, 2)
+                    })
+
+        # Bearish OB: شمعة خضراء يتبعها هبوط قوي يكسر قاع الشموع الثلاث التالية
+        if is_green:
+            next3_close = closes[i+1:i+4] if i+4 <= len(recent) else []
+            if next3_close:
+                move = (closes[i] - min(next3_close)) if closes[i] else 0
+                if move > atr_val * 1.5:
+                    bearish_obs.append({
+                        "low": lows[i], "high": highs[i], "index": i,
+                        "strength": round(move / atr_val, 2)
+                    })
+
+    # نأخذ أقوى 3 من كل نوع، الأحدث أولاً
+    bullish_obs = sorted(bullish_obs, key=lambda x: (-x["index"], -x["strength"]))[:3]
+    bearish_obs = sorted(bearish_obs, key=lambda x: (-x["index"], -x["strength"]))[:3]
+    return bullish_obs, bearish_obs
+
+
+def find_fair_value_gaps(candles, lookback=30):
+    """
+    Fair Value Gap (FVG): فجوة بين شمعة 1 وشمعة 3 لا يغطيها range الشمعة 2 —
+    تمثل عدم توازن في السعر، السوق يميل لـ"تعبئتها" لاحقاً قبل الاستمرار في الاتجاه.
+    """
+    if len(candles) < lookback:
+        lookback = len(candles)
+    recent = candles[-lookback:]
+    highs = [safe_float(c["high"]) for c in recent]
+    lows = [safe_float(c["low"]) for c in recent]
+
+    bullish_fvgs = []
+    bearish_fvgs = []
+
+    for i in range(2, len(recent)):
+        if None in [highs[i], lows[i], highs[i-2], lows[i-2]]: continue
+        # Bullish FVG: قاع الشمعة الحالية أعلى من قمة شمعة-2
+        if lows[i] > highs[i-2]:
+            bullish_fvgs.append({"gap_low": highs[i-2], "gap_high": lows[i], "index": i})
+        # Bearish FVG: قمة الشمعة الحالية أقل من قاع شمعة-2
+        if highs[i] < lows[i-2]:
+            bearish_fvgs.append({"gap_low": highs[i], "gap_high": lows[i-2], "index": i})
+
+    return bullish_fvgs[-3:], bearish_fvgs[-3:]
+
+
+def detect_liquidity_sweep(candles, swing_highs, swing_lows):
+    """
+    Liquidity Sweep: السعر يخترق swing high/low سابق بفتيل (wick) قوي ثم يرتد بسرعة —
+    يعني تم "اصطياد" أوامر وقف الخسارة (stop hunt) قبل الحركة الحقيقية.
+    """
+    if len(candles) < 10 or not swing_lows or not swing_highs:
+        return {"swept_low": False, "swept_high": False}
+
+    last_3 = candles[-3:]
+    closes = [safe_float(c["close"]) for c in last_3]
+    lows = [safe_float(c["low"]) for c in last_3]
+    highs = [safe_float(c["high"]) for c in last_3]
+
+    last_swing_low = swing_lows[-1][1] if swing_lows else None
+    last_swing_high = swing_highs[-1][1] if swing_highs else None
+
+    swept_low = False
+    swept_high = False
+
+    if last_swing_low:
+        for j in range(len(last_3)):
+            if lows[j] is not None and lows[j] < last_swing_low * 0.998 and closes[j] is not None and closes[j] > last_swing_low:
+                swept_low = True
+                break
+
+    if last_swing_high:
+        for j in range(len(last_3)):
+            if highs[j] is not None and highs[j] > last_swing_high * 1.002 and closes[j] is not None and closes[j] < last_swing_high:
+                swept_high = True
+                break
+
+    return {"swept_low": swept_low, "swept_high": swept_high,
+            "reference_low": last_swing_low, "reference_high": last_swing_high}
+
+
+def smc_order_flow_analysis(candles):
+    """
+    المدرسة 3: SMC الكاملة — تجمع Order Blocks + FVG + Liquidity Sweep في تصويت واحد.
+    """
+    if len(candles) < 30:
+        return {"vote": "WAIT", "confidence": 0, "reasoning": "بيانات غير كافية لتحليل SMC"}
+
+    current_price = safe_float(candles[-1]["close"])
+    if not current_price:
+        return {"vote": "WAIT", "confidence": 0, "reasoning": "لا يوجد سعر حالي"}
+
+    swing_highs, swing_lows = find_swing_points(candles, lookback=3)
+    bullish_obs, bearish_obs = find_order_blocks(candles)
+    bullish_fvgs, bearish_fvgs = find_fair_value_gaps(candles)
+    sweep = detect_liquidity_sweep(candles, swing_highs, swing_lows)
+
+    score = 0
+    reasons = []
+
+    # السعر قريب من Order Block صاعد (منطقة دعم مؤسسية) = إيجابي قوي
+    near_bullish_ob = False
+    for ob in bullish_obs:
+        if ob["low"] * 0.99 <= current_price <= ob["high"] * 1.02:
+            near_bullish_ob = True
+            score += 30
+            reasons.append(f"السعر عند Order Block صاعد (قوة {ob['strength']}x ATR)")
+            break
+
+    # السعر قريب من Order Block هابط (منطقة مقاومة) = سلبي
+    near_bearish_ob = False
+    for ob in bearish_obs:
+        if ob["low"] * 0.98 <= current_price <= ob["high"] * 1.01:
+            near_bearish_ob = True
+            score -= 25
+            reasons.append(f"السعر عند Order Block هابط (مقاومة مؤسسية)")
+            break
+
+    # Liquidity Sweep للقاع ثم ارتداد = إشارة دخول قوية جداً (stop hunt انتهى)
+    if sweep["swept_low"]:
+        score += 35
+        reasons.append("Liquidity Sweep للقاع — تم اصطياد وقف الخسائر، ارتداد محتمل قوي")
+    if sweep["swept_high"]:
+        score -= 30
+        reasons.append("Liquidity Sweep للقمة — اصطياد سيولة صاعدة، احتمال انعكاس هابط")
+
+    # FVG صاعدة قريبة لم تُغلق بعد = منطقة جذب للسعر (دعم)
+    for fvg in bullish_fvgs:
+        if fvg["gap_low"] * 0.98 <= current_price <= fvg["gap_high"] * 1.03:
+            score += 15
+            reasons.append("السعر داخل Fair Value Gap صاعدة — منطقة توازن محتملة")
+            break
+
+    if score >= 40:
+        vote, conf = "BUY", min(90, 50 + score // 2)
+    elif score >= 20:
+        vote, conf = "BUY_BIAS", 55
+    elif score <= -30:
+        vote, conf = "AVOID", min(85, 50 + abs(score) // 2)
+    elif score <= -15:
+        vote, conf = "WAIT", 45
+    else:
+        vote, conf = "WAIT", 30
+
+    if not reasons:
+        reasons.append("لا توجد مناطق SMC واضحة قريبة من السعر الحالي")
+
+    return {
+        "vote": vote, "confidence": conf, "score": score,
+        "reasoning": " | ".join(reasons),
+        "near_bullish_ob": near_bullish_ob, "near_bearish_ob": near_bearish_ob,
+        "swept_low": sweep["swept_low"], "swept_high": sweep["swept_high"],
+        "bullish_obs": bullish_obs, "bearish_obs": bearish_obs,
+        "bullish_fvgs": bullish_fvgs, "bearish_fvgs": bearish_fvgs,
+    }
+
+
+def vpa_analysis(candles):
+    """
+    المدرسة 4: Volume Price Analysis (نهج Wyckoff/Tom Williams).
+    القاعدة الأساسية: كل حركة سعرية يجب أن "يصدّقها" الحجم. التناقض بين السعر والحجم = تحذير.
+
+    الأنماط المكتشفة:
+    - No Demand: صعود بحجم ضعيف = صعود غير مدعوم، خطر
+    - No Supply: هبوط بحجم ضعيف = هبوط غير مدعوم، فرصة محتملة
+    - Stopping Volume: حجم ضخم في القاع مع شمعة صغيرة = توقف البيع
+    - Climactic Volume: حجم ضخم استثنائي = احتمال نهاية الحركة
+    """
+    if len(candles) < 20:
+        return {"vote": "WAIT", "confidence": 0, "reasoning": "بيانات غير كافية لـ VPA"}
+
+    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
+    closes = [safe_float(c["close"]) for c in candles]
+    opens = [safe_float(c["open"]) for c in candles]
+    highs = [safe_float(c["high"]) for c in candles]
+    lows = [safe_float(c["low"]) for c in candles]
+
+    avg_vol = sma(volumes, 20) or 1
+    last = candles[-1]
+    last_vol = volumes[-1]
+    last_close = closes[-1]
+    last_open = opens[-1]
+    last_high = highs[-1]
+    last_low = lows[-1]
+
+    if None in [last_close, last_open, last_high, last_low] or last_high == last_low:
+        return {"vote": "WAIT", "confidence": 0, "reasoning": "بيانات الشمعة الأخيرة ناقصة"}
+
+    vol_ratio = last_vol / avg_vol if avg_vol else 1
+    spread = last_high - last_low
+    body = abs(last_close - last_open)
+    body_ratio = body / spread if spread else 0
+    close_position = (last_close - last_low) / spread if spread else 0.5  # 1=close at high, 0=close at low
+
+    is_up_candle = last_close > last_open
+    is_down_candle = last_close < last_open
+
+    # اتجاه آخر 5 شموع
+    recent_trend_up = closes[-1] > closes[-6] if len(closes) >= 6 and closes[-6] else False
+    recent_trend_down = closes[-1] < closes[-6] if len(closes) >= 6 and closes[-6] else False
+
+    pattern = None
+    vote, conf = "WAIT", 25
+    reasoning = "لا يوجد نمط VPA واضح"
+
+    # No Demand: صعود بحجم ضعيف وspread ضيق
+    if is_up_candle and vol_ratio < 0.7 and recent_trend_up:
+        pattern = "NO_DEMAND"
+        vote, conf = "AVOID", 60
+        reasoning = f"No Demand — صعود بحجم ضعيف ({round(vol_ratio,2)}x) بعد ترند صاعد = نقص اهتمام مشترين"
+
+    # No Supply: هبوط بحجم ضعيف بعد ترند هابط = بائعون استنفدوا
+    elif is_down_candle and vol_ratio < 0.7 and recent_trend_down:
+        pattern = "NO_SUPPLY"
+        vote, conf = "BUY_BIAS", 55
+        reasoning = f"No Supply — هبوط بحجم ضعيف ({round(vol_ratio,2)}x) = البائعون يستنفدون، احتمال ارتداد"
+
+    # Stopping Volume: حجم ضخم جداً + شمعة بإغلاق قرب القمة بعد هبوط = توقف بيع مؤسسي
+    elif vol_ratio > 2.2 and recent_trend_down and close_position > 0.6:
+        pattern = "STOPPING_VOLUME"
+        vote, conf = "BUY", 75
+        reasoning = f"Stopping Volume — حجم ضخم ({round(vol_ratio,2)}x) مع إغلاق قوي بعد هبوط = امتصاص مؤسسي للبيع"
+
+    # Climactic Volume (بيعي): حجم ضخم جداً مع إغلاق ضعيف بعد صعود = ذروة شراء/توزيع
+    elif vol_ratio > 2.5 and recent_trend_up and close_position < 0.4:
+        pattern = "BUYING_CLIMAX"
+        vote, conf = "AVOID", 70
+        reasoning = f"Buying Climax — حجم استثنائي ({round(vol_ratio,2)}x) مع إغلاق ضعيف بعد صعود = ذروة توزيع محتملة"
+
+    # Effort vs Result: حجم كبير لكن حركة سعرية ضئيلة = صراع، انعكاس محتمل
+    elif vol_ratio > 1.8 and body_ratio < 0.3:
+        pattern = "EFFORT_NO_RESULT"
+        if recent_trend_up:
+            vote, conf = "WAIT", 50
+            reasoning = f"Effort vs No Result — حجم كبير ({round(vol_ratio,2)}x) بدون حركة سعرية بعد صعود = ضعف زخم"
+        else:
+            vote, conf = "WAIT", 45
+            reasoning = f"Effort vs No Result — حجم كبير بدون حركة بعد هبوط = تردد السوق"
+
+    # تأكيد طبيعي: صعود بحجم قوي
+    elif is_up_candle and vol_ratio > 1.3 and body_ratio > 0.5:
+        pattern = "DEMAND_CONFIRMED"
+        vote, conf = "BUY_BIAS", 55
+        reasoning = f"تأكيد طلب — صعود بحجم قوي ({round(vol_ratio,2)}x) ومصداقية سعرية عالية"
+
+    return {
+        "vote": vote, "confidence": conf, "pattern": pattern,
+        "reasoning": reasoning, "vol_ratio": round(vol_ratio, 2),
+        "close_position": round(close_position, 2),
+    }
+# ============================================================
+# نظام التصويت متعدد المدارس + الأهداف المبنية على الهيكل + Decision Lock الذكي
+# ============================================================
+
+VOTE_SCORE = {"BUY": 2, "BUY_BIAS": 1, "WAIT": 0, "AVOID": -2}
+
+def multi_school_vote(candles, market_phase, cmf_val, phase_details):
+    """
+    يجمع تصويت المدارس الأربع ويحسب القرار النهائي.
+    يتطلب توافق 3 من 4 مدارس على الأقل (أو غالبية وزنية قوية) للوصول لـ BUY حقيقي.
+    """
+    structure = classical_structure_analysis(candles)
+    wyckoff = wyckoff_phase_position(candles, market_phase, phase_details)
+    smc = smc_order_flow_analysis(candles)
+    vpa = vpa_analysis(candles)
+
+    schools = {
+        "classical_structure": structure,
+        "wyckoff": wyckoff,
+        "smc_order_flow": smc,
+        "vpa": vpa,
+    }
+
+    # نحول كل صوت لرقم مرجح بثقته
+    weighted_scores = []
+    buy_votes = 0
+    avoid_votes = 0
+    for name, s in schools.items():
+        base = VOTE_SCORE.get(s["vote"], 0)
+        conf_mult = s.get("confidence", 0) / 100
+        weighted_scores.append(base * conf_mult)
+        if s["vote"] in ["BUY", "BUY_BIAS"]:
+            buy_votes += 1
+        elif s["vote"] == "AVOID":
+            avoid_votes += 1
+
+    total_weighted = sum(weighted_scores)
+
+    # قرار التوافق: يحتاج 3+ من 4 يصوتون BUY/BUY_BIAS، وعدم وجود AVOID من مدرستين أو أكثر
+    consensus_buy = buy_votes >= 3 and avoid_votes <= 1
+    strong_buy = buy_votes == 4
+    any_critical_avoid = (
+        schools["wyckoff"].get("confidence", 0) >= 80 and schools["wyckoff"]["vote"] == "AVOID"
+    ) or (
+        schools["classical_structure"].get("confidence", 0) >= 80 and schools["classical_structure"]["vote"] == "AVOID"
+    )
+
+    if any_critical_avoid:
+        final_decision = "AVOID"
+        final_confidence = max(s.get("confidence", 0) for s in schools.values() if s["vote"] == "AVOID")
+    elif strong_buy:
+        final_decision = "BUY"
+        final_confidence = min(95, 65 + total_weighted * 8)
+    elif consensus_buy:
+        final_decision = "BUY"
+        final_confidence = min(85, 55 + total_weighted * 8)
+    elif avoid_votes >= 3:
+        final_decision = "AVOID"
+        final_confidence = min(90, 55 + abs(total_weighted) * 8)
+    elif avoid_votes >= 2 and buy_votes <= 1:
+        final_decision = "AVOID"
+        final_confidence = 55
+    else:
+        final_decision = "WAIT"
+        final_confidence = 35
+
+    final_confidence = max(0, min(100, round(final_confidence)))
+
+    return {
+        "final_decision": final_decision,
+        "final_confidence": final_confidence,
+        "buy_votes": buy_votes,
+        "avoid_votes": avoid_votes,
+        "total_weighted_score": round(total_weighted, 2),
+        "schools": schools,
+    }
+
+
+def structure_based_targets(candles, entry_price, vote_result, kind="SHORT_SWING"):
+    """
+    الأهداف الجديدة: مبنية على هيكل السوق الحقيقي (مناطق سيولة، Order Blocks معاكسة،
+    قمم Wyckoff سابقة) بدل مضاعف ATR تعسفي. هذا يحل مشكلة "الهدف 1% فقط".
+
+    منطق الهدف:
+    1. أقرب Order Block هابط فوق السعر = هدف أول طبيعي (مقاومة مؤسسية)
+    2. أقرب Fair Value Gap هابطة لم تُغلق = هدف وسيط
+    3. آخر swing high مهم = هدف ثانٍ
+    4. إذا لا توجد مناطق هيكلية واضحة، استخدم ATR كنسخة احتياطية فقط
+    """
+    smc = vote_result["schools"]["smc_order_flow"]
+    structure = vote_result["schools"]["classical_structure"]
+
+    atr_val = atr(candles, 14) or (entry_price * 0.015)
+    candidates = []
+
+    # من Order Blocks الهابطة (مقاومة)
+    for ob in smc.get("bearish_obs", []):
+        mid = (ob["low"] + ob["high"]) / 2
+        if mid > entry_price * 1.015:  # على الأقل 1.5% فوق الدخول
+            candidates.append(("order_block", mid))
+
+    # من Fair Value Gaps الهابطة
+    for fvg in smc.get("bearish_fvgs", []):
+        mid = (fvg["gap_low"] + fvg["gap_high"]) / 2
+        if mid > entry_price * 1.015:
+            candidates.append(("fvg", mid))
+
+    # من آخر swing high (الحديث)
+    last_high = structure.get("last_swing_high")
+    if last_high and last_high > entry_price * 1.015:
+        candidates.append(("swing_high", last_high))
+
+    # FIX: قمم تاريخية أبعد (حتى 150 شمعة) — تغطي حالات التجميع بعد تصحيح من قمة سابقة بعيدة،
+    # حيث تكون كل Order Blocks/FVGs الحديثة (آخر 30-40 شمعة) تحت السعر الحالي بطبيعتها
+    # لأنها تشكلت أثناء مرحلة التجميع نفسها لا قبلها.
+    extended_lookback = min(len(candles), 150)
+    sh_all, _ = find_swing_points(candles[-extended_lookback:], lookback=3)
+    for idx, price_val in sh_all:
+        if price_val > entry_price * 1.015:
+            candidates.append(("historical_high", price_val))
+
+    # رتب المرشحين من الأقرب للأبعد، نأخذ أقرب 4 لتفادي امتداد غير واقعي
+    candidates = sorted(set(candidates), key=lambda x: x[1])[:4]
+
+    if len(candidates) >= 2:
+        target1 = candidates[0][1]
+        target2 = candidates[1][1]
+        target3 = candidates[2][1] if len(candidates) >= 3 else target2 * 1.02
+        target_source = f"هيكلي ({candidates[0][0]}, {candidates[1][0]})"
+    elif len(candidates) == 1:
+        target1 = candidates[0][1]
+        # نمدد للهدفين التاليين بنسب من ATR كمكمل
+        target2 = target1 + atr_val * 1.5
+        target3 = target1 + atr_val * 3.0
+        target_source = f"هيكلي جزئي ({candidates[0][0]}) + ATR"
+    else:
+        # احتياطي: لا توجد مناطق هيكلية فوق السعر إطلاقاً (نادر، يعني السهم عند قمة تاريخية)
+        mult = 2.5 if kind == "SHORT_SWING" else 4.5
+        target1 = entry_price + atr_val * mult
+        target2 = entry_price + atr_val * mult * 1.6
+        target3 = entry_price + atr_val * mult * 2.2
+        target_source = "ATR احتياطي (السعر عند أعلى مستوى تاريخي معروف — لا مقاومات فوقه)"
+
+    # وقف الخسارة: تحت أقرب Order Block صاعد أو swing low، أيهما أقرب منطقياً
+    stop_candidates = []
+    for ob in smc.get("bullish_obs", []):
+        if ob["low"] < entry_price * 0.995:
+            stop_candidates.append(ob["low"] * 0.995)
+    last_low = structure.get("last_swing_low")
+    if last_low and last_low < entry_price * 0.995:
+        stop_candidates.append(last_low * 0.995)
+
+    if stop_candidates:
+        stop_loss = max(stop_candidates)  # أقرب وقف منطقي (الأعلى بين المرشحين تحت السعر)
+    else:
+        stop_mult = 1.2 if kind == "SHORT_SWING" else 2.0
+        stop_loss = entry_price - atr_val * stop_mult
+
+    # تأكد من نسبة مخاطرة معقولة (بين 1% و8%)
+    risk_pct = ((entry_price - stop_loss) / entry_price) * 100 if entry_price else 0
+    if risk_pct > 8:
+        stop_loss = entry_price * 0.93
+        risk_pct = 7.0
+    elif risk_pct < 1:
+        stop_loss = entry_price * 0.985
+        risk_pct = 1.5
+
+    # FIX: إذا كان T1 الهيكلي قريباً جداً لدرجة RR أقل من 1.0، هذا يعني المقاومة الأقرب
+    # لا تستاهل المخاطرة الحالية — نقفز لـ T2 كهدف أول فعلي بدل تجاهل المشكلة.
+    rr = ((target1 - entry_price) / (entry_price - stop_loss)) if entry_price > stop_loss else 0
+    weak_first_target = rr < 1.0 and target2 and target2 > target1
+    if weak_first_target:
+        target1, target2 = target2, (target3 if target3 and target3 > target2 else target2 * 1.015)
+        target_source += " [تم تخطي أقرب هدف ضعيف RR]"
+        rr = ((target1 - entry_price) / (entry_price - stop_loss)) if entry_price > stop_loss else 0
+
+    target_pct = ((target1 - entry_price) / entry_price) * 100 if entry_price else 0
+
+    return {
+        "target1": round(target1, 4), "target2": round(target2, 4), "target3": round(target3, 4),
+        "stop_loss": round(stop_loss, 4),
+        "target_pct": round(target_pct, 2), "risk_pct": round(risk_pct, 2),
+        "rr": round(rr, 2), "target_source": target_source,
+        "atr_value": round(atr_val, 4),
+        "rr_too_weak": rr < 0.8,  # FIX: علامة تحذير — حتى أفضل هدف هيكلي متاح لا يستاهل المخاطرة
+    }
+
+
+def format_vote_breakdown_ar(vote_result):
+    """تنسيق تفصيل تصويت المدارس بالعربي — يستخدم في تحليل البوت والـ API"""
+    schools_ar = {
+        "classical_structure": "الهيكل الكلاسيكي",
+        "wyckoff": "Wyckoff",
+        "smc_order_flow": "SMC/Order Flow",
+        "vpa": "تحليل الحجم (VPA)",
+    }
+    vote_ar = {"BUY": "شراء", "BUY_BIAS": "ميل للشراء", "WAIT": "انتظار", "AVOID": "تجنب"}
+    lines = []
+    for key, name_ar in schools_ar.items():
+        s = vote_result["schools"][key]
+        lines.append(f"{name_ar}: {vote_ar.get(s['vote'], s['vote'])} ({s.get('confidence',0)}%) — {s.get('reasoning','')}")
+    return lines
+# ============================================================
+# Decision Lock الجديد — يتحدث يومياً بناءً على صحة الأسباب الأصلية
+# يحل مشكلة "53 قفل صفر hits" في النظام القديم
+# ============================================================
+
+def evaluate_lock_validity(locked_payload, current_candles, current_vote_result):
+    """
+    بدل القفل الزمني الأعمى (3 أيام أو تغيّر score بمقدار 18)، هذا يفحص يومياً:
+    هل لا تزال الأسباب الأصلية للقرار صحيحة؟
+
+    يرجع: ("KEEP", "UPDATE", "INVALIDATE") مع السبب.
+
+    - INVALIDATE: أحد الأسباب الجوهرية انقلب (مثلاً: Order Block الذي بُني عليه القرار انكسر،
+      أو الهيكل انقلب من صاعد لهابط، أو ظهر AVOID حرج بثقة عالية) → يُعاد التقييم فوراً
+    - UPDATE: لا يزال القرار صحيحاً لكن الأرقام (سعر/هدف) تحتاج تحديث طفيف
+    - KEEP: كل شيء متوافق، لا داعي للتغيير
+    """
+    old_decision = locked_payload.get("decision")
+    old_structure = locked_payload.get("structure_snapshot", {})
+    old_smc = locked_payload.get("smc_snapshot", {})
+
+    new_structure = current_vote_result["schools"]["classical_structure"]
+    new_wyckoff = current_vote_result["schools"]["wyckoff"]
+    new_smc = current_vote_result["schools"]["smc_order_flow"]
+    new_decision = current_vote_result["final_decision"]
+
+    # 1. هل انقلب الهيكل من صاعد لهابط بثقة عالية؟ (سبب إلغاء فوري)
+    structure_flipped = (
+        old_structure.get("structure") in ["UPTREND_INTACT", "SUSTAINED_UPTREND", "STRUCTURE_BROKEN_BULLISH"]
+        and new_structure.get("structure") in ["DOWNTREND_INTACT", "SUSTAINED_DOWNTREND", "STRUCTURE_BROKEN_BEARISH"]
+        and new_structure.get("confidence", 0) >= 65
+    )
+
+    # 2. هل ظهرت إشارة AVOID حرجة جديدة من Wyckoff (مثل Upthrust أو Markdown نشط)؟
+    new_critical_avoid = new_wyckoff.get("vote") == "AVOID" and new_wyckoff.get("confidence", 0) >= 80
+
+    # 3. هل انكسر الـ Order Block الصاعد الذي كان يدعم وقف الخسارة الأصلي؟
+    ob_support_broken = False
+    if old_smc.get("near_bullish_ob") and not new_smc.get("near_bullish_ob"):
+        current_price = safe_float(current_candles[-1]["close"]) if current_candles else None
+        old_support_low = locked_payload.get("entry_low")
+        if current_price and old_support_low and current_price < old_support_low * 0.97:
+            ob_support_broken = True
+
+    # 4. هل انقلب القرار النهائي من BUY إلى AVOID صراحة في التصويت الجديد؟
+    decision_reversed = old_decision == "BUY" and new_decision == "AVOID"
+
+    if structure_flipped or new_critical_avoid or ob_support_broken or decision_reversed:
+        reasons = []
+        if structure_flipped: reasons.append("الهيكل انقلب من صاعد لهابط")
+        if new_critical_avoid: reasons.append(f"إشارة Wyckoff حرجة جديدة: {new_wyckoff.get('reasoning','')}")
+        if ob_support_broken: reasons.append("الدعم المؤسسي (Order Block) الأصلي انكسر")
+        if decision_reversed: reasons.append("التصويت العام انقلب من BUY إلى AVOID")
+        return "INVALIDATE", " | ".join(reasons)
+
+    # هل لا يزال القرار نفسه لكن بثقة مختلفة بشكل ملحوظ؟ (تحديث وليس إلغاء)
+    old_confidence = locked_payload.get("confidence", 0)
+    new_confidence = current_vote_result["final_confidence"]
+    if old_decision == new_decision and abs(new_confidence - old_confidence) >= 15:
+        return "UPDATE", f"نفس القرار لكن الثقة تغيرت من {old_confidence}% إلى {new_confidence}%"
+
+    # FIX: تحول BUY → WAIT (تباطؤ زخم بدون انعكاس هيكلي حقيقي) ليس INVALIDATE (السبب الأصلي
+    # لم ينقلب فعلياً) لكنه أيضاً ليس KEEP صامت — يحتاج تنبيه بأن الزخم يضعف.
+    if old_decision == "BUY" and new_decision == "WAIT":
+        return "UPDATE", "الزخم تباطأ (BUY→WAIT) دون انعكاس هيكلي مؤكد بعد — راقب عن قرب"
+
+    return "KEEP", "الأسباب الأصلية للقرار لا تزال صحيحة"
+
+
+def build_lock_snapshot(vote_result, targets):
+    """
+    يبني "لقطة" من حالة السوق وقت اتخاذ القرار — تُحفظ مع القفل وتُستخدم لاحقاً
+    في evaluate_lock_validity للمقارنة، بدل الاعتماد على score رقمي مجرد فقط.
+    """
+    return {
+        "decision": vote_result["final_decision"],
+        "confidence": vote_result["final_confidence"],
+        "structure_snapshot": {
+            "structure": vote_result["schools"]["classical_structure"].get("structure"),
+            "confidence": vote_result["schools"]["classical_structure"].get("confidence"),
+        },
+        "wyckoff_snapshot": {
+            "sub_phase": vote_result["schools"]["wyckoff"].get("sub_phase"),
+            "vote": vote_result["schools"]["wyckoff"].get("vote"),
+        },
+        "smc_snapshot": {
+            "near_bullish_ob": vote_result["schools"]["smc_order_flow"].get("near_bullish_ob"),
+            "near_bearish_ob": vote_result["schools"]["smc_order_flow"].get("near_bearish_ob"),
+        },
+        "entry_low": targets.get("stop_loss"),  # نخزن الستوب كمرجع لفحص كسر الدعم لاحقاً
+        "target1": targets.get("target1"),
+    }
+# ============================================================
+# دالة الربط (Glue Function) — V21
+# تستبدل build_signal_v20 بمحرك التحليل الجديد (4 مدارس + Decision Lock)
+# مع الحفاظ على نفس شكل القاموس الذي يتوقعه باقي النظام
+# (scan engine، تنسيق التليجرام، تسجيل الإشارات، الداشبورد)
+# ============================================================
+
+def build_signal_v21(symbol, kind, candles, d1):
+    """
+    النسخة الجديدة من build_signal_v20 — تستخدم نظام التصويت متعدد المدارس
+    (Wyckoff + Classical Structure + SMC/Order Flow + VPA) بدل النظام المرجح الأحادي،
+    وتستخدم الأهداف المبنية على الهيكل بدل ATR التعسفي.
+
+    تُرجع نفس شكل القاموس بالضبط الذي كانت تُرجعه build_signal_v20، بإضافة حقل
+    "vote_breakdown" اختياري للتفاصيل الإضافية (لا يكسر أي كود يعتمد على الحقول القديمة).
+    """
+    symbol = normalize_symbol(symbol)
+    req = MIN_H1_CANDLES if kind == "SHORT_SWING" else MIN_D1_CANDLES
+    if len(candles) < req:
+        return None
+    closes = [safe_float(x["close"]) for x in candles if safe_float(x["close"])]
+    volumes = [safe_float(x.get("volume"), 0) or 0 for x in candles]
+    if len(closes) < req:
+        return None
+    price = closes[-1]
+    if not price or price <= 0:
+        return None
+
+    last_c = candles[-1]
+    c_age = candle_age_hours(last_c)
+    stale = c_age > MAX_CANDLE_AGE_HOURS
+
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50) if len(closes) >= 50 else ma20
+    r = rsi(closes, 14)
+    a = atr(candles, 14)
+    sup, res = support_resistance(candles, 30 if kind == "SHORT_SWING" else 60)
+    avg_vol = sma(volumes, 20) or 1
+    vr = volumes[-1] / avg_vol if avg_vol else 1
+    mom = recent_momentum(candles, 8 if kind == "SHORT_SWING" else 15)
+    trend, _ = daily_trend_score(d1)
+    phase, cmf, phase_d = detect_market_phase(candles)
+    rev_sigs = detect_reversal_signals(candles)
+
+    # === المحرك الجديد: التصويت متعدد المدارس ===
+    vote_result = multi_school_vote(candles, phase, cmf, phase_d)
+    final_decision = vote_result["final_decision"]
+    final_confidence = vote_result["final_confidence"]
+
+    # === الأهداف المبنية على الهيكل ===
+    tg = structure_based_targets(candles, price, vote_result, kind)
+
+    rb = get_rsi_bucket(r)
+    vb = get_volume_bucket(vr)
+    ta = "ALIGNED" if trend == "UP" else "MIXED" if trend == "MIXED" else "AGAINST"
+
+    # درجة تمثيلية (score) للتوافق مع الكود القديم الذي يعرض/يرتب بناءً عليها —
+    # الآن مشتقة من ثقة التصويت بدل نظام النقاط المرجح القديم، عشان رتب العرض (ranking) يبقى منطقي
+    score = final_confidence if final_decision in ["BUY", "BUY_BIAS"] else (
+        -final_confidence if final_decision == "AVOID" else final_confidence * 0.3
+    )
+    score += get_pattern_adjustment(symbol, kind, phase, rb, vb) * 0.3  # وزن أخف، القرار الأساسي من التصويت
+    score += get_learning_adjustment(symbol) * 0.3
+    score += failure_penalty(symbol) * 0.3
+
+    strength = ("VERY STRONG" if final_confidence >= 80 else "STRONG" if final_confidence >= 65
+                else "MEDIUM" if final_confidence >= 50 else "WEAK")
+    bad = phase in ["DISTRIBUTION", "MARKDOWN"]
+    has_critical_rev = any(s["severity"] in ["STRONG", "CRITICAL"] for s in rev_sigs)
+
+    # القرار النهائي: BUY فقط إذا التصويت أعطى BUY حقيقي (3+ مدارس) والـ RR لا يزال معقول وما البيانات قديمة
+    ma = ("BUY" if final_decision == "BUY" and not tg.get("rr_too_weak")
+          and not stale and not (has_critical_rev and not bad)
+          else "WATCH")
+
+    mode = get_ai_mode()
+    action = {"LEARNING": "LEARN_SIGNAL" if ma == "BUY" else "WATCH",
+              "PAPER": "PAPER_BUY" if ma == "BUY" else "WATCH",
+              "LIVE": "BUY" if ma == "BUY" else "WATCH"}.get(mode, "WATCH")
+    tf = "60" if kind == "SHORT_SWING" else "1D"
+
+    # سبب القرار بالعربي — من تفصيل تصويت المدارس بدل قائمة reasons القديمة
+    vote_lines = format_vote_breakdown_ar(vote_result)
+    reason_summary = f"توافق {vote_result['buy_votes']}/4 مدارس شراء، {vote_result['avoid_votes']}/4 تجنب"
+    if stale:
+        reason_summary = f"⚠️ بيانات قديمة ({round(c_age,1)}h) — {reason_summary}"
+    if tg.get("rr_too_weak"):
+        reason_summary += " | ⚠️ RR ضعيف حتى بعد أفضل هدف هيكلي متاح"
+
+    sig = {
+        "symbol": symbol, "has_data": True, "type": kind, "mode": mode, "action": action,
+        "model_action": ma, "timeframe": tf, "price": round(price, 3),
+        "entry_zone": [round(price * 0.995, 4), round(price * 1.005, 4)],
+        "stop_loss": tg["stop_loss"],
+        "target1": tg["target1"], "target2": tg["target2"], "target3": tg["target3"],
+        "target_pct": tg["target_pct"], "risk_pct": tg["risk_pct"], "rr": tg["rr"],
+        "estimated_days": 5 if kind == "SHORT_SWING" else 15,
+        "max_hold_days": 14 if kind == "SHORT_SWING" else 45,
+        "atr_value": tg["atr_value"], "atr_pct": round((tg["atr_value"] / price) * 100, 2) if price else 0,
+        "score": round(score, 2), "strength": strength, "trend": trend, "market_phase": phase,
+        "cmf": round(cmf, 3), "reversal_signals": rev_sigs,
+        "support": round(sup, 3) if sup else None, "resistance": round(res, 3) if res else None,
+        "rsi": round(r, 2) if r is not None else None, "rsi_bucket": rb,
+        "volume_ratio": round(vr, 2), "volume_bucket": vb, "trend_alignment": ta,
+        "momentum_pct": round(mom, 2), "pattern_adj": 0.0, "learning_adj": 0.0, "failure_pen": 0.0,
+        "position_sizing": position_sizing(price, tg["stop_loss"], kind),
+        "reason": reason_summary,
+        "phase_details": phase_d,
+        "data_is_stale": stale,
+        "candle_age_hours": round(c_age, 1),
+        "last_bar_time": str(last_c.get("bar_time", "")),
+        # === حقول جديدة خاصة بـ V21 (إضافية، لا تكسر الكود القديم) ===
+        "vote_result": vote_result,
+        "vote_breakdown_ar": vote_lines,
+        "target_source": tg["target_source"],
+        "rr_too_weak": tg.get("rr_too_weak", False),
+        "engine_version": "V21",
+    }
+    sig["rank_score"] = ai_rank_score(sig)
+    sig["display_action"] = classify_action(sig)
+    sig["ai_comment"] = ai_comment_v21(sig)
+    return sig
+
+
+def ai_comment_v21(sig):
+    """نسخة معدّلة من ai_comment_v20 تعكس قرار التصويت متعدد المدارس"""
+    if not sig:
+        return "No data"
+    if sig.get("data_is_stale"):
+        return f"⚠️ بيانات قديمة ({sig.get('candle_age_hours',0)}h) — انتظر تحديث"
+    vr = sig.get("vote_result", {})
+    p = sig.get("market_phase", "NEUTRAL")
+    if sig.get("model_action") == "BUY":
+        return f"✅ توافق {vr.get('buy_votes',0)}/4 مدارس — فرصة {p} (ثقة {vr.get('final_confidence',0)}%)"
+    if vr.get("final_decision") == "AVOID":
+        return f"❌ تجنب — {vr.get('avoid_votes',0)}/4 مدارس ضد ({vr.get('final_confidence',0)}%)"
+    if sig.get("rr_too_weak"):
+        return f"⚠️ مراقبة — لا توجد أهداف هيكلية تستاهل المخاطرة حالياً"
+    return f"👀 مراقبة — توافق جزئي ({vr.get('buy_votes',0)}/4 شراء) في {p}"
+
+
 def build_signal_v20(symbol,kind,candles,d1):
     symbol=normalize_symbol(symbol); req=MIN_H1_CANDLES if kind=="SHORT_SWING" else MIN_D1_CANDLES
     if len(candles)<req: return None
@@ -722,10 +1692,10 @@ def analyze_symbol(symbol,scan_type="ALL"):
     if st=="COMBINED": st="ALL"
     h1=get_candles(symbol,"60",100); d1=get_candles(symbol,"1D",100); sigs=[]
     if st in ["ALL","HOURLY"]:
-        s=build_signal_v20(symbol,"SHORT_SWING",h1,d1)
+        s=build_signal_v21(symbol,"SHORT_SWING",h1,d1)
         if s: sigs.append(s)
     if st in ["ALL","DAILY"]:
-        s=build_signal_v20(symbol,"LONG_SWING",d1,d1)
+        s=build_signal_v21(symbol,"LONG_SWING",d1,d1)
         if s: sigs.append(s)
     return sigs
 
@@ -734,10 +1704,10 @@ def analyze_symbol_from_cache(symbol,scan_type,cache):
     if st=="COMBINED": st="ALL"
     h1=cache.get(symbol,{}).get("60",[]); d1=cache.get(symbol,{}).get("1D",[]); sigs=[]
     if st in ["ALL","HOURLY"]:
-        s=build_signal_v20(symbol,"SHORT_SWING",h1,d1)
+        s=build_signal_v21(symbol,"SHORT_SWING",h1,d1)
         if s: sigs.append(s)
     if st in ["ALL","DAILY"]:
-        s=build_signal_v20(symbol,"LONG_SWING",d1,d1)
+        s=build_signal_v21(symbol,"LONG_SWING",d1,d1)
         if s: sigs.append(s)
     return sigs
 # ── DECISION LOCK ─────────────────────────────────────────────
@@ -750,25 +1720,60 @@ def get_locked_decision(symbol):
             return c.fetchone()
     except: return None
 
-def should_override_decision(existing,new_score,new_phase,has_crit):
-    old=float(existing.get("score") or 0)
-    la=parse_dt(str(existing.get("locked_at") or ""))
-    hd=business_days_between(la,utc_now_dt()) if la else 99
-    op=existing.get("market_phase","NEUTRAL"); delta=abs(new_score-old)
-    if has_crit: return True,"critical_reversal_detected"
-    if new_phase in ["DISTRIBUTION","MARKDOWN"] and op not in ["DISTRIBUTION","MARKDOWN"]: return True,"phase_turned_negative"
-    if hd<DECISION_MIN_HOLD_DAYS:
-        return (True,"major_score_shift") if delta>=20 else (False,f"locked_{hd}d")
-    return (True,"score_delta_exceeded") if delta>=DECISION_CHANGE_DELTA else (False,f"stable_hold")
+def should_override_decision(existing, new_sig):
+    """
+    V21: استبدال منطق القفل الزمني القديم (3 أيام / تغيّر score≥18) بإعادة تقييم
+    يومية حقيقية للأسباب الأصلية للقرار — يحل مشكلة "53 قفل صفر hits" حيث كانت
+    القرارات الضعيفة تتجمد لأسابيع بدون اختبار فعلي ضد T1/Stop.
+
+    new_sig["vote_result"] محسوب أصلاً بأحدث الشموع وقت تشغيل السكان، فلا حاجة لتمرير
+    شموع خام منفصلة — هذا يحافظ على نفس توقيع الاستدعاء القديم في باقي الكود.
+    """
+    new_vote_result = new_sig.get("vote_result")
+    if not new_vote_result:
+        # احتياطي: الإشارة الجديدة لم تُبنَ بمحرك V21 لأي سبب — لا نملك بيانات تصويت، نُبقي القفل
+        return False, "no_vote_data_keep_locked"
+
+    old_payload_raw = existing.get("payload")
+    old_vote_result = None
+    if old_payload_raw:
+        try:
+            old_payload = json.loads(old_payload_raw) if isinstance(old_payload_raw, str) else old_payload_raw
+            old_vote_result = old_payload.get("vote_result")
+        except Exception:
+            old_vote_result = None
+
+    if not old_vote_result:
+        # القفل الحالي قديم (من V20 قبل الترقية) — لا نملك snapshot منطقي للمقارنة،
+        # نعامله كإشارة جديدة بالكامل ونسمح بإعادة التقييم الفورية مرة واحدة فقط
+        return True, "legacy_lock_upgraded_to_v21"
+
+    old_targets_snapshot = {
+        "stop_loss": existing.get("stop_loss"),
+        "target1": existing.get("target1"),
+    }
+    lock_snapshot = build_lock_snapshot(old_vote_result, old_targets_snapshot)
+    lock_snapshot["decision"] = existing.get("decision")
+    lock_snapshot["confidence"] = float(existing.get("confidence") or 0)
+
+    # current_candles غير مستخدمة فعلياً داخل evaluate_lock_validity إلا لفحص السعر الحالي
+    # عند كسر الدعم؛ نستخدم سعر الإشارة الجديدة كمؤشر كافٍ بدل تمرير الشموع كاملة
+    fake_candles_ref = [{"close": new_sig.get("price")}]
+    status, reason = evaluate_lock_validity(lock_snapshot, fake_candles_ref, new_vote_result)
+    if status == "INVALIDATE":
+        return True, f"v21_invalidated: {reason}"
+    if status == "UPDATE":
+        # تحديث الأرقام (سعر/ثقة) دون اعتبارها قفلاً جديداً بالكامل — لا تزال نفس الفرضية صحيحة
+        return False, f"v21_update: {reason}"
+    return False, f"v21_keep: {reason}"
 
 def update_decision_lock(symbol,sig):
     if not sig or not sig.get("has_data"): return
-    symbol=normalize_symbol(symbol); ns=float(sig.get("score") or 0)
+    symbol=normalize_symbol(symbol)
     np=sig.get("market_phase","NEUTRAL")
-    hc=any(s.get("severity") in ["CRITICAL","STRONG"] for s in (sig.get("reversal_signals") or []))
     ex=get_locked_decision(symbol)
     if ex:
-        ov,reason=should_override_decision(ex,ns,np,hc)
+        ov,reason=should_override_decision(ex,sig)
         if not ov:
             try:
                 with get_db() as conn:
@@ -794,7 +1799,9 @@ def update_decision_lock(symbol,sig):
                 market_phase=EXCLUDED.market_phase,signal_type=EXCLUDED.signal_type,
                 lock_reason=EXCLUDED.lock_reason,locked_at=EXCLUDED.locked_at,
                 last_checked_at=EXCLUDED.last_checked_at,status='LOCKED',unlock_reason=NULL,payload=EXCLUDED.payload""",
-                (symbol,dec,sig.get("score"),sig.get("score"),sig.get("price"),
+                (symbol,dec,
+                (sig.get("vote_result") or {}).get("final_confidence", sig.get("score")),
+                sig.get("score"),sig.get("price"),
                 sig.get("entry_zone",[None,None])[0],sig.get("entry_zone",[None,None])[1],
                 sig.get("stop_loss"),sig.get("target1"),sig.get("target2"),sig.get("target3"),
                 sig.get("estimated_days"),np,sig.get("type"),lr,utc_now(),utc_now(),json.dumps(sig)))
