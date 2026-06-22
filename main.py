@@ -2952,24 +2952,39 @@ def format_morning_report():
         scan = latest_scan_result("COMBINED") or {}
         ranked = scan.get("ranked", [])
 
-        # فلتر الفرص الجيدة فقط
+        # فلتر الفرص — V21: BUY حقيقي بتوافق 3/4 مدارس، أو score عالي كاحتياط
         opportunities = [
             s for s in ranked
-            if s.get("score", 0) >= 80
+            if (s.get("model_action") == "BUY" or s.get("score", 0) >= 80)
             and s.get("market_phase") in ["ACCUMULATION", "MARKUP"]
             and not s.get("data_is_stale", False)
+            and not s.get("rr_too_weak", False)
         ][:5]
 
         if opportunities:
             for s in opportunities:
                 phase = s.get("market_phase", "")
                 pe = {"ACCUMULATION": "🔵", "MARKUP": "🟢"}.get(phase, "⚪")
+                entry_zone = s.get("entry_zone") or []
+                entry_low  = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
+                entry_high = round(entry_zone[1], 3) if len(entry_zone) > 1 else ""
+                stop       = s.get("stop_loss", "?")
+                t1         = s.get("target1", "?")
+                t1_pct     = s.get("target_pct", "?")
+                rr         = s.get("rr", "?")
+                # تحذير RR ضعيف
+                rr_warn = " ⚠️" if (rr != "?" and float(rr) < 1.0) else ""
+                # عدد أصوات المدارس (V21)
+                vote_info = ""
+                vr = s.get("vote_result") or {}
+                if vr:
+                    vote_info = f" | {vr.get('buy_votes',0)}/4 مدارس"
                 lines.append(
-                    f"{pe} <b>{s.get('symbol')}</b> | "
-                    f"Score:{s.get('score')} | "
-                    f"T1:{s.get('target1')} | "
-                    f"RR:{s.get('rr')} | "
-                    f"~{s.get('estimated_days','?')} يوم"
+                    f"{pe} <b>{s.get('symbol')}</b>{vote_info}\n"
+                    f"   📥 دخول: {entry_low}"
+                    + (f"–{entry_high}" if entry_high else "") +
+                    f" | 🛑 وقف: {stop}\n"
+                    f"   🎯 هدف: {t1} (+{t1_pct}%) | RR:{rr}{rr_warn}"
                 )
         else:
             lines.append("لا توجد فرص قوية الآن — السوق يحتاج وقتاً")
