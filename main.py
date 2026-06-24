@@ -3526,7 +3526,79 @@ def api_learning_scan():
     return {"ok":True,"mode":get_ai_mode(),"created_count":len(created),"evaluated_count":len(ev),"observations_evaluated":len(ob)}
 
 @app.get("/api/ai/test-telegram")
-def test_telegram(): return tg_main_send("✅ UAE AI V20.1 — اختبار Telegram ناجح!")
+def test_telegram(): return tg_main_send("✅ UAE AI V21 — اختبار Telegram ناجح!")
+
+@app.get("/api/ai/test-alerts")
+def test_alerts(secret: Optional[str] = None):
+    """
+    اختبار التنبيهات الفورية — يشغّل نفس منطق السيولة المفاجئة والفرص اليومية
+    على آخر بيانات محفوظة ويرسل رسالة تجريبية للتحقق من أن كل شيء يعمل.
+    """
+    if not cron_ok(secret): return {"ok": False, "error": "bad_secret"}
+    results = {"daily_alerts": 0, "surge_alerts": 0, "messages_sent": 0, "details": []}
+
+    try:
+        # 1. اختبار الفرص اليومية من آخر scan محفوظ
+        daily_scan = latest_scan_result("DAILY") or {}
+        daily_sigs = daily_scan.get("ranked", [])
+        daily_buy = [s for s in daily_sigs if s.get("model_action") == "BUY"]
+        results["daily_alerts"] = len(daily_buy)
+
+        if daily_buy:
+            s = daily_buy[0]
+            vr = s.get("vote_result") or {}
+            entry_zone = s.get("entry_zone") or []
+            entry_low = round(entry_zone[0], 3) if entry_zone else s.get("price", "?")
+            mkt = s.get("market", get_stock_market(s.get("symbol", "")))
+            mkt_icon = "🇦🇪 DFM" if mkt == "DFM" else "🏛 ADX"
+            msg = (
+                f"🧪 <b>اختبار — فرصة يومية</b> {mkt_icon}\n"
+                f"<b>{s.get('symbol')}</b> | {vr.get('buy_votes',0)}/4 مدارس\n"
+                f"📥 دخول: {entry_low} | 🛑 وقف: {s.get('stop_loss','?')}\n"
+                f"🎯 هدف: {s.get('target1','?')} (+{s.get('target_pct','?')}%) | RR:{s.get('rr','?')}"
+            )
+            tg_main_send(msg)
+            results["messages_sent"] += 1
+            results["details"].append(f"فرصة يومية: {s.get('symbol')}")
+        else:
+            tg_main_send("🧪 اختبار فرص يومية: لا توجد فرص BUY يومية حالياً في السوق")
+            results["messages_sent"] += 1
+
+        # 2. اختبار السيولة المفاجئة من آخر scan
+        combined = latest_scan_result("COMBINED") or {}
+        all_sigs = combined.get("ranked", [])
+        surges_dfm, surges_adx = [], []
+        for s in all_sigs:
+            vs = s.get("volume_surge") or {}
+            if vs.get("surge"):
+                mkt = s.get("market", get_stock_market(s.get("symbol", "")))
+                entry = {"symbol": s.get("symbol"), "surge_ratio": vs.get("surge_ratio"),
+                         "direction": vs.get("direction"), "price": s.get("price")}
+                if mkt == "DFM": surges_dfm.append(entry)
+                elif mkt == "ADX": surges_adx.append(entry)
+
+        results["surge_alerts"] = len(surges_dfm) + len(surges_adx)
+
+        if surges_dfm or surges_adx:
+            lines = ["🧪 <b>اختبار — السيولة المفاجئة</b>\n"]
+            if surges_dfm:
+                lines.append("🇦🇪 <b>DFM:</b> " + " | ".join(
+                    f"{a['symbol']} ({a['surge_ratio']}x {a['direction']})" for a in surges_dfm[:5]
+                ))
+            if surges_adx:
+                lines.append("🏛 <b>ADX:</b> " + " | ".join(
+                    f"{a['symbol']} ({a['surge_ratio']}x {a['direction']})" for a in surges_adx[:5]
+                ))
+            tg_main_send("\n".join(lines))
+            results["messages_sent"] += 1
+        else:
+            tg_main_send("🧪 اختبار السيولة: لا توجد سيولة مفاجئة في آخر scan — جرب بعد أول scan في وقت التداول")
+            results["messages_sent"] += 1
+
+    except Exception as e:
+        results["error"] = str(e)
+
+    return {"ok": True, "test_results": results}
 
 @app.get("/api/telegram/set-webhook")
 def set_webhook():
