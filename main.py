@@ -2945,52 +2945,76 @@ def format_morning_report():
     except Exception as e:
         lines.append(f"⚠️ خطأ في تحليل المحفظة: {e}")
 
-    # ── قسم الفرص ────────────────────────────────────────────
+    # ── فرص يومية (D1) — أهداف 8%+ على أسابيع ────────────────
     lines.append("")
-    lines.append("🎯 <b>أفضل الفرص اليوم:</b>")
+    lines.append("📅 <b>فرص يومية (أسابيع | هدف 8%+):</b>")
     try:
-        scan = latest_scan_result("COMBINED") or {}
-        ranked = scan.get("ranked", [])
-
-        # فلتر الفرص — V21: BUY حقيقي بتوافق 3/4 مدارس، أو score عالي كاحتياط
-        opportunities = [
-            s for s in ranked
-            if (s.get("model_action") == "BUY" or s.get("score", 0) >= 80)
-            and s.get("market_phase") in ["ACCUMULATION", "MARKUP"]
+        daily_scan = latest_scan_result("DAILY") or {}
+        daily_ranked = daily_scan.get("ranked", [])
+        daily_opps = [
+            s for s in daily_ranked
+            if s.get("model_action") == "BUY"
             and not s.get("data_is_stale", False)
             and not s.get("rr_too_weak", False)
-        ][:5]
+            and float(s.get("target_pct") or 0) >= 5
+        ][:3]
+
+        if daily_opps:
+            for s in daily_opps:
+                vr = s.get("vote_result") or {}
+                votes = vr.get("buy_votes", 0)
+                entry_zone = s.get("entry_zone") or []
+                entry_low  = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
+                entry_high = round(entry_zone[1], 3) if len(entry_zone) > 1 else ""
+                lines.append(
+                    f"📈 <b>{s.get('symbol')}</b> | {votes}/4 مدارس\n"
+                    f"   📥 دخول: {entry_low}" + (f"–{entry_high}" if entry_high else "") +
+                    f" | 🛑 وقف: {s.get('stop_loss','?')}\n"
+                    f"   🎯 هدف: {s.get('target1','?')} (+{s.get('target_pct','?')}%) | RR:{s.get('rr','?')}\n"
+                    f"   ⏱ مدة متوقعة: {s.get('estimated_days','?')} يوم"
+                )
+        else:
+            lines.append("لا توجد فرص يومية قوية الآن")
+    except Exception as e:
+        lines.append(f"⚠️ خطأ في الفرص اليومية: {e}")
+
+    # ── فرص ساعية (H1) — أهداف قصيرة المدى ────────────────────
+    lines.append("")
+    lines.append("⚡ <b>فرص ساعية (أيام | دخول سريع):</b>")
+    try:
+        scan = latest_scan_result("HOURLY") or {}
+        ranked = scan.get("ranked", [])
+
+        # فلتر الفرص — V21: BUY حقيقي بتوافق 3/4 مدارس
+        opportunities = [
+            s for s in ranked
+            if s.get("model_action") == "BUY"
+            and not s.get("data_is_stale", False)
+            and not s.get("rr_too_weak", False)
+        ][:3]
 
         if opportunities:
             for s in opportunities:
                 phase = s.get("market_phase", "")
                 pe = {"ACCUMULATION": "🔵", "MARKUP": "🟢"}.get(phase, "⚪")
+                vr = s.get("vote_result") or {}
+                votes = vr.get("buy_votes", 0)
                 entry_zone = s.get("entry_zone") or []
                 entry_low  = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
                 entry_high = round(entry_zone[1], 3) if len(entry_zone) > 1 else ""
-                stop       = s.get("stop_loss", "?")
-                t1         = s.get("target1", "?")
-                t1_pct     = s.get("target_pct", "?")
-                rr         = s.get("rr", "?")
-                # تحذير RR ضعيف
+                rr = s.get("rr", "?")
                 rr_warn = " ⚠️" if (rr != "?" and float(rr) < 1.0) else ""
-                # عدد أصوات المدارس (V21)
-                vote_info = ""
-                vr = s.get("vote_result") or {}
-                if vr:
-                    vote_info = f" | {vr.get('buy_votes',0)}/4 مدارس"
                 lines.append(
-                    f"{pe} <b>{s.get('symbol')}</b>{vote_info}\n"
-                    f"   📥 دخول: {entry_low}"
-                    + (f"–{entry_high}" if entry_high else "") +
-                    f" | 🛑 وقف: {stop}\n"
-                    f"   🎯 هدف: {t1} (+{t1_pct}%) | RR:{rr}{rr_warn}"
+                    f"{pe} <b>{s.get('symbol')}</b> | {votes}/4 مدارس\n"
+                    f"   📥 دخول: {entry_low}" + (f"–{entry_high}" if entry_high else "") +
+                    f" | 🛑 وقف: {s.get('stop_loss','?')}\n"
+                    f"   🎯 هدف: {s.get('target1','?')} (+{s.get('target_pct','?')}%) | RR:{rr}{rr_warn}"
                 )
         else:
-            lines.append("لا توجد فرص قوية الآن — السوق يحتاج وقتاً")
+            lines.append("لا توجد فرص ساعية قوية الآن")
 
     except Exception as e:
-        lines.append(f"⚠️ خطأ في جلب الفرص: {e}")
+        lines.append(f"⚠️ خطأ في الفرص الساعية: {e}")
 
     # ── ملاحظات ──────────────────────────────────────────────
     lines.append("")
@@ -3634,12 +3658,55 @@ def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
                 update_decision_lock(sym,best)
                 cov.append({"symbol":sym,"action":classify_action(best),"score":best.get("score"),"market_phase":best.get("market_phase")})
         except Exception as e: cov.append({"symbol":sym,"error":str(e)})
-    payload={"ok":True,"version":"V20.1","scan_type":"BATCH","created_at":utc_now(),
+    payload={"ok":True,"version":"V21","scan_type":"BATCH","created_at":utc_now(),
         "batch_start":start,"batch_end":end,"signals_count":len(batch_sigs),"signals":batch_sigs[:10],"coverage":cov}
     save_scan_result("HOURLY",payload); save_combined_scan()
     for s in batch_sigs: record_virtual_signal(s)
     evaluate_virtual_signals(); evaluate_observations()
     if send and batch_sigs: tg_main_send(_scan_summary({"signals":batch_sigs,"signals_count":len(batch_sigs),"mode":get_ai_mode()},"📦 Batch Scan"))
+
+    # ── تنبيه فوري للفرص اليومية القوية ─────────────────────────
+    # نشغّل تحليل D1 موازٍ لكل دفعة، ونرسل تنبيه فوري إذا ظهر BUY يومي قوي (هدف 8%+)
+    try:
+        daily_alerts = []
+        for sym in batch:
+            try:
+                d1 = cache.get(sym, {}).get("1D", [])
+                if len(d1) < 30: continue
+                sig_d1 = build_signal_v21(sym, "LONG_SWING", d1, d1)
+                if not sig_d1: continue
+                if (sig_d1.get("model_action") == "BUY"
+                        and not sig_d1.get("rr_too_weak", False)
+                        and float(sig_d1.get("target_pct") or 0) >= 8):
+                    daily_alerts.append(sig_d1)
+                    record_virtual_signal(sig_d1)
+            except: pass
+
+        # حفظ نتائج D1 كـ scan منفصل
+        if daily_alerts:
+            d1_payload = {"ok":True,"version":"V21","scan_type":"DAILY","created_at":utc_now(),
+                "signals_count":len(daily_alerts),"signals":daily_alerts,"ranked":daily_alerts,"coverage":[]}
+            save_scan_result("DAILY", d1_payload)
+
+        # إرسال تنبيه فوري لكل فرصة يومية جديدة
+        if send:
+            for s in daily_alerts:
+                vr = s.get("vote_result") or {}
+                entry_zone = s.get("entry_zone") or []
+                entry_low  = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
+                msg = (
+                    f"🔔 <b>فرصة يومية — {s.get('symbol')}</b>\n"
+                    f"📊 {vr.get('buy_votes',0)}/4 مدارس متوافقة\n\n"
+                    f"📥 دخول: {entry_low}\n"
+                    f"🛑 وقف: {s.get('stop_loss','?')}\n"
+                    f"🎯 هدف: {s.get('target1','?')} (+{s.get('target_pct','?')}%)\n"
+                    f"📐 RR: {s.get('rr','?')} | مدة: ~{s.get('estimated_days','?')} يوم\n\n"
+                    f"💡 {s.get('ai_comment','')}"
+                )
+                tg_main_send(msg)
+    except Exception as e:
+        pass  # لا نكسر الـ batch scan الرئيسي بسبب D1
+
     return payload
 
 # ── DASHBOARD ─────────────────────────────────────────────────
