@@ -54,6 +54,78 @@ WATCHLIST = [
     "ALDAR","FERTIGLB","DANA","DFM","AJMANBANK","DIC"
 ]
 
+# تصنيف الأسهم حسب السوق — DFM (دبي) أو ADX (أبوظبي)
+DFM_STOCKS = {
+    "DTC","DU","ESHRAQ","GFH","GHITHA","GULFNAV","MANAZEL","SALIK",
+    "SHUAA","SIB","TECOM","JULPHAR","2POINTZERO","INVICTUS","EMPOWER",
+    "TALABAT","RAKBANK","DIB","EMAARDEV","EMAAR","AIRARABIA","ESG",
+    "AJMANBANK","DFM","DIC","RAKPROP","ALEFEDT","APEX","ARMX"
+}
+ADX_STOCKS = {
+    "EAND","EMSTEEL","UPP","MODON","SPACE42","ADPORTS","PUREHEALTH",
+    "TAQA","NMDC","FAB","ADIB","ADNOCGAS","ADNOCDRILL","ADNOCLS",
+    "ADNOCDIST","BURJEEL","BOROUGE","DEWA","AGTHIA","AMR","ALDAR",
+    "FERTIGLB","DANA","PRESIGHT"
+}
+
+def get_stock_market(symbol):
+    """يرجع 'DFM' أو 'ADX' أو 'UNKNOWN' لكل سهم"""
+    s = normalize_symbol(symbol) if symbol else ""
+    if s in DFM_STOCKS: return "DFM"
+    if s in ADX_STOCKS: return "ADX"
+    return "UNKNOWN"
+
+
+def detect_volume_surge(candles, lookback=20, surge_threshold=2.5):
+    """
+    مؤشر السيولة المفاجئة — يكتشف ارتفاعاً غير عادي في الحجم قد يدل على
+    اهتمام مؤسسي مبكر قبل ما يتحرك السعر فعلياً.
+
+    surge_threshold=2.5 يعني الحجم الحالي 2.5x فوق المعدل الطبيعي = سيولة مفاجئة.
+
+    يرجع dict يحتوي:
+    - surge: True/False
+    - surge_ratio: نسبة الحجم الحالي للمعدل
+    - direction: UP/DOWN/NEUTRAL (اتجاه السعر مع الارتفاع)
+    - signal: وصف الإشارة
+    """
+    if len(candles) < lookback + 3:
+        return {"surge": False, "surge_ratio": 1.0, "direction": "NEUTRAL", "signal": "بيانات غير كافية"}
+
+    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
+    closes  = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+
+    if not volumes or not closes:
+        return {"surge": False, "surge_ratio": 1.0, "direction": "NEUTRAL", "signal": "لا يوجد حجم"}
+
+    avg_vol = sma(volumes[-(lookback+3):-3], lookback) or 1
+    recent_vol = sma(volumes[-3:], 3) or 0
+    surge_ratio = recent_vol / avg_vol if avg_vol else 1
+
+    if surge_ratio < surge_threshold:
+        return {"surge": False, "surge_ratio": round(surge_ratio, 2),
+                "direction": "NEUTRAL", "signal": f"حجم عادي ({round(surge_ratio,1)}x المعدل)"}
+
+    # اتجاه السعر مع السيولة المفاجئة
+    price_change = ((closes[-1] - closes[-4]) / closes[-4]) * 100 if len(closes) >= 4 and closes[-4] else 0
+    if price_change > 0.5:
+        direction = "UP"
+        signal = f"🔥 سيولة مفاجئة صاعدة ({round(surge_ratio,1)}x) — اهتمام مؤسسي محتمل"
+    elif price_change < -0.5:
+        direction = "DOWN"
+        signal = f"⚠️ سيولة مفاجئة هابطة ({round(surge_ratio,1)}x) — بيع مؤسسي محتمل"
+    else:
+        direction = "NEUTRAL"
+        signal = f"👀 سيولة مفاجئة بدون اتجاه واضح ({round(surge_ratio,1)}x) — راقب"
+
+    return {
+        "surge": True,
+        "surge_ratio": round(surge_ratio, 2),
+        "direction": direction,
+        "signal": signal,
+        "price_change_pct": round(price_change, 2),
+    }
+
 def run_background_job(f, *a, **kw):
     def w():
         try: f(*a, **kw)
@@ -1536,6 +1608,9 @@ def build_signal_v21(symbol, kind, candles, d1):
         "target_source": tg["target_source"],
         "rr_too_weak": tg.get("rr_too_weak", False),
         "engine_version": "V21",
+        # === مؤشر السيولة المفاجئة + تصنيف السوق ===
+        "volume_surge": detect_volume_surge(candles),
+        "market": get_stock_market(symbol),
     }
     sig["rank_score"] = ai_rank_score(sig)
     sig["display_action"] = classify_action(sig)
@@ -3016,6 +3091,39 @@ def format_morning_report():
     except Exception as e:
         lines.append(f"⚠️ خطأ في الفرص الساعية: {e}")
 
+    # ── قسم السيولة المفاجئة ─────────────────────────────────────
+    lines.append("")
+    lines.append("💧 <b>سيولة مفاجئة بالأمس (إنذار مبكر):</b>")
+    try:
+        combined = latest_scan_result("COMBINED") or {}
+        all_sigs = combined.get("ranked", [])
+        surges_dfm, surges_adx = [], []
+        for s in all_sigs:
+            vs = s.get("volume_surge") or {}
+            if vs.get("surge") and vs.get("direction") == "UP":
+                mkt = s.get("market", get_stock_market(s.get("symbol","")))
+                entry = {
+                    "symbol": s.get("symbol"), "surge_ratio": vs.get("surge_ratio"),
+                    "price": s.get("price"), "signal": vs.get("signal"),
+                }
+                if mkt == "DFM": surges_dfm.append(entry)
+                elif mkt == "ADX": surges_adx.append(entry)
+
+        if surges_dfm or surges_adx:
+            if surges_dfm:
+                lines.append("🇦🇪 <b>DFM:</b> " + " | ".join(
+                    f"{a['symbol']} ({a['surge_ratio']}x)" for a in surges_dfm[:4]
+                ))
+            if surges_adx:
+                lines.append("🏛 <b>ADX:</b> " + " | ".join(
+                    f"{a['symbol']} ({a['surge_ratio']}x)" for a in surges_adx[:4]
+                ))
+            lines.append("<i>⚠️ سيولة مفاجئة قد تسبق حركة — راقب هذه الأسهم اليوم</i>")
+        else:
+            lines.append("لا توجد سيولة مفاجئة ملحوظة")
+    except Exception as e:
+        lines.append(f"⚠️ خطأ في مؤشر السيولة: {e}")
+
     # ── ملاحظات ──────────────────────────────────────────────
     lines.append("")
     lines.append(f"<i>للتحليل المفصل: اكتب اسم السهم في البوت</i>")
@@ -3669,33 +3777,58 @@ def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
     # نشغّل تحليل D1 موازٍ لكل دفعة، ونرسل تنبيه فوري إذا ظهر BUY يومي قوي (هدف 8%+)
     try:
         daily_alerts = []
+        surge_alerts = []  # تنبيهات السيولة المفاجئة (مستقلة عن BUY)
+
         for sym in batch:
             try:
                 d1 = cache.get(sym, {}).get("1D", [])
-                if len(d1) < 30: continue
-                sig_d1 = build_signal_v21(sym, "LONG_SWING", d1, d1)
-                if not sig_d1: continue
-                if (sig_d1.get("model_action") == "BUY"
-                        and not sig_d1.get("rr_too_weak", False)
-                        and float(sig_d1.get("target_pct") or 0) >= 8):
-                    daily_alerts.append(sig_d1)
-                    record_virtual_signal(sig_d1)
-            except: pass
+                h1 = cache.get(sym, {}).get("60", [])
+                market = get_stock_market(sym)
 
-        # حفظ نتائج D1 كـ scan منفصل
+                # ── فرص يومية قوية ──
+                if len(d1) >= 30:
+                    sig_d1 = build_signal_v21(sym, "LONG_SWING", d1, d1)
+                    if sig_d1:
+                        if (sig_d1.get("model_action") == "BUY"
+                                and not sig_d1.get("rr_too_weak", False)
+                                and float(sig_d1.get("target_pct") or 0) >= 8):
+                            sig_d1["market"] = market
+                            daily_alerts.append(sig_d1)
+                            record_virtual_signal(sig_d1)
+
+                # ── السيولة المفاجئة (H1 و D1 معاً) ──
+                for c_data, tf_label in [(h1, "H1"), (d1, "D1")]:
+                    if len(c_data) >= 25:
+                        vs = detect_volume_surge(c_data, lookback=20, surge_threshold=2.5)
+                        if vs.get("surge") and vs.get("direction") == "UP":
+                            surge_alerts.append({
+                                "symbol": sym, "market": market,
+                                "timeframe": tf_label,
+                                "surge_ratio": vs["surge_ratio"],
+                                "signal": vs["signal"],
+                                "price_change_pct": vs.get("price_change_pct", 0),
+                                "price": safe_float(c_data[-1]["close"]) if c_data else None,
+                            })
+            except:
+                pass
+
+        # حفظ نتائج D1
         if daily_alerts:
-            d1_payload = {"ok":True,"version":"V21","scan_type":"DAILY","created_at":utc_now(),
-                "signals_count":len(daily_alerts),"signals":daily_alerts,"ranked":daily_alerts,"coverage":[]}
+            d1_payload = {"ok": True, "version": "V21", "scan_type": "DAILY",
+                "created_at": utc_now(), "signals_count": len(daily_alerts),
+                "signals": daily_alerts, "ranked": daily_alerts, "coverage": []}
             save_scan_result("DAILY", d1_payload)
 
-        # إرسال تنبيه فوري لكل فرصة يومية جديدة
         if send:
+            # إرسال تنبيه الفرص اليومية
             for s in daily_alerts:
                 vr = s.get("vote_result") or {}
                 entry_zone = s.get("entry_zone") or []
-                entry_low  = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
+                entry_low = round(entry_zone[0], 3) if len(entry_zone) > 0 else s.get("price", "?")
+                mkt = s.get("market", "")
+                mkt_icon = "🇦🇪 DFM" if mkt == "DFM" else "🏛 ADX" if mkt == "ADX" else ""
                 msg = (
-                    f"🔔 <b>فرصة يومية — {s.get('symbol')}</b>\n"
+                    f"🔔 <b>فرصة يومية — {s.get('symbol')}</b> {mkt_icon}\n"
                     f"📊 {vr.get('buy_votes',0)}/4 مدارس متوافقة\n\n"
                     f"📥 دخول: {entry_low}\n"
                     f"🛑 وقف: {s.get('stop_loss','?')}\n"
@@ -3704,8 +3837,33 @@ def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
                     f"💡 {s.get('ai_comment','')}"
                 )
                 tg_main_send(msg)
+
+            # إرسال تنبيهات السيولة المفاجئة (مجمّعة في رسالة واحدة)
+            if surge_alerts:
+                dfm_surges = [a for a in surge_alerts if a["market"] == "DFM"]
+                adx_surges = [a for a in surge_alerts if a["market"] == "ADX"]
+                lines = ["💧 <b>سيولة مفاجئة — تحرك غير عادي</b>\n"]
+                if dfm_surges:
+                    lines.append("🇦🇪 <b>DFM (دبي):</b>")
+                    for a in dfm_surges[:5]:
+                        lines.append(
+                            f"  • <b>{a['symbol']}</b> [{a['timeframe']}] "
+                            f"{a['surge_ratio']}x | سعر:{a['price']} | "
+                            f"تغيّر:{a['price_change_pct']:+.1f}%"
+                        )
+                if adx_surges:
+                    lines.append("\n🏛 <b>ADX (أبوظبي):</b>")
+                    for a in adx_surges[:5]:
+                        lines.append(
+                            f"  • <b>{a['symbol']}</b> [{a['timeframe']}] "
+                            f"{a['surge_ratio']}x | سعر:{a['price']} | "
+                            f"تغيّر:{a['price_change_pct']:+.1f}%"
+                        )
+                lines.append("\n⚠️ راقب هذه الأسهم — السيولة المفاجئة قد تسبق حركة سعرية")
+                tg_main_send("\n".join(lines))
+
     except Exception as e:
-        pass  # لا نكسر الـ batch scan الرئيسي بسبب D1
+        pass  # لا نكسر الـ batch scan الرئيسي
 
     return payload
 
