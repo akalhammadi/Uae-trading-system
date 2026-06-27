@@ -3255,6 +3255,65 @@ def api_set_mode(mode:str,secret:Optional[str]=None):
     if mode not in ["LEARNING","PAPER","LIVE"]: return {"ok":False,"error":"invalid mode"}
     set_setting("ai_mode",mode); return {"ok":True,"mode":mode}
 
+def classify_rocket_duration(symbol, tf, vol_ratio, cl, o, h, l):
+    """
+    يصنف الصاروخ حسب المدة المتوقعة:
+    - INTRADAY: ساعات فقط (خروج اليوم) — H1 فقط، سيولة منخفضة أصلاً، حركة كبيرة جداً
+    - MULTIDAY: 2-3 أيام — H1 + D1 متوافقان، سهم سيولة جيدة، حركة معتدلة مستمرة
+    - EXTENDED: أسبوع+ — D1 قوي مع تجميع مسبق واضح
+    """
+    try:
+        candle_move = ((cl - o) / o * 100) if o else 0
+        d1_candles  = get_candles(symbol, "1D", 30)
+        h1_candles  = get_candles(symbol, "60", 30)
+
+        # هل D1 يؤكد نفس الاتجاه؟
+        d1_confirms = False
+        d1_vol_surge = False
+        d1_obv_rising = False
+        if len(d1_candles) >= 10:
+            d1_vols = [safe_float(c.get("volume"), 0) or 0 for c in d1_candles]
+            d1_avg  = sma(d1_vols[:-1], min(len(d1_vols)-1, 20)) or 1
+            d1_vol_surge = d1_vols[-1] > d1_avg * 2.0
+            d1_obv = compute_obv(d1_candles)
+            d1_obv_rising = len(d1_obv) >= 5 and d1_obv[-1] > d1_obv[-5]
+            d1_closes = [safe_float(c["close"]) for c in d1_candles if safe_float(c["close"])]
+            d1_confirms = len(d1_closes) >= 3 and d1_closes[-1] > d1_closes[-3]
+
+        # تحقق من مرحلة السوق على D1
+        d1_phase = "NEUTRAL"
+        if len(d1_candles) >= 20:
+            d1_phase, _, _ = detect_market_phase(d1_candles)
+
+        # منطق التصنيف
+        if tf == "1D" and d1_vol_surge and d1_obv_rising and d1_phase in ["MARKUP","ACCUMULATION"]:
+            # D1 قوي مع تجميع = ممتد
+            return "EXTENDED", "📅 أسبوع+", "🟣", (
+                "D1 قوي: حجم ضخم + OBV صاعد + مرحلة إيجابية\n"
+                "⏳ خطة: دخول الآن، هدف أسابيع"
+            )
+        elif d1_confirms and d1_vol_surge and tf == "60":
+            # H1 + D1 متوافقان = متعدد أيام
+            return "MULTIDAY", "📈 2-3 أيام", "🟡", (
+                "H1 + D1 متوافقان: حجم قوي على الإطارين\n"
+                "⏳ خطة: دخول الآن، راجع موقفك بعد يومين"
+            )
+        elif abs(candle_move) >= 5 or vol_ratio >= 4.0:
+            # حركة ضخمة جداً = يومي فقط (استنزاف سريع)
+            return "INTRADAY", "⚡ ساعات فقط", "🔴", (
+                f"حركة كبيرة جداً ({round(candle_move,1)}%) أو حجم استثنائي ({round(vol_ratio,1)}x)\n"
+                "⚠️ خطة: خروج قبل نهاية الجلسة — لا تبقي ليوم ثاني"
+            )
+        else:
+            # افتراضي: يومي
+            return "INTRADAY", "⚡ يومي", "🟠", (
+                "إشارة H1 بدون تأكيد D1\n"
+                "⏳ خطة: راقب ساعة بعد الدخول — إذا استمر قد يمتد ليومين"
+            )
+    except:
+        return "INTRADAY", "⚡ يومي", "🟠", "لم يتمكن من التحقق من D1"
+
+
 @app.post("/webhook/tradingview")
 @app.post("/api/webhook/price-alert")
 @app.get("/api/webhook/price-alert")
@@ -3279,11 +3338,83 @@ async def price_webhook(request:Request,secret:Optional[str]=None):
         if not symbol: return {"ok":False,"error":"missing_symbol"}
         if tf not in ["60","1D"]: tf="60"
         if None in [o,h,l,cl]: return {"ok":False,"error":"missing_ohlc"}
+
+        # ── تخزين الشمعة ───────────────────────────────────────
         with get_db() as conn:
-            conn.cursor().execute("INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            conn.cursor().execute(
+                "INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (symbol,exchange,tf,parse_bar_time(data.get("time") or data.get("timenow")),o,h,l,cl,v,utc_now()))
-        return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,"close":cl}
-    except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
+
+        # ── كشف إشارة الصاروخ 🚀 ────────────────────────────────
+        signal_type = str(data.get("signal","")).upper()
+        vol_ratio   = safe_float(data.get("vol_ratio")) or 0
+        is_rocket   = signal_type == "ROCKET"
+
+        # فحص تلقائي fallback إذا Pine Script لم يرسل signal=ROCKET
+        if not is_rocket and v and o and h and l and cl:
+            try:
+                recent = get_candles(symbol, tf, 25)
+                if len(recent) >= 20:
+                    vols     = [safe_float(c.get("volume"),0) or 0 for c in recent[:-1]]
+                    avg_v    = sma(vols, 20) or 1
+                    vol_ratio = v / avg_v
+                    body      = abs(cl - o)
+                    rng       = h - l
+                    body_r    = (body / rng) if rng else 0
+                    highs_    = [safe_float(c.get("high"),0) or 0 for c in recent[:-1]]
+                    broke     = h > max(highs_[-20:]) if highs_ else False
+                    is_rocket = vol_ratio >= 2.5 and body_r >= 0.6 and cl > o and broke
+            except: pass
+
+        if is_rocket:
+            market   = get_stock_market(symbol)
+            mkt_icon = "🇦🇪 DFM" if market=="DFM" else "🏛 ADX" if market=="ADX" else "🌐"
+            tf_label = "H1 ساعي" if tf=="60" else "D1 يومي"
+            vol_txt  = f"{round(vol_ratio,1)}x" if vol_ratio else "عالي"
+
+            # ── تصنيف المدة ──────────────────────────────────────
+            duration_type, duration_label, dur_color, duration_plan = \
+                classify_rocket_duration(symbol, tf, vol_ratio, cl, o, h, l)
+
+            # ── حساب الأهداف ──────────────────────────────────────
+            stop=target1=target2=t1_pct=rr=None
+            try:
+                tgt_candles = get_candles(symbol, tf, 50)
+                atr_val  = atr(tgt_candles, 14) or (cl * 0.015)
+                # ضبط مضاعفات الهدف حسب نوع الصاروخ
+                t_mult   = {"INTRADAY":2.0, "MULTIDAY":3.5, "EXTENDED":5.0}.get(duration_type, 2.5)
+                sl_mult  = {"INTRADAY":1.0, "MULTIDAY":1.5, "EXTENDED":2.0}.get(duration_type, 1.2)
+                stop     = round(cl - atr_val * sl_mult, 4)
+                target1  = round(cl + atr_val * t_mult, 4)
+                target2  = round(cl + atr_val * t_mult * 1.6, 4)
+                t1_pct   = round(((target1 - cl) / cl) * 100, 1) if cl else 0
+                rr       = round((target1 - cl) / (cl - stop), 1) if cl > stop else 0
+            except: pass
+
+            # ── رسالة التليجرام ───────────────────────────────────
+            msg = (
+                f"🚀 <b>صاروخ — {symbol}</b> {mkt_icon}\n"
+                f"{dur_color} <b>{duration_label}</b> | {tf_label} | 💧 {vol_txt}\n\n"
+                f"💰 السعر: <b>{cl}</b>\n"
+                f"📥 دخول: {round(cl*0.998,4)}–{round(cl*1.002,4)}\n"
+            )
+            if stop and target1:
+                msg += (
+                    f"🛑 وقف: {stop}\n"
+                    f"🎯 T1: {target1} (+{t1_pct}%)\n"
+                    f"🎯 T2: {target2}\n"
+                    f"📐 RR: {rr}\n\n"
+                )
+            msg += f"💡 {duration_plan}"
+            run_background_job(tg_main_send, msg)
+
+        return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,
+                "close":cl,"rocket_detected":is_rocket,
+                "rocket_type":duration_type if is_rocket else None}
+
+    except Exception as e:
+        return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
 
 @app.get("/api/candles/latest")
 def latest_candles(symbol:Optional[str]=None,timeframe:Optional[str]=None,limit:int=100):
