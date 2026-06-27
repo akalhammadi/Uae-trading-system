@@ -3278,11 +3278,82 @@ async def price_webhook(request:Request,secret:Optional[str]=None):
         if not symbol: return {"ok":False,"error":"missing_symbol"}
         if tf not in ["60","1D"]: tf="60"
         if None in [o,h,l,cl]: return {"ok":False,"error":"missing_ohlc"}
+
+        # ── تخزين الشمعة (السلوك الأصلي) ──────────────────────
         with get_db() as conn:
-            conn.cursor().execute("INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            conn.cursor().execute(
+                "INSERT INTO candles(symbol,exchange,timeframe,bar_time,open,high,low,close,volume,received_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (symbol,exchange,tf,parse_bar_time(data.get("time") or data.get("timenow")),o,h,l,cl,v,utc_now()))
-        return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,"close":cl}
-    except Exception as e: return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
+
+        # ── كشف إشارة الصاروخ 🚀 ────────────────────────────────
+        # يُفعَّل عند استقبال signal=ROCKET من Pine Script الجديد
+        # أو عند تحقق شروط الصاروخ تلقائياً من بيانات الشمعة الواردة
+        signal_type = str(data.get("signal","")).upper()
+        vol_ratio   = safe_float(data.get("vol_ratio")) or 0
+        is_rocket_signal = signal_type == "ROCKET"
+
+        # فحص تلقائي إذا Pine Script لم يرسل signal صريح
+        # (fallback: نفس الشروط — حجم + شمعة قوية)
+        if not is_rocket_signal and v and o and h and l and cl:
+            try:
+                candles_recent = get_candles(symbol, tf, 25)
+                if len(candles_recent) >= 20:
+                    vols = [safe_float(c.get("volume"),0) or 0 for c in candles_recent[:-1]]
+                    avg_v = sma(vols, 20) or 1
+                    vol_ratio = v / avg_v
+                    candle_body  = abs(cl - o)
+                    candle_range = h - l
+                    body_ratio   = (candle_body / candle_range) if candle_range else 0
+                    highs = [safe_float(c.get("high"),0) or 0 for c in candles_recent[:-1]]
+                    broke_res = h > max(highs[-20:]) if highs else False
+                    is_rocket_signal = (
+                        vol_ratio >= 2.5
+                        and body_ratio >= 0.6
+                        and cl > o          # شمعة خضراء
+                        and broke_res       # كسر مقاومة
+                    )
+            except: pass
+
+        if is_rocket_signal:
+            market = get_stock_market(symbol)
+            mkt_icon = "🇦🇪 DFM" if market=="DFM" else "🏛 ADX" if market=="ADX" else "🌐"
+            tf_label = "ساعي H1" if tf=="60" else "يومي D1"
+            vol_display = f"{round(vol_ratio,1)}x" if vol_ratio else "عالي"
+
+            # نحسب هدف ووقف تقريبيين من ATR
+            try:
+                candles_for_target = get_candles(symbol, tf, 50)
+                atr_val = atr(candles_for_target, 14) or (cl * 0.015)
+                stop    = round(cl - atr_val * 1.5, 4)
+                target1 = round(cl + atr_val * 3.0, 4)
+                target2 = round(cl + atr_val * 5.0, 4)
+                t1_pct  = round(((target1 - cl) / cl) * 100, 1) if cl else 0
+                rr      = round((target1 - cl) / (cl - stop), 1) if cl > stop else 0
+            except:
+                stop=target1=target2=t1_pct=rr=None
+
+            msg = (
+                f"🚀 <b>صاروخ — {symbol}</b> {mkt_icon}\n"
+                f"⏱ {tf_label} | 💧 سيولة: {vol_display}\n\n"
+                f"💰 السعر الحالي: {cl}\n"
+                f"📥 منطقة الدخول: {round(cl*0.998,4)}–{round(cl*1.002,4)}\n"
+            )
+            if stop and target1:
+                msg += (
+                    f"🛑 وقف الخسارة: {stop}\n"
+                    f"🎯 هدف 1: {target1} (+{t1_pct}%)\n"
+                    f"🎯 هدف 2: {target2}\n"
+                    f"📐 RR: {rr}\n"
+                )
+            msg += f"\n⚡ <i>كسر مقاومة + سيولة مفاجئة = فرصة صاروخية</i>"
+            run_background_job(tg_main_send, msg)
+
+        return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,
+                "close":cl,"rocket_detected":is_rocket_signal}
+
+    except Exception as e:
+        return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
 
 @app.get("/api/candles/latest")
 def latest_candles(symbol:Optional[str]=None,timeframe:Optional[str]=None,limit:int=100):
