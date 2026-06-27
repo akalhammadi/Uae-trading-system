@@ -3890,6 +3890,149 @@ def cron_daily_scan(secret:Optional[str]=None,send:bool=True):
     if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
     run_background_job(daily_scan_job,send); return {"ok":True,"started":True,"job":"DAILY_SCAN"}
 
+@app.get("/api/cron/daily-candles-scan")
+def cron_daily_candles_scan(secret:Optional[str]=None,send:bool=True,market:str="ALL"):
+    """
+    كرون الشمعات اليومية والسيولة — يُستدعى مرتين:
+    - DFM:  10:01 UTC (14:01 UAE) — بعد إغلاق DFM بدقيقة
+    - ADX:  10:16 UTC (14:16 UAE) — بعد توفر بيانات ADX
+    - ALL:  11:05 UTC (15:05 UAE) — للمسح الكامل بعد نهاية السوقين
+    """
+    if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok":True,"skipped":True,"reason":"UAE weekend"}
+
+    market = market.upper()
+    # تحديد الأسهم المستهدفة حسب السوق
+    if market == "DFM":
+        target_symbols = [s for s in WATCHLIST if s in DFM_STOCKS]
+    elif market == "ADX":
+        target_symbols = [s for s in WATCHLIST if s in ADX_STOCKS]
+    else:
+        target_symbols = WATCHLIST
+
+    results = {"market":market,"daily_opps":[],"surge_alerts":[],"rocket_alerts":[],"errors":[]}
+
+    try:
+        cache = get_all_candles_for_scan(220)
+
+        for symbol in target_symbols:
+            try:
+                d1 = cache.get(symbol,{}).get("1D",[])
+                if len(d1) < 15: continue
+
+                sym_market = get_stock_market(symbol)
+                mkt_icon   = "🇦🇪 DFM" if sym_market=="DFM" else "🏛 ADX"
+
+                # ── 1. فرص BUY يومية ──────────────────────────────
+                if len(d1) >= 30:
+                    sig = build_signal_v21(symbol, "LONG_SWING", d1, d1)
+                    if (sig and sig.get("model_action") == "BUY"
+                            and not sig.get("rr_too_weak", False)
+                            and float(sig.get("target_pct") or 0) >= 8):
+                        sig["market"] = sym_market
+                        results["daily_opps"].append(sig)
+                        record_virtual_signal(sig)
+
+                # ── 2. سيولة مفاجئة على D1 ────────────────────────
+                vs = detect_volume_surge(d1, lookback=20, surge_threshold=2.5)
+                if vs.get("surge") and vs.get("direction") == "UP":
+                    results["surge_alerts"].append({
+                        "symbol":symbol, "market":sym_market, "mkt_icon":mkt_icon,
+                        "surge_ratio":vs["surge_ratio"],
+                        "price_change_pct":vs.get("price_change_pct",0),
+                        "price":safe_float(d1[-1]["close"]) if d1 else None,
+                    })
+
+                # ── 3. صاروخ D1 ────────────────────────────────────
+                if len(d1) >= 22:
+                    vols_d1 = [safe_float(c.get("volume"),0) or 0 for c in d1]
+                    avg_v   = sma(vols_d1[:-1], 20) or 1
+                    vr_d1   = vols_d1[-1] / avg_v if avg_v else 1
+                    cl_d1   = safe_float(d1[-1]["close"])
+                    op_d1   = safe_float(d1[-1]["open"])
+                    hi_d1   = safe_float(d1[-1]["high"])
+                    lo_d1   = safe_float(d1[-1]["low"])
+                    highs_d1= [safe_float(c.get("high"),0) or 0 for c in d1[:-1]]
+                    broke   = hi_d1 and highs_d1 and hi_d1 > max(highs_d1[-20:])
+                    body    = abs(cl_d1 - op_d1) if cl_d1 and op_d1 else 0
+                    rng     = (hi_d1 - lo_d1) if hi_d1 and lo_d1 else 0
+                    body_r  = (body / rng) if rng else 0
+
+                    if vr_d1 >= 2.5 and body_r >= 0.6 and cl_d1 and op_d1 and cl_d1 > op_d1 and broke:
+                        dur_type, dur_label, dur_color, dur_plan = \
+                            classify_rocket_duration(symbol,"1D",vr_d1,cl_d1,op_d1,hi_d1,lo_d1)
+                        results["rocket_alerts"].append({
+                            "symbol":symbol,"market":sym_market,"mkt_icon":mkt_icon,
+                            "vol_ratio":round(vr_d1,2),"close":cl_d1,
+                            "duration_type":dur_type,"duration_label":dur_label,
+                            "dur_color":dur_color,"duration_plan":dur_plan,
+                        })
+
+            except Exception as e:
+                results["errors"].append({"symbol":symbol,"error":str(e)})
+
+        # حفظ نتائج D1
+        if results["daily_opps"]:
+            existing = latest_scan_result("DAILY") or {"signals":[],"ranked":[]}
+            # دمج مع السكان الموجود (لدمج DFM + ADX عند استدعاء الكرونين منفصلين)
+            merged_sigs   = existing.get("signals",[]) + results["daily_opps"]
+            merged_ranked = existing.get("ranked",[])  + results["daily_opps"]
+            save_scan_result("DAILY",{
+                "ok":True,"version":"V21","scan_type":"DAILY","created_at":utc_now(),
+                "signals_count":len(merged_sigs),
+                "signals":merged_sigs,"ranked":merged_ranked,"coverage":[]
+            })
+            save_combined_scan()
+
+        if send:
+            # فرص BUY يومية
+            for s in results["daily_opps"]:
+                vr = s.get("vote_result") or {}
+                ez = s.get("entry_zone") or []
+                el = round(ez[0],3) if ez else s.get("price","?")
+                mi = "🇦🇪 DFM" if s.get("market")=="DFM" else "🏛 ADX"
+                tg_main_send(
+                    f"🔔 <b>فرصة يومية — {s.get('symbol')}</b> {mi}\n"
+                    f"📊 {vr.get('buy_votes',0)}/4 مدارس | ثقة {vr.get('final_confidence',0)}%\n\n"
+                    f"📥 دخول: {el}\n"
+                    f"🛑 وقف: {s.get('stop_loss','?')}\n"
+                    f"🎯 هدف: {s.get('target1','?')} (+{s.get('target_pct','?')}%)\n"
+                    f"📐 RR: {s.get('rr','?')} | مدة: ~{s.get('estimated_days','?')} يوم\n\n"
+                    f"💡 {s.get('ai_comment','')}"
+                )
+
+            # صواريخ D1
+            for r in results["rocket_alerts"]:
+                tg_main_send(
+                    f"🚀 <b>صاروخ يومي — {r['symbol']}</b> {r['mkt_icon']}\n"
+                    f"{r['dur_color']} <b>{r['duration_label']}</b> | D1 | 💧 {r['vol_ratio']}x\n\n"
+                    f"💰 السعر: {r['close']}\n"
+                    f"💡 {r['duration_plan']}"
+                )
+
+            # سيولة مفاجئة — مجمّعة في رسالة واحدة
+            if results["surge_alerts"]:
+                mkt_label = {"DFM":"🇦🇪 DFM (دبي)","ADX":"🏛 ADX (أبوظبي)","ALL":"🇦🇪 DFM + 🏛 ADX"}.get(market,market)
+                lines = [f"💧 <b>سيولة مفاجئة يومية — {mkt_label}</b>\n"]
+                for a in results["surge_alerts"][:8]:
+                    lines.append(
+                        f"  • <b>{a['symbol']}</b> {a['mkt_icon']} "
+                        f"{a['surge_ratio']}x | {a['price_change_pct']:+.1f}% | سعر:{a['price']}"
+                    )
+                lines.append("\n⚠️ راقب هذه الأسهم — سيولة يومية غير عادية")
+                tg_main_send("\n".join(lines))
+
+    except Exception as e:
+        return {"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}
+
+    return {
+        "ok":True,"market":market,
+        "daily_opps":len(results["daily_opps"]),
+        "surge_alerts":len(results["surge_alerts"]),
+        "rocket_alerts":len(results["rocket_alerts"]),
+        "errors":len(results["errors"]),
+    }
+
 @app.get("/api/cron/learning-scan")
 def cron_learning_scan(secret:Optional[str]=None):
     if not cron_ok(secret): return {"ok":False,"error":"bad_cron_secret"}
