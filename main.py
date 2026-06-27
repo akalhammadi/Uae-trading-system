@@ -3377,36 +3377,59 @@ async def price_webhook(request:Request,secret:Optional[str]=None):
             duration_type, duration_label, dur_color, duration_plan = \
                 classify_rocket_duration(symbol, tf, vol_ratio, cl, o, h, l)
 
-            # ── حساب الأهداف ──────────────────────────────────────
-            stop=target1=target2=t1_pct=rr=None
+            # ── حساب الأهداف والدخول والخروج ──────────────────────
+            stop=target1=target2=t1_pct=t2_pct=rr=None
+            entry_low=entry_high=sl_pct=None
             try:
                 tgt_candles = get_candles(symbol, tf, 50)
-                atr_val  = atr(tgt_candles, 14) or (cl * 0.015)
-                # ضبط مضاعفات الهدف حسب نوع الصاروخ
-                t_mult   = {"INTRADAY":2.0, "MULTIDAY":3.5, "EXTENDED":5.0}.get(duration_type, 2.5)
-                sl_mult  = {"INTRADAY":1.0, "MULTIDAY":1.5, "EXTENDED":2.0}.get(duration_type, 1.2)
-                stop     = round(cl - atr_val * sl_mult, 4)
-                target1  = round(cl + atr_val * t_mult, 4)
-                target2  = round(cl + atr_val * t_mult * 1.6, 4)
-                t1_pct   = round(((target1 - cl) / cl) * 100, 1) if cl else 0
-                rr       = round((target1 - cl) / (cl - stop), 1) if cl > stop else 0
+                atr_val = atr(tgt_candles, 14) or (cl * 0.015)
+
+                # مضاعفات حسب نوع الصاروخ
+                t_mult  = {"INTRADAY":2.0, "MULTIDAY":3.5, "EXTENDED":5.0}.get(duration_type, 2.5)
+                sl_mult = {"INTRADAY":0.8, "MULTIDAY":1.5, "EXTENDED":2.0}.get(duration_type, 1.0)
+
+                # منطقة الدخول: 0.2% تحت وفوق السعر الحالي
+                entry_low  = round(cl * 0.998, 4)
+                entry_high = round(cl * 1.002, 4)
+
+                # وقف الخسارة: تحت آخر قاع أو ATR
+                recent_c = tgt_candles[-10:] if len(tgt_candles) >= 10 else tgt_candles
+                recent_lows = [safe_float(c.get("low"),cl) for c in recent_c]
+                structural_stop = min(recent_lows) * 0.998 if recent_lows else None
+                atr_stop = cl - atr_val * sl_mult
+                # نأخذ الأعلى بين الاثنين (الأقرب للسعر) كوقف أكثر منطقية
+                stop = round(max(structural_stop, atr_stop) if structural_stop else atr_stop, 4)
+
+                # الأهداف
+                target1 = round(cl + atr_val * t_mult, 4)
+                target2 = round(cl + atr_val * t_mult * 1.8, 4)
+
+                t1_pct = round(((target1 - cl) / cl) * 100, 1) if cl else 0
+                t2_pct = round(((target2 - cl) / cl) * 100, 1) if cl else 0
+                sl_pct = round(((cl - stop) / cl) * 100, 1) if cl else 0
+                rr = round((target1 - cl) / (cl - stop), 1) if cl > stop else 0
+
             except: pass
 
-            # ── رسالة التليجرام ───────────────────────────────────
+            # ── رسالة التليجرام المحسّنة ──────────────────────────
             msg = (
                 f"🚀 <b>صاروخ — {symbol}</b> {mkt_icon}\n"
-                f"{dur_color} <b>{duration_label}</b> | {tf_label} | 💧 {vol_txt}\n\n"
-                f"💰 السعر: <b>{cl}</b>\n"
-                f"📥 دخول: {round(cl*0.998,4)}–{round(cl*1.002,4)}\n"
+                f"{dur_color} {duration_label} | {tf_label} | 💧 {vol_txt}\n"
+                f"{'─'*30}\n"
+                f"💰 <b>السعر الحالي: {cl}</b>\n\n"
             )
-            if stop and target1:
-                msg += (
-                    f"🛑 وقف: {stop}\n"
-                    f"🎯 T1: {target1} (+{t1_pct}%)\n"
-                    f"🎯 T2: {target2}\n"
-                    f"📐 RR: {rr}\n\n"
-                )
-            msg += f"💡 {duration_plan}"
+            if entry_low and entry_high:
+                msg += f"📥 <b>منطقة الدخول:</b> {entry_low} – {entry_high}\n"
+            if stop:
+                msg += f"🛑 <b>وقف الخسارة:</b> {stop} (-{sl_pct}%)\n"
+            if target1:
+                msg += f"\n🎯 <b>الخروج الأول (T1):</b> {target1} (+{t1_pct}%)\n"
+            if target2:
+                msg += f"🎯 <b>الخروج الثاني (T2):</b> {target2} (+{t2_pct}%)\n"
+            if rr:
+                msg += f"\n📐 <b>نسبة المخاطرة/الربح:</b> {rr}\n"
+            msg += f"{'─'*30}\n💡 {duration_plan}"
+
             run_background_job(tg_main_send, msg)
 
         return {"ok":True,"symbol":symbol,"timeframe":tf,"exchange":exchange,
@@ -4001,12 +4024,41 @@ def cron_daily_candles_scan(secret:Optional[str]=None,send:bool=True,market:str=
                     f"💡 {s.get('ai_comment','')}"
                 )
 
-            # صواريخ D1
+            # صواريخ D1 — في تقرير المساء فقط
             for r in results["rocket_alerts"]:
+                try:
+                    tgt_c   = get_candles(r["symbol"], "1D", 50)
+                    atr_v   = atr(tgt_c, 14) or (r["close"] * 0.015)
+                    t_mult  = {"INTRADAY":2.0,"MULTIDAY":3.5,"EXTENDED":5.0}.get(r["duration_type"],3.0)
+                    sl_mult = {"INTRADAY":0.8,"MULTIDAY":1.5,"EXTENDED":2.0}.get(r["duration_type"],1.2)
+                    cl_     = r["close"]
+                    recent_lows_ = [safe_float(c.get("low"),cl_) for c in tgt_c[-10:]]
+                    struct_stop  = min(recent_lows_)*0.998 if recent_lows_ else None
+                    atr_stop_    = cl_ - atr_v * sl_mult
+                    stop_   = round(max(struct_stop,atr_stop_) if struct_stop else atr_stop_, 4)
+                    t1_     = round(cl_ + atr_v * t_mult, 4)
+                    t2_     = round(cl_ + atr_v * t_mult * 1.8, 4)
+                    t1p_    = round(((t1_-cl_)/cl_)*100, 1)
+                    t2p_    = round(((t2_-cl_)/cl_)*100, 1)
+                    slp_    = round(((cl_-stop_)/cl_)*100, 1)
+                    rr_     = round((t1_-cl_)/(cl_-stop_), 1) if cl_>stop_ else 0
+                    el_     = round(cl_*0.998, 4)
+                    eh_     = round(cl_*1.002, 4)
+                except:
+                    stop_=t1_=t2_=t1p_=t2p_=slp_=rr_=el_=eh_=None
+
                 tg_main_send(
                     f"🚀 <b>صاروخ يومي — {r['symbol']}</b> {r['mkt_icon']}\n"
-                    f"{r['dur_color']} <b>{r['duration_label']}</b> | D1 | 💧 {r['vol_ratio']}x\n\n"
-                    f"💰 السعر: {r['close']}\n"
+                    f"{r['dur_color']} {r['duration_label']} | D1 | 💧 {r['vol_ratio']}x\n"
+                    f"{'─'*30}\n"
+                    f"💰 <b>سعر الإغلاق: {r['close']}</b>\n"
+                    f"📅 <b>الدخول غداً عند الفتح</b>\n\n"
+                    f"📥 <b>منطقة الدخول:</b> {el_} – {eh_}\n"
+                    f"🛑 <b>وقف الخسارة:</b> {stop_} (-{slp_}%)\n\n"
+                    f"🎯 <b>الخروج الأول (T1):</b> {t1_} (+{t1p_}%)\n"
+                    f"🎯 <b>الخروج الثاني (T2):</b> {t2_} (+{t2p_}%)\n\n"
+                    f"📐 <b>نسبة المخاطرة/الربح:</b> {rr_}\n"
+                    f"{'─'*30}\n"
                     f"💡 {r['duration_plan']}"
                 )
 
