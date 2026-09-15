@@ -333,7 +333,11 @@ def learning_remaining_days():
     return max(0, LEARNING_DAYS - learning_age_days())
 
 @app.on_event("startup")
-def startup(): init_db(); ensure_learning_start()
+def startup(): init_db(); ensure_learning_start(); _safe_init_v22()
+
+def _safe_init_v22():
+    try: init_v22_tables()
+    except Exception as e: print(f"v22 init warning: {e}")
 
 # ── CANDLES ──────────────────────────────────────────────────
 
@@ -3229,6 +3233,1107 @@ def format_eod_report():
     return "\n".join(lines)
 
 
+
+# ════════════════════════════════════════════════════════════════
+# V22 — PROACTIVE PREDICTIVE ENGINE (يعمل بالتوازي مع V21)
+# التجميع + موجات إليوت + متابعة التوصيات
+# ════════════════════════════════════════════════════════════════
+
+# ============================================================
+# V22 — PROACTIVE PREDICTIVE ENGINE
+# المرحلة 1: كاشف التجميع (Accumulation Scanner)
+# يكتشف الأسهم في مرحلة التجميع قبل الصعود
+# ============================================================
+
+def detect_accumulation_zone(candles, min_candles=40):
+    """
+    كاشف التجميع الاستباقي — يجد الأسهم التي تُجمّع بهدوء قبل الصعود.
+
+    علامات التجميع الحقيقي (منهج Wyckoff):
+    1. السعر في نطاق ضيق (لا اتجاه صاعد واضح بعد) — Trading Range
+    2. الحجم يتناقص تدريجياً (البائعون ينفدون) — Volume Dry-up
+    3. OBV يرتفع ببطء رغم ثبات السعر (شراء مؤسسي خفي) — Accumulation
+    4. القيعان ترتفع تدريجياً (Higher Lows داخل النطاق) — Spring/Support
+    5. CMF إيجابي أو محايد (تدفق أموال داخل) — Money Flow
+
+    يرجع dict فيه:
+    - is_accumulating: True/False
+    - accumulation_score: 0-100 (قوة التجميع)
+    - phase: مرحلة التجميع (EARLY/MID/LATE/SPRING)
+    - range_high/range_low: حدود النطاق
+    - breakout_level: مستوى الاختراق المتوقع
+    """
+    if len(candles) < min_candles:
+        return {"is_accumulating": False, "accumulation_score": 0,
+                "phase": "INSUFFICIENT_DATA", "reason": "بيانات غير كافية"}
+
+    closes  = [safe_float(c["close"]) for c in candles if safe_float(c["close"])]
+    highs   = [safe_float(c["high"]) for c in candles if safe_float(c["high"])]
+    lows    = [safe_float(c["low"]) for c in candles if safe_float(c["low"])]
+    volumes = [safe_float(c.get("volume"), 0) or 0 for c in candles]
+
+    if len(closes) < min_candles:
+        return {"is_accumulating": False, "accumulation_score": 0,
+                "phase": "INSUFFICIENT_DATA", "reason": "إغلاقات غير كافية"}
+
+    current_price = closes[-1]
+    score = 0
+    signals = []
+
+    # ── 1. النطاق الضيق (Trading Range) ──────────────────────
+    # ننظر لآخر 30 شمعة: هل السعر في نطاق ضيق؟
+    recent_window = 30
+    rec_highs = highs[-recent_window:]
+    rec_lows  = lows[-recent_window:]
+    range_high = max(rec_highs)
+    range_low  = min(rec_lows)
+    range_pct  = ((range_high - range_low) / range_low * 100) if range_low else 100
+
+    # نطاق ضيق = أقل من 15% تذبذب على مدى 30 شمعة
+    is_tight_range = range_pct < 15
+    if is_tight_range:
+        score += 25
+        signals.append(f"نطاق ضيق ({round(range_pct,1)}%) — تجميع محتمل")
+    elif range_pct < 22:
+        score += 12
+        signals.append(f"نطاق متوسط ({round(range_pct,1)}%)")
+
+    # ── 2. تناقص الحجم (Volume Dry-up) ───────────────────────
+    # مقارنة حجم آخر 10 شموع بحجم الـ 20 قبلها
+    if len(volumes) >= 30:
+        recent_vol = sma(volumes[-10:], 10) or 0
+        earlier_vol = sma(volumes[-30:-10], 20) or 1
+        vol_ratio = recent_vol / earlier_vol if earlier_vol else 1
+
+        # الحجم يتناقص = علامة نضوب البائعين
+        if vol_ratio < 0.7:
+            score += 20
+            signals.append(f"نضوب الحجم ({round(vol_ratio,2)}x) — البائعون ينفدون")
+        elif vol_ratio < 0.9:
+            score += 10
+            signals.append(f"حجم متناقص ({round(vol_ratio,2)}x)")
+    else:
+        vol_ratio = 1
+
+    # ── 3. OBV صاعد رغم ثبات السعر (Hidden Accumulation) ─────
+    obv = compute_obv(candles)
+    obv_rising = False
+    if len(obv) >= 20:
+        obv_start = obv[-20]
+        obv_end = obv[-1]
+        # OBV يرتفع
+        obv_rising = obv_end > obv_start
+        # لكن السعر ثابت نسبياً (لم يصعد كثيراً)
+        price_20_ago = closes[-20] if len(closes) >= 20 else closes[0]
+        price_change = ((current_price - price_20_ago) / price_20_ago * 100) if price_20_ago else 0
+
+        if obv_rising and abs(price_change) < 8:
+            # OBV صاعد + سعر ثابت = تجميع خفي (أقوى إشارة)
+            score += 30
+            signals.append("OBV صاعد رغم ثبات السعر — تجميع مؤسسي خفي 🎯")
+        elif obv_rising:
+            score += 15
+            signals.append("OBV صاعد — تدفق شراء")
+
+    # ── 4. القيعان ترتفع (Higher Lows / Spring) ──────────────
+    # نقسم آخر 30 شمعة لنصفين ونقارن أدنى قاع
+    if len(lows) >= 30:
+        first_half_low = min(lows[-30:-15])
+        second_half_low = min(lows[-15:])
+        higher_lows = second_half_low > first_half_low
+
+        if higher_lows:
+            score += 15
+            signals.append("قيعان ترتفع — الدعم يقوى")
+
+        # كشف Spring: كسر مؤقت للقاع في آخر 10 شموع ثم ارتداد فوقه
+        # (الكسر + الارتداد يأخذ عدة شموع، فنفحص نافذة أوسع)
+        recent_window_low = min(lows[-10:])
+        prior_support = min(lows[-30:-10])
+        # هل حدث كسر تحت الدعم في آخر 10 شموع، والسعر الحالي عاد فوقه؟
+        spring_detected = recent_window_low < prior_support * 0.99 and current_price > prior_support * 1.005
+        if spring_detected:
+            score += 20
+            signals.append("Spring مكتشف — اختبار قاع نهائي قبل الصعود ⚡")
+
+    # ── 5. CMF (تدفق الأموال) ─────────────────────────────────
+    cmf_val = compute_cmf(candles, 20)
+    if cmf_val > 0.1:
+        score += 15
+        signals.append(f"CMF إيجابي ({round(cmf_val,3)}) — أموال تدخل")
+    elif cmf_val > 0:
+        score += 8
+        signals.append(f"CMF محايد موجب ({round(cmf_val,3)})")
+    elif cmf_val < -0.1:
+        score -= 15
+        signals.append(f"⚠️ CMF سلبي ({round(cmf_val,3)}) — أموال تخرج")
+
+    # ── تحديد مرحلة التجميع ───────────────────────────────────
+    score = max(0, min(100, score))
+
+    # حساب مستوى الاختراق المتوقع (أعلى النطاق + هامش)
+    breakout_level = round(range_high * 1.01, 4)
+
+    # تحديد المرحلة بناءً على المؤشرات
+    spring_now = False
+    if len(lows) >= 30:
+        recent_window_low = min(lows[-10:])
+        prior_support = min(lows[-30:-10])
+        spring_now = recent_window_low < prior_support * 0.99 and current_price > prior_support * 1.005
+
+    near_breakout = current_price >= range_high * 0.97
+
+    # حساب: هل السعر صعد كثيراً فعلاً؟ (لتمييز التجميع عن الصعود)
+    if len(closes) >= 40:
+        price_40_ago = closes[-40]
+        total_rise = ((current_price - price_40_ago) / price_40_ago * 100) if price_40_ago else 0
+    else:
+        total_rise = 0
+
+    # التجميع يتطلب نطاقاً ضيقاً حقيقياً (السعر لم يصعد أكثر من 12% على 40 شمعة)
+    # الصعود القوي = ارتفاع كبير = ليس تجميعاً
+    genuine_range = is_tight_range and total_rise < 12
+
+    if spring_now:
+        phase = "SPRING"
+        phase_desc = "Spring — اختبار قاع نهائي، الصعود وشيك"
+    elif near_breakout and obv_rising and genuine_range:
+        phase = "LATE"
+        phase_desc = "تجميع متأخر — قرب الاختراق، جاهز للانطلاق"
+    elif score >= 60 and total_rise < 12:
+        phase = "MID"
+        phase_desc = "تجميع نشط — المؤسسات تبني مراكزها"
+    elif score >= 40 and total_rise < 15:
+        phase = "EARLY"
+        phase_desc = "بداية تجميع — مبكر، راقب"
+    else:
+        phase = "NONE"
+        phase_desc = "لا يوجد تجميع واضح (قد يكون صعوداً أو هبوطاً)"
+
+    is_accumulating = score >= 45 and total_rise < 15
+
+    # Spring و LATE إشارات قوية بذاتها — تُقبل بعتبة أقل (40)
+    if phase in ["SPRING", "LATE"] and score >= 40:
+        is_accumulating = True
+
+    # حماية: إذا السعر صعد كثيراً، مو تجميع مهما كانت النقاط
+    if total_rise >= 15:
+        is_accumulating = False
+        phase = "NONE"
+        phase_desc = f"صعود كبير ({round(total_rise,1)}%) — فات وقت التجميع"
+
+    return {
+        "is_accumulating": is_accumulating,
+        "accumulation_score": score,
+        "phase": phase,
+        "phase_desc": phase_desc,
+        "range_high": round(range_high, 4),
+        "range_low": round(range_low, 4),
+        "range_pct": round(range_pct, 2),
+        "breakout_level": breakout_level,
+        "current_price": round(current_price, 4),
+        "obv_rising": obv_rising,
+        "cmf": round(cmf_val, 3),
+        "vol_ratio": round(vol_ratio, 2),
+        "signals": signals,
+        "distance_to_breakout_pct": round(((breakout_level - current_price) / current_price * 100), 2) if current_price else 0,
+    }
+
+
+def scan_accumulation_candidates(candles_cache, min_score=50):
+    """
+    يمسح كل الأسهم ويرجع المرشحين في مرحلة التجميع مرتبين حسب القوة.
+    يستخدم D1 (الإطار اليومي) لأن التجميع ظاهرة تمتد أسابيع.
+    """
+    candidates = []
+    for symbol in WATCHLIST:
+        try:
+            d1 = candles_cache.get(symbol, {}).get("1D", [])
+            if len(d1) < 40:
+                continue
+            acc = detect_accumulation_zone(d1, min_candles=40)
+            if acc["is_accumulating"] and acc["accumulation_score"] >= min_score:
+                acc["symbol"] = symbol
+                acc["market"] = get_stock_market(symbol)
+                candidates.append(acc)
+        except Exception:
+            continue
+
+    # ترتيب: Spring أولاً، ثم حسب النقاط
+    phase_order = {"SPRING": 0, "LATE": 1, "MID": 2, "EARLY": 3, "NONE": 4}
+    candidates.sort(key=lambda x: (phase_order.get(x["phase"], 5), -x["accumulation_score"]))
+    return candidates
+# ============================================================
+# V22 — المرحلة 2: عدّاد موجات إليوت (Elliott Wave Counter)
+# يحدد موقع السهم في دورة الموجات ويتوقع الأهداف
+# ============================================================
+#
+# نظرية إليوت المبسطة للتطبيق الآلي:
+# - الدورة الكاملة = 5 موجات دافعة (1-2-3-4-5) + 3 تصحيحية (A-B-C)
+# - الموجات الدافعة: 1(صعود) 2(تصحيح) 3(أقوى صعود) 4(تصحيح) 5(صعود أخير)
+# - القواعد الأساسية:
+#   * الموجة 2 لا تتجاوز بداية الموجة 1
+#   * الموجة 3 ليست الأقصر أبداً (عادة الأطول)
+#   * الموجة 4 لا تدخل نطاق الموجة 1
+# - نسب فيبوناتشي: الموجة 3 غالباً 1.618x من الموجة 1
+#                   التصحيحات عادة 0.382 أو 0.5 أو 0.618
+#
+# ملاحظة مهمة: عدّ إليوت احتمالي وليس يقيني. النظام يعطي أرجح
+# عدّ ممكن مع درجة ثقة، وليس يقيناً مطلقاً.
+
+def find_significant_swings(candles, min_swing_pct=3.0):
+    """
+    يجد نقاط التحول المهمة (swing points) التي تفصل الموجات.
+    min_swing_pct: أقل نسبة حركة لاعتبارها swing حقيقي (تصفية الضوضاء).
+    يرجع قائمة نقاط بالترتيب الزمني: [(index, price, type)]
+    type = 'H' (قمة) أو 'L' (قاع)
+    """
+    if len(candles) < 10:
+        return []
+
+    highs = [safe_float(c["high"]) for c in candles]
+    lows = [safe_float(c["low"]) for c in candles]
+    closes = [safe_float(c["close"]) for c in candles]
+
+    # نستخدم ZigZag مبسط: نتتبع الحركة ونسجل نقطة تحول عند انعكاس بنسبة min_swing_pct
+    swings = []
+    if None in [highs[0], lows[0]]:
+        return []
+
+    # نبدأ بتحديد أول نقطة مرجعية والاتجاه من أول حركة حقيقية
+    last_pivot_idx = 0
+    last_pivot_price = closes[0]
+    direction = None
+
+    # نحدد الاتجاه الأولي بالبحث عن أول انعكاس معتبر
+    for i in range(1, len(candles)):
+        if None in [highs[i], lows[i], closes[i]]:
+            continue
+        up_move = ((highs[i] - last_pivot_price) / last_pivot_price * 100) if last_pivot_price else 0
+        down_move = ((last_pivot_price - lows[i]) / last_pivot_price * 100) if last_pivot_price else 0
+        if up_move >= min_swing_pct:
+            direction = 'up'
+            # سجّل نقطة البداية كقاع
+            swings.append((0, closes[0], 'L'))
+            last_pivot_price = highs[i]
+            last_pivot_idx = i
+            break
+        elif down_move >= min_swing_pct:
+            direction = 'down'
+            swings.append((0, closes[0], 'H'))
+            last_pivot_price = lows[i]
+            last_pivot_idx = i
+            break
+
+    if direction is None:
+        return swings  # لا حركة معتبرة
+
+    start_i = last_pivot_idx + 1
+    for i in range(start_i, len(candles)):
+        if None in [highs[i], lows[i], closes[i]]:
+            continue
+
+        if direction == 'up':
+            if highs[i] > last_pivot_price:
+                last_pivot_price = highs[i]
+                last_pivot_idx = i
+            else:
+                drop = ((last_pivot_price - lows[i]) / last_pivot_price * 100) if last_pivot_price else 0
+                if drop >= min_swing_pct:
+                    swings.append((last_pivot_idx, last_pivot_price, 'H'))
+                    direction = 'down'
+                    last_pivot_price = lows[i]
+                    last_pivot_idx = i
+        elif direction == 'down':
+            if lows[i] < last_pivot_price:
+                last_pivot_price = lows[i]
+                last_pivot_idx = i
+            else:
+                rise = ((highs[i] - last_pivot_price) / last_pivot_price * 100) if last_pivot_price else 0
+                if rise >= min_swing_pct:
+                    swings.append((last_pivot_idx, last_pivot_price, 'L'))
+                    direction = 'up'
+                    last_pivot_price = highs[i]
+                    last_pivot_idx = i
+
+    # نضيف آخر نقطة
+    if direction == 'up':
+        swings.append((last_pivot_idx, last_pivot_price, 'H'))
+    elif direction == 'down':
+        swings.append((last_pivot_idx, last_pivot_price, 'L'))
+
+    return swings
+
+
+def count_elliott_waves(candles, min_swing_pct=3.0):
+    """
+    يحاول عدّ موجات إليوت من نقاط التحول.
+    يبحث عن نمط دافع من 5 موجات (يبدأ من قاع).
+
+    يرجع:
+    - wave_count: كم موجة تم تحديدها
+    - current_wave: أي موجة نحن فيها الآن (1-5 أو تصحيح)
+    - wave_confidence: ثقة العدّ (0-100)
+    - next_target: الهدف المتوقع للموجة القادمة
+    - pattern_valid: هل النمط يحترم قواعد إليوت
+    """
+    swings = find_significant_swings(candles, min_swing_pct)
+
+    if len(swings) < 3:
+        return {"wave_count": 0, "current_wave": "INSUFFICIENT_SWINGS",
+                "wave_desc": "نقاط تحول غير كافية لعدّ الموجات",
+                "wave_confidence": 0, "pattern_valid": False,
+                "next_target": None, "last_swing_type": "—", "last_swing_price": None,
+                "reason": "نقاط تحول غير كافية لعدّ الموجات",
+                "swings_found": len(swings)}
+
+    # نأخذ آخر نقاط التحول (حتى 9 نقاط = دورة كاملة محتملة)
+    recent_swings = swings[-9:]
+
+    # نبحث عن بداية نمط دافع (يبدأ من قاع L)
+    # النمط المثالي: L(بداية) - H(موجة1) - L(موجة2) - H(موجة3) - L(موجة4) - H(موجة5)
+    prices = [s[1] for s in recent_swings]
+    types = [s[2] for s in recent_swings]
+
+    current_price = safe_float(candles[-1]["close"])
+
+    # نحدد آخر قاع مهم كنقطة بداية محتملة
+    result = {
+        "wave_count": len(recent_swings),
+        "swings_found": len(swings),
+        "current_price": round(current_price, 4) if current_price else None,
+    }
+
+    # منطق تحديد الموجة الحالية بناءً على آخر نقاط التحول
+    last_type = types[-1]
+    last_price = prices[-1]
+
+    # نحسب اتجاه الموجات الأخيرة
+    if len(recent_swings) >= 5:
+        # نأخذ آخر 5 نقاط ونتحقق من نمط دافع
+        last5_prices = prices[-5:]
+        last5_types = types[-5:]
+
+        # نمط دافع صاعد: L-H-L-H (مع قمم وقيعان ترتفع)
+        # موجة 3 يجب أن تكون أقوى من موجة 1
+        try:
+            # افتراض: النقاط الأخيرة تمثل موجات
+            # إذا آخر نقطة قمة والقمم ترتفع = نحن في موجة صاعدة
+            highs_in_swing = [last5_prices[i] for i in range(len(last5_types)) if last5_types[i]=='H']
+            lows_in_swing = [last5_prices[i] for i in range(len(last5_types)) if last5_types[i]=='L']
+
+            rising_highs = len(highs_in_swing) >= 2 and highs_in_swing[-1] > highs_in_swing[0]
+            rising_lows = len(lows_in_swing) >= 2 and lows_in_swing[-1] > lows_in_swing[0]
+
+            if rising_highs and rising_lows:
+                # اتجاه صاعد سليم — نحدد الموجة
+                if last_type == 'L':
+                    # آخر نقطة قاع = انتهى تصحيح، بداية موجة صاعدة جديدة
+                    current_wave = "WAVE_3_OR_5_START"
+                    wave_desc = "نهاية تصحيح — بداية موجة دافعة (3 أو 5)"
+                    confidence = 60
+                    # الهدف: امتداد فيبوناتشي
+                    if len(highs_in_swing) >= 1 and len(lows_in_swing) >= 1:
+                        wave1_size = highs_in_swing[0] - lows_in_swing[0] if len(lows_in_swing)>=1 else 0
+                        next_target = round(last_price + wave1_size * 1.618, 4)
+                    else:
+                        next_target = round(last_price * 1.15, 4)
+                else:
+                    # آخر نقطة قمة = نحن في نهاية موجة صاعدة
+                    current_wave = "WAVE_PEAK"
+                    wave_desc = "قمة موجة — احتمال تصحيح قادم"
+                    confidence = 55
+                    next_target = None
+                result["pattern_valid"] = True
+            elif not rising_highs and not rising_lows:
+                # اتجاه هابط — موجات تصحيحية
+                current_wave = "CORRECTIVE"
+                wave_desc = "موجات تصحيحية هابطة (A-B-C)"
+                confidence = 50
+                next_target = None
+                result["pattern_valid"] = False
+            else:
+                current_wave = "TRANSITION"
+                wave_desc = "مرحلة انتقالية — النمط غير واضح"
+                confidence = 30
+                next_target = None
+                result["pattern_valid"] = False
+        except Exception:
+            current_wave = "UNKNOWN"
+            wave_desc = "تعذر تحديد الموجة"
+            confidence = 20
+            next_target = None
+            result["pattern_valid"] = False
+    else:
+        # نقاط قليلة (3-4) — نتحقق من اتجاه القيعان والقمم
+        highs_few = [prices[i] for i in range(len(types)) if types[i]=='H']
+        lows_few  = [prices[i] for i in range(len(types)) if types[i]=='L']
+
+        # هل القيعان تهبط؟ (اتجاه هابط - ليس بداية صعود)
+        falling_lows = len(lows_few) >= 2 and lows_few[-1] < lows_few[0]
+        falling_highs = len(highs_few) >= 2 and highs_few[-1] < highs_few[0]
+
+        if falling_lows or falling_highs:
+            # اتجاه هابط — موجات تصحيحية
+            current_wave = "CORRECTIVE"
+            wave_desc = "موجات هابطة تصحيحية — ليست فرصة دخول"
+            confidence = 40
+            next_target = None
+            result["pattern_valid"] = False
+        elif last_type == 'L':
+            # قاع في اتجاه غير هابط = بداية محتملة لموجة دافعة
+            current_wave = "EARLY_IMPULSE"
+            wave_desc = "بداية محتملة لموجة دافعة صاعدة"
+            confidence = 45
+            # الهدف من حجم آخر موجة صاعدة
+            if highs_few and lows_few:
+                last_up_move = highs_few[-1] - lows_few[0]
+                next_target = round(last_price + abs(last_up_move) * 1.5, 4) if last_price else None
+            else:
+                next_target = round(last_price * 1.12, 4) if last_price else None
+            result["pattern_valid"] = True
+        else:
+            current_wave = "DEVELOPING"
+            wave_desc = "النمط قيد التطور"
+            confidence = 30
+            next_target = None
+            result["pattern_valid"] = len(recent_swings) >= 3
+
+    result.update({
+        "current_wave": current_wave,
+        "wave_desc": wave_desc,
+        "wave_confidence": confidence,
+        "next_target": next_target,
+        "last_swing_type": "قمة" if last_type=='H' else "قاع",
+        "last_swing_price": round(last_price, 4),
+    })
+    return result
+
+
+def calculate_fib_targets(swing_low, swing_high, extension=True):
+    """
+    يحسب مستويات فيبوناتشي للأهداف والتصحيحات.
+    swing_low, swing_high: حدود الموجة المرجعية.
+    """
+    if not swing_low or not swing_high or swing_high <= swing_low:
+        return {}
+
+    diff = swing_high - swing_low
+
+    if extension:
+        # امتدادات (أهداف صعود)
+        return {
+            "target_1272": round(swing_high + diff * 0.272, 4),
+            "target_1618": round(swing_high + diff * 0.618, 4),  # الهدف الكلاسيكي للموجة 3
+            "target_2618": round(swing_high + diff * 1.618, 4),
+        }
+    else:
+        # تصحيحات (نقاط دخول محتملة)
+        return {
+            "retrace_382": round(swing_high - diff * 0.382, 4),  # تصحيح ضحل
+            "retrace_500": round(swing_high - diff * 0.500, 4),  # تصحيح متوسط
+            "retrace_618": round(swing_high - diff * 0.618, 4),  # تصحيح عميق (دخول ذهبي)
+        }
+# ============================================================
+# V22 — المرحلة 3: نظام التوقع الموحّد (Predictive Engine)
+# يدمج التجميع + الموجات لتوليد توصية استباقية كاملة
+# ============================================================
+#
+# الفلسفة: بدل انتظار الحركة (رد فعل)، نتوقع قبلها.
+# - كاشف التجميع يجد "أين" السهم في مرحلة البناء قبل الصعود
+# - عدّاد الموجات يحدد "متى" ندخل و"إلى أين" الهدف
+# - الدمج يعطي: نقطة دخول + هدف + وقف + مدة متوقعة + درجة ثقة
+
+def build_predictive_signal_v22(symbol, candles_d1, candles_h1=None):
+    """
+    يبني توصية استباقية كاملة بدمج التجميع + الموجات.
+
+    منطق القرار:
+    1. هل السهم في تجميع؟ (كاشف التجميع)
+    2. أين هو في دورة الموجات؟ (عدّاد الموجات)
+    3. الدمج:
+       - تجميع + بداية موجة دافعة = فرصة ذهبية (دخول قوي)
+       - تجميع فقط = مراقبة (لم يبدأ الصعود بعد)
+       - موجة دافعة بدون تجميع = دخول متأخر نسبياً (حذر)
+       - قمة موجة أو هبوط = تجنب
+
+    يرجع dict بنفس البنية المتوقعة من باقي النظام + حقول V22 الجديدة.
+    """
+    symbol = normalize_symbol(symbol)
+
+    if len(candles_d1) < 40:
+        return None
+
+    closes = [safe_float(c["close"]) for c in candles_d1 if safe_float(c["close"])]
+    if len(closes) < 40:
+        return None
+    current_price = closes[-1]
+    if not current_price or current_price <= 0:
+        return None
+
+    # ── تشغيل المحركين ────────────────────────────────────────
+    acc = detect_accumulation_zone(candles_d1, min_candles=40)
+    ell = count_elliott_waves(candles_d1, min_swing_pct=2.5)
+
+    # ── منطق الدمج والقرار ────────────────────────────────────
+    is_accumulating = acc.get("is_accumulating", False)
+    acc_phase = acc.get("phase", "NONE")
+    acc_score = acc.get("accumulation_score", 0)
+
+    wave = ell.get("current_wave", "UNKNOWN")
+    wave_valid = ell.get("pattern_valid", False)
+    wave_target = ell.get("next_target")
+    wave_conf = ell.get("wave_confidence", 0)
+
+    # تصنيف الفرصة
+    decision = "AVOID"
+    setup_type = "NONE"
+    confidence = 0
+    entry_zone = None
+    reasoning = []
+
+    # ═══ الحالة 1: فرصة ذهبية — تجميع + بداية موجة دافعة ═══
+    if is_accumulating and wave in ["EARLY_IMPULSE", "WAVE_3_OR_5_START"] and wave_valid:
+        decision = "STRONG_BUY"
+        setup_type = "GOLDEN_ACCUMULATION_IMPULSE"
+        confidence = min(90, 50 + acc_score * 0.3 + wave_conf * 0.3)
+        reasoning.append(f"🎯 تجميع ({acc_phase}) + بداية موجة دافعة = فرصة استباقية قوية")
+        reasoning.append(acc.get("phase_desc", ""))
+        reasoning.append(ell.get("wave_desc", ""))
+        # الدخول عند السعر الحالي أو أقل قليلاً
+        entry_zone = [round(current_price * 0.99, 4), round(current_price * 1.01, 4)]
+
+    # ═══ الحالة 2: Spring — أقوى إشارة تجميع ═══
+    elif acc_phase == "SPRING":
+        decision = "STRONG_BUY"
+        setup_type = "SPRING_ENTRY"
+        confidence = min(85, 55 + acc_score * 0.3)
+        reasoning.append("⚡ Spring — اختبار قاع نهائي، الصعود وشيك")
+        reasoning.append(acc.get("phase_desc", ""))
+        entry_zone = [round(current_price * 0.99, 4), round(current_price * 1.015, 4)]
+
+    # ═══ الحالة 3: تجميع متأخر — قرب الاختراق ═══
+    elif is_accumulating and acc_phase == "LATE":
+        decision = "BUY"
+        setup_type = "LATE_ACCUMULATION"
+        confidence = min(75, 45 + acc_score * 0.3)
+        reasoning.append("تجميع متأخر — قرب الاختراق، جاهز للانطلاق")
+        reasoning.append(f"مستوى الاختراق: {acc.get('breakout_level')}")
+        entry_zone = [round(current_price * 0.995, 4), round(acc.get("breakout_level", current_price*1.02), 4)]
+
+    # ═══ الحالة 4: تجميع مبكر/متوسط — مراقبة ═══
+    elif is_accumulating and acc_phase in ["EARLY", "MID"]:
+        decision = "WATCH"
+        setup_type = "ACCUMULATION_BUILDING"
+        confidence = min(60, 35 + acc_score * 0.3)
+        reasoning.append(f"تجميع {acc_phase} — المؤسسات تبني، لم يبدأ الصعود بعد")
+        reasoning.append("راقب حتى الاختراق أو ظهور Spring")
+        entry_zone = None  # لا دخول بعد
+
+    # ═══ الحالة 5: موجة دافعة بدون تجميع واضح — حذر ═══
+    elif wave in ["EARLY_IMPULSE", "WAVE_3_OR_5_START"] and wave_valid and wave_target:
+        decision = "BUY_CAUTIOUS"
+        setup_type = "IMPULSE_NO_ACCUMULATION"
+        confidence = min(60, 35 + wave_conf * 0.3)
+        reasoning.append("موجة دافعة بدأت لكن بدون تجميع مؤكد — دخول متأخر نسبياً")
+        entry_zone = [round(current_price * 0.99, 4), round(current_price * 1.005, 4)]
+
+    # ═══ الحالة 6: قمة موجة — تجنب الدخول ═══
+    elif wave == "WAVE_PEAK":
+        decision = "AVOID"
+        setup_type = "WAVE_TOP"
+        confidence = 0
+        reasoning.append("قمة موجة — احتمال تصحيح، لا تدخل الآن")
+
+    # ═══ الحالة 7: هبوط تصحيحي — تجنب ═══
+    elif wave == "CORRECTIVE":
+        decision = "AVOID"
+        setup_type = "CORRECTIVE_DOWN"
+        confidence = 0
+        reasoning.append("موجات هابطة تصحيحية — انتظر اكتمال التصحيح")
+
+    else:
+        decision = "AVOID"
+        setup_type = "NO_SETUP"
+        confidence = 0
+        reasoning.append("لا يوجد إعداد واضح — لا تجميع ولا موجة دافعة")
+
+    confidence = max(0, min(100, round(confidence)))
+
+    # ── حساب الأهداف والوقف (للتوصيات القابلة للدخول) ──────────
+    targets = {}
+    if decision in ["STRONG_BUY", "BUY", "BUY_CAUTIOUS"] and entry_zone:
+        entry_price = current_price
+
+        # الهدف: من الموجات إن وُجد، وإلا من نطاق التجميع
+        if wave_target and wave_target > entry_price * 1.03:
+            target1 = wave_target
+            target_source = "elliott_wave"
+        elif acc.get("breakout_level"):
+            # هدف مبني على ارتفاع النطاق مضروب في نسبة إليوت
+            range_size = acc.get("range_high", entry_price) - acc.get("range_low", entry_price)
+            target1 = round(acc["breakout_level"] + range_size * 1.618, 4)
+            target_source = "accumulation_range"
+        else:
+            target1 = round(entry_price * 1.15, 4)
+            target_source = "default"
+
+        # أهداف إضافية بفيبوناتشي
+        swing_low = acc.get("range_low", entry_price * 0.95)
+        target2 = round(target1 + (target1 - entry_price) * 0.618, 4)
+
+        # الوقف: تحت قاع التجميع أو قاع الموجة الأخيرة
+        acc_low = acc.get("range_low", entry_price * 0.95)
+        last_swing_low = ell.get("last_swing_price") if ell.get("last_swing_type") == "قاع" else None
+        stop_candidates = [acc_low * 0.98]
+        if last_swing_low:
+            stop_candidates.append(last_swing_low * 0.98)
+        stop_loss = round(max(stop_candidates), 4)  # أقرب وقف منطقي
+
+        # تأكد من وقف معقول (لا يزيد عن 8%)
+        risk_pct = ((entry_price - stop_loss) / entry_price * 100) if entry_price else 0
+        if risk_pct > 8:
+            stop_loss = round(entry_price * 0.92, 4)
+            risk_pct = 8.0
+        elif risk_pct < 2:
+            stop_loss = round(entry_price * 0.97, 4)
+            risk_pct = 3.0
+
+        target_pct = ((target1 - entry_price) / entry_price * 100) if entry_price else 0
+        rr = ((target1 - entry_price) / (entry_price - stop_loss)) if entry_price > stop_loss else 0
+
+        targets = {
+            "target1": target1,
+            "target2": target2,
+            "stop_loss": stop_loss,
+            "target_pct": round(target_pct, 2),
+            "risk_pct": round(risk_pct, 2),
+            "rr": round(rr, 2),
+            "target_source": target_source,
+        }
+
+    # ── المدة المتوقعة (بناءً على نوع الإعداد) ─────────────────
+    duration_map = {
+        "GOLDEN_ACCUMULATION_IMPULSE": "2-6 أسابيع",
+        "SPRING_ENTRY": "1-4 أسابيع",
+        "LATE_ACCUMULATION": "1-3 أسابيع",
+        "ACCUMULATION_BUILDING": "3-8 أسابيع (مراقبة)",
+        "IMPULSE_NO_ACCUMULATION": "1-2 أسابيع",
+    }
+    expected_duration = duration_map.get(setup_type, "غير محدد")
+
+    return {
+        "symbol": symbol,
+        "engine_version": "V22",
+        "decision": decision,
+        "setup_type": setup_type,
+        "confidence": confidence,
+        "current_price": round(current_price, 4),
+        "entry_zone": entry_zone,
+        "expected_duration": expected_duration,
+        "market": get_stock_market(symbol),
+        "reasoning": [r for r in reasoning if r],
+        # تفاصيل المحركين
+        "accumulation": {
+            "is_accumulating": is_accumulating,
+            "phase": acc_phase,
+            "score": acc_score,
+            "range_low": acc.get("range_low"),
+            "range_high": acc.get("range_high"),
+            "breakout_level": acc.get("breakout_level"),
+            "distance_to_breakout_pct": acc.get("distance_to_breakout_pct"),
+        },
+        "elliott": {
+            "current_wave": wave,
+            "wave_desc": ell.get("wave_desc"),
+            "pattern_valid": wave_valid,
+            "next_target": wave_target,
+            "confidence": wave_conf,
+        },
+        **targets,
+    }
+
+
+def scan_predictive_opportunities_v22(candles_cache, min_confidence=50):
+    """
+    يمسح كل الأسهم بالنظام الاستباقي ويرجع الفرص مرتبة.
+    يفصل بين: فرص للدخول (BUY) وفرص للمراقبة (WATCH).
+    """
+    buy_opportunities = []
+    watch_list = []
+
+    for symbol in WATCHLIST:
+        try:
+            d1 = candles_cache.get(symbol, {}).get("1D", [])
+            h1 = candles_cache.get(symbol, {}).get("60", [])
+            if len(d1) < 40:
+                continue
+
+            sig = build_predictive_signal_v22(symbol, d1, h1)
+            if not sig:
+                continue
+
+            if sig["decision"] in ["STRONG_BUY", "BUY", "BUY_CAUTIOUS"] and sig["confidence"] >= min_confidence:
+                buy_opportunities.append(sig)
+            elif sig["decision"] == "WATCH" and sig["confidence"] >= 40:
+                watch_list.append(sig)
+        except Exception:
+            continue
+
+    # ترتيب: STRONG_BUY أولاً، ثم حسب الثقة
+    decision_order = {"STRONG_BUY": 0, "BUY": 1, "BUY_CAUTIOUS": 2}
+    buy_opportunities.sort(key=lambda x: (decision_order.get(x["decision"], 3), -x["confidence"]))
+    watch_list.sort(key=lambda x: -x["confidence"])
+
+    return {"buy": buy_opportunities, "watch": watch_list}
+# ============================================================
+# V22 — المرحلة 4: متابعة التوصية (Thesis Tracking)
+# كل توصية تُفتح، تُتابع يومياً، تُقيّم، وتنبّه عند تغيّر النظرة
+# ============================================================
+#
+# يحل المشاكل:
+# - لا تكرار: توصية واحدة لكل سهم (thesis) تُحدّث بدل توصيات جديدة
+# - تقييم الفعالية: كل توصية تُتابع حتى نهايتها (هدف/وقف/إلغاء)
+# - تنبيه عند تغيّر النظرة: إذا انكسر أساس التوصية = تنبيه فوري
+# - بناء الثقة: سجل أداء موثّق لكل نوع إعداد
+#
+# دورة حياة التوصية:
+# ACTIVE (نشطة) → إما TARGET_HIT (نجحت) أو STOPPED (فشلت)
+#              أو INVALIDATED (تغيّر الأساس) أو EXPIRED (انتهت المدة)
+
+def init_v22_tables():
+    """ينشئ جداول V22 المطلوبة لمتابعة التوصيات"""
+    with get_db() as conn:
+        c = conn.cursor()
+        # جدول التوصيات النشطة (thesis)
+        c.execute("""CREATE TABLE IF NOT EXISTS v22_thesis (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT UNIQUE NOT NULL,
+            decision TEXT NOT NULL,
+            setup_type TEXT,
+            confidence DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            entry_low DOUBLE PRECISION,
+            entry_high DOUBLE PRECISION,
+            stop_loss DOUBLE PRECISION,
+            target1 DOUBLE PRECISION,
+            target2 DOUBLE PRECISION,
+            target_pct DOUBLE PRECISION,
+            risk_pct DOUBLE PRECISION,
+            rr DOUBLE PRECISION,
+            expected_duration TEXT,
+            market TEXT,
+            acc_phase TEXT,
+            acc_score DOUBLE PRECISION,
+            wave_type TEXT,
+            wave_target DOUBLE PRECISION,
+            range_low DOUBLE PRECISION,
+            range_high DOUBLE PRECISION,
+            breakout_level DOUBLE PRECISION,
+            status TEXT DEFAULT 'ACTIVE',
+            outcome TEXT,
+            max_price_reached DOUBLE PRECISION,
+            min_price_reached DOUBLE PRECISION,
+            days_active INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT,
+            invalidation_reason TEXT,
+            reasoning TEXT,
+            payload TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_v22_thesis_status ON v22_thesis(status)")
+
+        # سجل تاريخ التوصيات (للتقييم والإحصائيات)
+        c.execute("""CREATE TABLE IF NOT EXISTS v22_thesis_history (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            setup_type TEXT,
+            decision TEXT,
+            confidence DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            exit_price DOUBLE PRECISION,
+            target1 DOUBLE PRECISION,
+            stop_loss DOUBLE PRECISION,
+            outcome TEXT,
+            return_pct DOUBLE PRECISION,
+            days_held INTEGER,
+            max_gain_pct DOUBLE PRECISION,
+            created_at TEXT NOT NULL,
+            closed_at TEXT NOT NULL,
+            payload TEXT)""")
+
+        # سجل التغييرات على التوصيات (لتتبع تطور النظرة)
+        c.execute("""CREATE TABLE IF NOT EXISTS v22_thesis_updates (
+            id SERIAL PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            update_type TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            note TEXT,
+            price_at_update DOUBLE PRECISION,
+            created_at TEXT NOT NULL)""")
+
+
+def get_active_thesis(symbol):
+    """يجلب التوصية النشطة لسهم معين"""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v22_thesis WHERE symbol=%s AND status='ACTIVE'",
+                      (normalize_symbol(symbol),))
+            return c.fetchone()
+    except Exception:
+        return None
+
+
+def open_or_update_thesis(sig):
+    """
+    يفتح توصية جديدة أو يحدّث الموجودة.
+    المنطق:
+    - إذا ما في توصية نشطة → افتح جديدة
+    - إذا في توصية نشطة ونفس الاتجاه → حدّث الأرقام فقط (لا تكرار)
+    - إذا في توصية نشطة والقرار انقلب → سجّل التغيير
+    """
+    if not sig or sig["decision"] not in ["STRONG_BUY", "BUY", "BUY_CAUTIOUS"]:
+        return {"action": "skipped", "reason": "not a buy signal"}
+
+    symbol = sig["symbol"]
+    existing = get_active_thesis(symbol)
+    now = utc_now()
+
+    if not existing:
+        # ── فتح توصية جديدة ────────────────────────────────────
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""INSERT INTO v22_thesis
+                    (symbol, decision, setup_type, confidence, entry_price, entry_low, entry_high,
+                     stop_loss, target1, target2, target_pct, risk_pct, rr, expected_duration,
+                     market, acc_phase, acc_score, wave_type, wave_target, range_low, range_high,
+                     breakout_level, status, max_price_reached, min_price_reached, days_active,
+                     created_at, updated_at, reasoning, payload)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           'ACTIVE',%s,%s,0,%s,%s,%s,%s)""",
+                    (symbol, sig["decision"], sig["setup_type"], sig["confidence"],
+                     sig["current_price"],
+                     (sig.get("entry_zone") or [None,None])[0],
+                     (sig.get("entry_zone") or [None,None])[1],
+                     sig.get("stop_loss"), sig.get("target1"), sig.get("target2"),
+                     sig.get("target_pct"), sig.get("risk_pct"), sig.get("rr"),
+                     sig.get("expected_duration"), sig.get("market"),
+                     sig["accumulation"].get("phase"), sig["accumulation"].get("score"),
+                     sig["elliott"].get("current_wave"), sig["elliott"].get("next_target"),
+                     sig["accumulation"].get("range_low"), sig["accumulation"].get("range_high"),
+                     sig["accumulation"].get("breakout_level"),
+                     sig["current_price"], sig["current_price"],
+                     now, now, " | ".join(sig.get("reasoning", [])), json.dumps(sig)))
+            return {"action": "opened", "symbol": symbol, "setup": sig["setup_type"]}
+        except Exception as e:
+            return {"action": "error", "error": str(e)}
+    else:
+        # ── تحديث توصية موجودة (لا تكرار) ─────────────────────
+        old_conf = float(existing.get("confidence") or 0)
+        new_conf = sig["confidence"]
+        old_setup = existing.get("setup_type")
+        new_setup = sig["setup_type"]
+
+        # هل تحسّن الإعداد؟ (مثلاً من مراقبة تجميع إلى Spring)
+        setup_upgraded = (old_setup == "ACCUMULATION_BUILDING" and
+                          new_setup in ["SPRING_ENTRY", "GOLDEN_ACCUMULATION_IMPULSE", "LATE_ACCUMULATION"])
+
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                # نحدّث الثقة والأرقام لكن نبقي سعر الدخول الأصلي
+                c.execute("""UPDATE v22_thesis SET
+                    confidence=%s, setup_type=%s, target1=%s, target2=%s, stop_loss=%s,
+                    target_pct=%s, rr=%s, acc_phase=%s, wave_type=%s, updated_at=%s
+                    WHERE symbol=%s AND status='ACTIVE'""",
+                    (new_conf, new_setup, sig.get("target1"), sig.get("target2"),
+                     sig.get("stop_loss"), sig.get("target_pct"), sig.get("rr"),
+                     sig["accumulation"].get("phase"), sig["elliott"].get("current_wave"),
+                     now, symbol))
+
+                # سجّل التحديث إذا تغيّر الإعداد بشكل مهم
+                if setup_upgraded:
+                    c.execute("""INSERT INTO v22_thesis_updates
+                        (symbol, update_type, old_value, new_value, note, price_at_update, created_at)
+                        VALUES(%s,'SETUP_UPGRADE',%s,%s,%s,%s,%s)""",
+                        (symbol, old_setup, new_setup,
+                         "تحسّن الإعداد — إشارة أقوى", sig["current_price"], now))
+            return {"action": "updated", "symbol": symbol,
+                    "upgraded": setup_upgraded}
+        except Exception as e:
+            return {"action": "error", "error": str(e)}
+
+
+def evaluate_active_thesis():
+    """
+    يقيّم كل التوصيات النشطة يومياً:
+    - هل وصلت الهدف؟ → TARGET_HIT
+    - هل ضربت الوقف؟ → STOPPED
+    - هل تغيّر الأساس (التجميع انهار / ظهر توزيع)؟ → INVALIDATED
+    - هل انتهت المدة؟ → EXPIRED
+
+    يرجع قائمة بالتوصيات التي تغيّرت حالتها (للتنبيه).
+    """
+    changed = []
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v22_thesis WHERE status='ACTIVE'")
+            theses = c.fetchall()
+
+        for th in theses:
+            symbol = th["symbol"]
+            entry = float(th["entry_price"] or 0)
+            target1 = float(th["target1"] or 0)
+            stop = float(th["stop_loss"] or 0)
+
+            # السعر الحالي
+            last_price, _, _ = get_latest_price(symbol)
+            if not last_price:
+                continue
+
+            # تحديث أعلى/أدنى سعر
+            max_reached = max(float(th.get("max_price_reached") or entry), last_price)
+            min_reached = min(float(th.get("min_price_reached") or entry), last_price)
+
+            # حساب الأيام النشطة
+            created = parse_dt(th["created_at"])
+            days_active = business_days_between(created, utc_now_dt()) if created else 0
+
+            new_status = "ACTIVE"
+            outcome = None
+            invalidation_reason = None
+
+            # ── فحص الهدف والوقف ──────────────────────────────
+            if target1 and last_price >= target1:
+                new_status = "TARGET_HIT"
+                outcome = "WIN"
+            elif stop and last_price <= stop:
+                new_status = "STOPPED"
+                outcome = "LOSS"
+            else:
+                # ── فحص تغيّر الأساس (إعادة تحليل) ─────────────
+                d1 = get_candles(symbol, "1D", 100)
+                if len(d1) >= 40:
+                    acc = detect_accumulation_zone(d1)
+                    phase_now, cmf_now, _ = detect_market_phase(d1)
+
+                    # الأساس انهار إذا: دخل في توزيع/هبوط، أو CMF أصبح سلبياً بقوة
+                    if phase_now in ["DISTRIBUTION", "MARKDOWN"]:
+                        new_status = "INVALIDATED"
+                        outcome = "INVALIDATED"
+                        invalidation_reason = f"تحول لـ {phase_now} — الأساس انهار"
+                    elif acc.get("cmf", 0) < -0.2:
+                        new_status = "INVALIDATED"
+                        outcome = "INVALIDATED"
+                        invalidation_reason = f"CMF سلبي قوي ({acc.get('cmf')}) — أموال تخرج"
+
+            # ── فحص انتهاء المدة ──────────────────────────────
+            # الحد الأقصى: 45 يوم تداول (حتى للتوصيات طويلة المدى)
+            if new_status == "ACTIVE" and days_active > 45:
+                new_status = "EXPIRED"
+                outcome = "EXPIRED"
+
+            # ── تحديث السجل ───────────────────────────────────
+            now = utc_now()
+            if new_status != "ACTIVE":
+                # التوصية انتهت — انقلها للتاريخ
+                return_pct = ((last_price - entry) / entry * 100) if entry else 0
+                if new_status == "TARGET_HIT":
+                    return_pct = ((target1 - entry) / entry * 100) if entry else 0
+                elif new_status == "STOPPED":
+                    return_pct = ((stop - entry) / entry * 100) if entry else 0
+                max_gain = ((max_reached - entry) / entry * 100) if entry else 0
+
+                with get_db() as conn:
+                    c = conn.cursor()
+                    # أرشفة في التاريخ
+                    c.execute("""INSERT INTO v22_thesis_history
+                        (symbol, setup_type, decision, confidence, entry_price, exit_price,
+                         target1, stop_loss, outcome, return_pct, days_held, max_gain_pct,
+                         created_at, closed_at, payload)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (symbol, th.get("setup_type"), th.get("decision"), th.get("confidence"),
+                         entry, last_price, target1, stop, outcome, round(return_pct,2),
+                         days_active, round(max_gain,2), th["created_at"], now,
+                         th.get("payload")))
+                    # تحديث الحالة
+                    c.execute("""UPDATE v22_thesis SET status=%s, outcome=%s,
+                        max_price_reached=%s, min_price_reached=%s, days_active=%s,
+                        closed_at=%s, invalidation_reason=%s, updated_at=%s
+                        WHERE symbol=%s AND status='ACTIVE'""",
+                        (new_status, outcome, max_reached, min_reached, days_active,
+                         now, invalidation_reason, now, symbol))
+
+                changed.append({
+                    "symbol": symbol,
+                    "old_status": "ACTIVE",
+                    "new_status": new_status,
+                    "outcome": outcome,
+                    "entry": entry,
+                    "exit": last_price,
+                    "return_pct": round(return_pct, 2),
+                    "days_held": days_active,
+                    "setup_type": th.get("setup_type"),
+                    "invalidation_reason": invalidation_reason,
+                })
+            else:
+                # لا تزال نشطة — حدّث المؤشرات فقط
+                with get_db() as conn:
+                    c = conn.cursor()
+                    c.execute("""UPDATE v22_thesis SET max_price_reached=%s,
+                        min_price_reached=%s, days_active=%s, updated_at=%s
+                        WHERE symbol=%s AND status='ACTIVE'""",
+                        (max_reached, min_reached, days_active, now, symbol))
+
+    except Exception as e:
+        print(f"evaluate_thesis error: {e}")
+
+    return changed
+
+
+def get_v22_performance_stats():
+    """يحسب إحصائيات أداء V22 لبناء الثقة"""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT COUNT(*) cnt FROM v22_thesis_history")
+            total = int(c.fetchone()["cnt"])
+            c.execute("SELECT COUNT(*) cnt FROM v22_thesis_history WHERE outcome='WIN'")
+            wins = int(c.fetchone()["cnt"])
+            c.execute("SELECT COUNT(*) cnt FROM v22_thesis_history WHERE outcome='LOSS'")
+            losses = int(c.fetchone()["cnt"])
+            c.execute("SELECT AVG(return_pct) avg_ret, AVG(days_held) avg_days, AVG(max_gain_pct) avg_max FROM v22_thesis_history WHERE outcome IN ('WIN','LOSS')")
+            row = c.fetchone()
+            c.execute("SELECT COUNT(*) cnt FROM v22_thesis WHERE status='ACTIVE'")
+            active = int(c.fetchone()["cnt"])
+            # أداء حسب نوع الإعداد
+            c.execute("""SELECT setup_type, COUNT(*) total,
+                SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) wins,
+                AVG(return_pct) avg_ret
+                FROM v22_thesis_history GROUP BY setup_type ORDER BY total DESC""")
+            by_setup = c.fetchall()
+
+        closed = wins + losses
+        win_rate = (wins / closed * 100) if closed else 0
+        return {
+            "total_closed": total,
+            "active": active,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "avg_return_pct": round(float(row["avg_ret"] or 0), 2),
+            "avg_days_held": round(float(row["avg_days"] or 0), 1),
+            "avg_max_gain_pct": round(float(row["avg_max"] or 0), 2),
+            "by_setup": [dict(r) for r in by_setup],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── API ROUTES ────────────────────────────────────────────────
 
 @app.get("/")
@@ -4267,6 +5372,207 @@ def batch_scan(secret:Optional[str]=None,limit:int=10,send:bool=False):
     return payload
 
 # ── DASHBOARD ─────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════
+# V22 — التقارير و API endpoints والكرون
+# ════════════════════════════════════════════════════════════════
+
+def format_v22_report(scan_result, changed_thesis=None):
+    """تقرير V22 الاستباقي — الفرص + التوصيات النشطة + التغييرات"""
+    lines = [
+        f"🔮 <b>التحليل الاستباقي V22 — {uae_now_dt().strftime('%Y-%m-%d')}</b>",
+        f"🕒 {uae_now_dt().strftime('%H:%M')} UAE",
+        "",
+    ]
+
+    # ── تغييرات التوصيات (الأهم أولاً) ────────────────────────
+    if changed_thesis:
+        lines.append("🔔 <b>تحديثات التوصيات:</b>")
+        for ch in changed_thesis:
+            sym = ch["symbol"]
+            if ch["new_status"] == "TARGET_HIT":
+                lines.append(f"✅ <b>{sym}</b> وصل الهدف! +{ch['return_pct']}% في {ch['days_held']} يوم")
+            elif ch["new_status"] == "STOPPED":
+                lines.append(f"🛑 <b>{sym}</b> ضرب الوقف ({ch['return_pct']}%)")
+            elif ch["new_status"] == "INVALIDATED":
+                lines.append(f"⚠️ <b>{sym}</b> تغيّرت النظرة — {ch.get('invalidation_reason','')}")
+            elif ch["new_status"] == "EXPIRED":
+                lines.append(f"⏱ <b>{sym}</b> انتهت المدة ({ch['return_pct']}%)")
+        lines.append("")
+
+    # ── فرص جديدة للدخول ──────────────────────────────────────
+    buy_opps = scan_result.get("buy", [])
+    if buy_opps:
+        lines.append("🎯 <b>فرص استباقية للدخول:</b>")
+        for sig in buy_opps[:5]:
+            mkt_icon = "🇦🇪" if sig["market"]=="DFM" else "🏛" if sig["market"]=="ADX" else "🌐"
+            dec_icon = "🟢🟢" if sig["decision"]=="STRONG_BUY" else "🟢" if sig["decision"]=="BUY" else "🟡"
+            lines.append(
+                f"\n{dec_icon} <b>{sig['symbol']}</b> {mkt_icon} | ثقة {sig['confidence']}%"
+            )
+            lines.append(f"   📊 {sig['setup_type']}")
+            if sig.get("entry_zone"):
+                lines.append(f"   📥 دخول: {sig['entry_zone'][0]}–{sig['entry_zone'][1]}")
+                lines.append(f"   🛑 وقف: {sig.get('stop_loss')} | 🎯 هدف: {sig.get('target1')} (+{sig.get('target_pct')}%)")
+                lines.append(f"   📐 RR: {sig.get('rr')} | ⏱ {sig.get('expected_duration')}")
+    else:
+        lines.append("🎯 لا توجد فرص دخول قوية حالياً")
+
+    # ── قائمة المراقبة (تجميع قيد البناء) ─────────────────────
+    watch = scan_result.get("watch", [])
+    if watch:
+        lines.append("\n👀 <b>مراقبة (تجميع قيد البناء):</b>")
+        for sig in watch[:4]:
+            mkt_icon = "🇦🇪" if sig["market"]=="DFM" else "🏛"
+            acc = sig["accumulation"]
+            lines.append(
+                f"  • <b>{sig['symbol']}</b> {mkt_icon} | {acc['phase']} "
+                f"(score {acc['score']}) | اختراق عند {acc.get('breakout_level')}"
+            )
+
+    # ── التوصيات النشطة حالياً ────────────────────────────────
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("SELECT * FROM v22_thesis WHERE status='ACTIVE' ORDER BY confidence DESC")
+            active = c.fetchall()
+        if active:
+            lines.append(f"\n📋 <b>توصيات نشطة ({len(active)}):</b>")
+            for th in active[:6]:
+                lp, _, _ = get_latest_price(th["symbol"])
+                entry = float(th["entry_price"] or 0)
+                pnl = ((lp - entry)/entry*100) if lp and entry else 0
+                icon = "🟢" if pnl >= 0 else "🔴"
+                lines.append(
+                    f"  {icon} <b>{th['symbol']}</b> {pnl:+.1f}% | "
+                    f"{th['days_active']}د | هدف {th.get('target1')}"
+                )
+    except Exception:
+        pass
+
+    # ── إحصائيات الأداء ───────────────────────────────────────
+    try:
+        stats = get_v22_performance_stats()
+        if stats.get("total_closed", 0) > 0:
+            lines.append(
+                f"\n📈 <b>الأداء:</b> Win Rate {stats['win_rate']}% "
+                f"({stats['wins']}/{stats['wins']+stats['losses']}) | "
+                f"متوسط العائد {stats['avg_return_pct']}%"
+            )
+    except Exception:
+        pass
+
+    lines.append(f"\n{DASHBOARD_URL}")
+    return "\n".join(lines)
+
+
+@app.get("/api/v22/scan")
+def api_v22_scan(run: bool = True):
+    """مسح استباقي فوري — يرجع الفرص والمراقبة"""
+    cache = get_all_candles_for_scan(220)
+    result = scan_predictive_opportunities_v22(cache, min_confidence=50)
+    return {"ok": True, "version": "V22",
+            "buy_count": len(result["buy"]), "watch_count": len(result["watch"]),
+            "buy": result["buy"], "watch": result["watch"]}
+
+
+@app.get("/api/v22/analyze/{symbol}")
+def api_v22_analyze(symbol: str):
+    """تحليل استباقي لسهم واحد"""
+    symbol = normalize_symbol(symbol)
+    d1 = get_candles(symbol, "1D", 100)
+    h1 = get_candles(symbol, "60", 100)
+    if len(d1) < 40:
+        return {"ok": False, "error": f"بيانات D1 غير كافية ({len(d1)})"}
+    sig = build_predictive_signal_v22(symbol, d1, h1)
+    thesis = get_active_thesis(symbol)
+    return {"ok": True, "signal": sig, "active_thesis": thesis}
+
+
+@app.get("/api/v22/thesis")
+def api_v22_thesis():
+    """كل التوصيات النشطة"""
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM v22_thesis WHERE status='ACTIVE' ORDER BY confidence DESC")
+        active = c.fetchall()
+    return {"ok": True, "count": len(active), "thesis": active}
+
+
+@app.get("/api/v22/performance")
+def api_v22_performance():
+    """إحصائيات أداء V22"""
+    return {"ok": True, "stats": get_v22_performance_stats()}
+
+
+@app.get("/api/v22/history")
+def api_v22_history(limit: int = 50):
+    """تاريخ التوصيات المغلقة"""
+    with get_db() as conn:
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT * FROM v22_thesis_history ORDER BY id DESC LIMIT %s", (limit,))
+        rows = c.fetchall()
+    return {"ok": True, "count": len(rows), "history": rows}
+
+
+def v22_daily_job(send=True):
+    """
+    وظيفة V22 اليومية:
+    1. تقييم التوصيات النشطة (هدف/وقف/تغيّر نظرة)
+    2. مسح فرص جديدة
+    3. فتح/تحديث التوصيات
+    4. إرسال التقرير
+    """
+    # 1. تقييم النشطة أولاً
+    changed = evaluate_active_thesis()
+
+    # 2. مسح فرص جديدة
+    cache = get_all_candles_for_scan(220)
+    scan_result = scan_predictive_opportunities_v22(cache, min_confidence=50)
+
+    # 3. فتح/تحديث التوصيات للفرص القوية
+    for sig in scan_result["buy"]:
+        if sig["decision"] in ["STRONG_BUY", "BUY"] and sig["confidence"] >= 55:
+            open_or_update_thesis(sig)
+
+    # 4. حفظ نتيجة المسح
+    try:
+        save_scan_result("V22", {"ok": True, "version": "V22", "created_at": utc_now(),
+            "buy": scan_result["buy"], "watch": scan_result["watch"],
+            "changed_thesis": changed})
+    except Exception:
+        pass
+
+    # 5. التقرير
+    if send:
+        tg_main_send(format_v22_report(scan_result, changed))
+
+    return {"changed": len(changed), "buy": len(scan_result["buy"]),
+            "watch": len(scan_result["watch"])}
+
+
+@app.get("/api/cron/v22-daily")
+def cron_v22_daily(secret: Optional[str] = None, send: bool = True):
+    """كرون V22 اليومي — بعد إغلاق السوق"""
+    if not cron_ok(secret): return {"ok": False, "error": "bad_cron_secret"}
+    if not is_uae_trading_day(): return {"ok": True, "skipped": True, "reason": "UAE weekend"}
+    run_background_job(v22_daily_job, send)
+    return {"ok": True, "started": True, "job": "V22_DAILY"}
+
+
+@app.get("/api/v22/report")
+def api_v22_report(secret: Optional[str] = None, send: bool = False):
+    """توليد تقرير V22 (اختباري)"""
+    cache = get_all_candles_for_scan(220)
+    scan_result = scan_predictive_opportunities_v22(cache, min_confidence=50)
+    changed = evaluate_active_thesis()
+    text = format_v22_report(scan_result, changed)
+    if send:
+        tg_main_send(text)
+    return {"ok": True, "sent": send, "report": text}
+
+
+
 
 @app.get("/dashboard",response_class=HTMLResponse)
 def dashboard():
